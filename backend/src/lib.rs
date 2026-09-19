@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use shared::{GroceryItem, GroceryUpdate, NewGroceryItem, NewRecipe, Recipe};
+use shared::{GroceryItem, GroceryUpdate, Ingredient, NewGroceryItem, Recipe, RecipeDetail, RecipeInput};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tower_http::cors::CorsLayer;
@@ -73,7 +73,9 @@ pub async fn open_db(db_url: &str) -> anyhow::Result<SqlitePool> {
     let options = db_url
         .parse::<SqliteConnectOptions>()
         .context("invalid BOUEDIG_DB_URL")?
-        .busy_timeout(std::time::Duration::from_secs(5));
+        .busy_timeout(std::time::Duration::from_secs(5))
+        // Needed for `ON DELETE CASCADE` on recipe_ingredients.
+        .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(options)
@@ -96,6 +98,10 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
     let api = Router::new()
         .route("/recipes", get(list_recipes).post(create_recipe))
         .route("/recipes/photo", post(create_recipe_with_photo))
+        .route(
+            "/recipes/{id}",
+            get(recipe_detail).put(update_recipe).delete(delete_recipe),
+        )
         .route(
             "/grocery",
             get(list_grocery).post(add_grocery_item),
@@ -251,21 +257,6 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
-fn row_to_recipe(row: &sqlx::sqlite::SqliteRow) -> Recipe {
-    use sqlx::Row;
-    /// DB stores a relative path under the image dir; expose it as a URL.
-    fn url(col: Option<String>) -> Option<String> {
-        col.map(|p| format!("/api/images/{p}"))
-    }
-    Recipe {
-        id: row.get::<i64, _>("id"),
-        name: row.get::<String, _>("name"),
-        ingredients: row.get::<String, _>("ingredients"),
-        image: url(row.get::<Option<String>, _>("image_path")),
-        thumb: url(row.get::<Option<String>, _>("thumb_path")),
-    }
-}
-
 fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
     use sqlx::Row;
     GroceryItem {
@@ -276,53 +267,182 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
     }
 }
 
-/// Insert a recipe (and its parsed ingredients) in one transaction.
+/// DB stores relative paths under the image dir; expose them as URLs.
+fn recipe_urls(row: &sqlx::sqlite::SqliteRow) -> (Option<String>, Option<String>) {
+    use sqlx::Row;
+    let url = |col: Option<String>| col.map(|p| format!("/api/images/{p}"));
+    (
+        url(row.get::<Option<String>, _>("image_path")),
+        url(row.get::<Option<String>, _>("thumb_path")),
+    )
+}
+
+fn row_to_recipe(row: &sqlx::sqlite::SqliteRow) -> Recipe {
+    use sqlx::Row;
+    let (image, thumb) = recipe_urls(row);
+    Recipe {
+        id: row.get::<i64, _>("id"),
+        name: row.get::<String, _>("name"),
+        image,
+        thumb,
+    }
+}
+
+/// Decode the instructions JSON column.
+fn decode_instructions(json: Option<String>) -> Result<Vec<String>, ApiError> {
+    match json {
+        None => Ok(Vec::new()),
+        Some(json) => serde_json::from_str(&json)
+            .map_err(|e| ApiError::internal(anyhow::anyhow!("bad instructions JSON: {e}"))),
+    }
+}
+
+/// Assemble the full detail view (recipe row + ordered ingredients).
+async fn load_recipe_detail(db: &SqlitePool, id: i64) -> Result<Option<RecipeDetail>, ApiError> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT id, name, instructions, image_path, thumb_path FROM recipes WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let (image, thumb) = recipe_urls(&row);
+    let instructions = decode_instructions(row.get("instructions"))?;
+    let rows = sqlx::query(
+        "SELECT quantity, unit, name, prep FROM recipe_ingredients \
+         WHERE recipe_id = ? ORDER BY position ASC",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await?;
+    let ingredients = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            Ingredient {
+                quantity: row.get::<Option<f64>, _>("quantity"),
+                unit: row.get::<Option<String>, _>("unit"),
+                name: row.get::<String, _>("name"),
+                prep: row.get::<Option<String>, _>("prep"),
+            }
+        })
+        .collect();
+    Ok(Some(RecipeDetail {
+        id,
+        name: row.get("name"),
+        ingredients,
+        instructions,
+        image,
+        thumb,
+    }))
+}
+
+/// Remove the stored photo files of a recipe (best effort).
+fn delete_image_files(data_dir: &std::path::Path, image_path: Option<&str>, thumb_path: Option<&str>) {
+    for path in [image_path, thumb_path].into_iter().flatten() {
+        match std::fs::remove_file(data_dir.join(path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!("failed to remove image {path}: {err}"),
+        }
+    }
+}
+
+/// Insert a recipe with structured ingredients. The grocery list is **not**
+/// touched here — adding ingredients to it is an explicit user action.
 async fn insert_recipe(
     db: &SqlitePool,
-    name: &str,
-    ingredients: &str,
+    input: &RecipeInput,
     image: Option<(String, String)>,
 ) -> Result<Recipe, ApiError> {
     let (image_path, thumb_path) = match image {
         Some((i, t)) => (Some(i), Some(t)),
         None => (None, None),
     };
+    let instructions =
+        serde_json::to_string(&input.instructions).context("failed to encode instructions")?;
 
     let mut tx = db.begin().await?;
-    let row = sqlx::query(
-        "INSERT INTO recipes (name, ingredients, image_path, thumb_path) \
-         VALUES (?, ?, ?, ?) RETURNING id, name, ingredients, image_path, thumb_path",
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO recipes (name, instructions, image_path, thumb_path) \
+         VALUES (?, ?, ?, ?) RETURNING id",
     )
-    .bind(name)
-    .bind(ingredients)
-    .bind(image_path)
-    .bind(thumb_path)
+    .bind(input.name.trim())
+    .bind(&instructions)
+    .bind(image_path.clone())
+    .bind(thumb_path.clone())
     .fetch_one(&mut *tx)
     .await?;
-    let recipe = row_to_recipe(&row);
 
-    // Every parsed ingredient lands on the grocery list.
-    for ingredient in shared::parse_ingredients(ingredients) {
-        sqlx::query("INSERT INTO grocery_items (name) VALUES (?)")
-            .bind(ingredient)
-            .execute(&mut *tx)
-            .await?;
+    for (position, ingredient) in input.ingredients.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO recipe_ingredients \
+             (recipe_id, position, quantity, unit, name, prep) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(position as i64)
+        .bind(ingredient.quantity)
+        .bind(ingredient.unit.as_deref().map(str::trim).filter(|u| !u.is_empty()))
+        .bind(ingredient.name.trim())
+        .bind(ingredient.prep.as_deref().map(str::trim).filter(|p| !p.is_empty()))
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
-    Ok(recipe)
+
+    Ok(Recipe {
+        id,
+        name: input.name.trim().to_string(),
+        image: image_path.map(|p| format!("/api/images/{p}")),
+        thumb: thumb_path.map(|p| format!("/api/images/{p}")),
+    })
 }
 
-async fn create_recipe(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    Json(recipe): Json<NewRecipe>,
-) -> Result<(StatusCode, Json<Recipe>), ApiError> {
-    let name = recipe.name.trim();
-    if name.is_empty() {
+/// Replace the structured ingredients of a recipe (used by update).
+async fn replace_ingredients(
+    tx: &mut sqlx::SqliteConnection,
+    recipe_id: i64,
+    ingredients: &[Ingredient],
+) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM recipe_ingredients WHERE recipe_id = ?")
+        .bind(recipe_id)
+        .execute(&mut *tx)
+        .await?;
+    for (position, ingredient) in ingredients.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO recipe_ingredients \
+             (recipe_id, position, quantity, unit, name, prep) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(recipe_id)
+        .bind(position as i64)
+        .bind(ingredient.quantity)
+        .bind(ingredient.unit.as_deref().map(str::trim).filter(|u| !u.is_empty()))
+        .bind(ingredient.name.trim())
+        .bind(ingredient.prep.as_deref().map(str::trim).filter(|p| !p.is_empty()))
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn validate_recipe_input(input: &RecipeInput) -> Result<(), ApiError> {
+    if input.name.trim().is_empty() {
         return Err(ApiError(
             (StatusCode::UNPROCESSABLE_ENTITY, "recipe name must not be empty").into_response(),
         ));
     }
-    let recipe = insert_recipe(&state.db, name, &recipe.ingredients, None).await?;
+    Ok(())
+}
+
+async fn create_recipe(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(input): Json<RecipeInput>,
+) -> Result<(StatusCode, Json<Recipe>), ApiError> {
+    validate_recipe_input(&input)?;
+    let recipe = insert_recipe(&state.db, &input, None).await?;
     Ok((StatusCode::CREATED, Json(recipe)))
 }
 
@@ -359,14 +479,21 @@ fn save_recipe_image(data_dir: &std::path::Path, bytes: &[u8]) -> anyhow::Result
     Ok((image_path, thumb_path))
 }
 
-/// `POST /api/recipes/photo`: multipart form with `name`, `ingredients` and
+/// A parsed multipart recipe payload: structured fields + optional photo.
+struct MultipartRecipe {
+    input: RecipeInput,
+    image: Option<(String, String)>,
+}
+
+/// Parse `name`, `ingredients` (JSON array), `instructions` (JSON array) and
 /// an optional `image` file field.
-async fn create_recipe_with_photo(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    mut multipart: axum::extract::Multipart,
-) -> Result<(StatusCode, Json<Recipe>), ApiError> {
+async fn parse_recipe_multipart(
+    state: &AppState,
+    multipart: &mut axum::extract::Multipart,
+) -> Result<MultipartRecipe, ApiError> {
     let mut name = String::new();
     let mut ingredients = String::new();
+    let mut instructions = String::new();
     let mut image: Option<(String, String)> = None;
 
     while let Some(field) = multipart
@@ -377,27 +504,144 @@ async fn create_recipe_with_photo(
         match field.name().unwrap_or_default() {
             "name" => name = field.text().await.unwrap_or_default(),
             "ingredients" => ingredients = field.text().await.unwrap_or_default(),
+            "instructions" => instructions = field.text().await.unwrap_or_default(),
             "image" => {
                 let bytes = field
                     .bytes()
                     .await
                     .map_err(|e| ApiError::client(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
                 if !bytes.is_empty() {
-                    image = Some(save_recipe_image(&state.data_dir, &bytes).map_err(ApiError::from)?);
+                    image =
+                        Some(save_recipe_image(&state.data_dir, &bytes).map_err(ApiError::from)?);
                 }
             }
             _ => {}
         }
     }
 
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(ApiError(
-            (StatusCode::UNPROCESSABLE_ENTITY, "recipe name must not be empty").into_response(),
-        ));
-    }
-    let recipe = insert_recipe(&state.db, name, &ingredients, image).await?;
+    let ingredients: Vec<Ingredient> = if ingredients.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&ingredients).map_err(|e| {
+            ApiError::client(StatusCode::UNPROCESSABLE_ENTITY, format!("bad ingredients JSON: {e}"))
+        })?
+    };
+    let instructions: Vec<String> = if instructions.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&instructions).map_err(|e| {
+            ApiError::client(StatusCode::UNPROCESSABLE_ENTITY, format!("bad instructions JSON: {e}"))
+        })?
+    };
+
+    Ok(MultipartRecipe {
+        input: RecipeInput { name, ingredients, instructions },
+        image,
+    })
+}
+
+/// `POST /api/recipes/photo`: multipart create with an optional photo.
+async fn create_recipe_with_photo(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<(StatusCode, Json<Recipe>), ApiError> {
+    let MultipartRecipe { input, image } =
+        parse_recipe_multipart(&state, &mut multipart).await?;
+    validate_recipe_input(&input)?;
+    let recipe = insert_recipe(&state.db, &input, image).await?;
     Ok((StatusCode::CREATED, Json(recipe)))
+}
+
+/// `GET /api/recipes/{id}`: full detail view.
+async fn recipe_detail(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<RecipeDetail>, ApiError> {
+    load_recipe_detail(&state.db, id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError((StatusCode::NOT_FOUND, "not found").into_response()))
+}
+
+/// `PUT /api/recipes/{id}`: multipart update, optional photo replacement.
+async fn update_recipe(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<RecipeDetail>, ApiError> {
+    let MultipartRecipe { input, image } =
+        parse_recipe_multipart(&state, &mut multipart).await?;
+    validate_recipe_input(&input)?;
+
+    let existing = sqlx::query(
+        "SELECT image_path, thumb_path FROM recipes WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .context("no such recipe")?;
+    let (old_image, old_thumb): (Option<String>, Option<String>) = {
+        use sqlx::Row;
+        (existing.get("image_path"), existing.get("thumb_path"))
+    };
+
+    let instructions = serde_json::to_string(&input.instructions)
+        .context("failed to encode instructions")?;
+    let mut tx = state.db.begin().await?;
+    let (new_image, new_thumb) = match &image {
+        Some((img, thumb)) => {
+            delete_image_files(&state.data_dir, old_image.as_deref(), old_thumb.as_deref());
+            (Some(img.clone()), Some(thumb.clone()))
+        }
+        None => (old_image, old_thumb),
+    };
+    let updated = sqlx::query(
+        "UPDATE recipes SET name = ?, instructions = ?, image_path = ?, thumb_path = ? \
+         WHERE id = ? RETURNING id",
+    )
+    .bind(input.name.trim())
+    .bind(&instructions)
+    .bind(new_image)
+    .bind(new_thumb)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if updated.is_none() {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such recipe").into_response()));
+    }
+    replace_ingredients(&mut tx, id, &input.ingredients).await?;
+    tx.commit().await?;
+
+    load_recipe_detail(&state.db, id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError((StatusCode::NOT_FOUND, "not found").into_response()))
+}
+
+/// `DELETE /api/recipes/{id}`: remove the row (ingredients cascade) and the
+/// stored photo files.
+async fn delete_recipe(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let row = sqlx::query("SELECT image_path, thumb_path FROM recipes WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError((StatusCode::NOT_FOUND, "not found").into_response()))?;
+    {
+        use sqlx::Row;
+        delete_image_files(
+            &state.data_dir,
+            row.get::<Option<String>, _>("image_path").as_deref(),
+            row.get::<Option<String>, _>("thumb_path").as_deref(),
+        );
+    }
+    sqlx::query("DELETE FROM recipes WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Serve an uploaded image from the data dir (path-sanitised).
@@ -430,7 +674,7 @@ async fn list_recipes(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<Vec<Recipe>>, ApiError> {
     let rows = sqlx::query(
-        "SELECT id, name, ingredients, image_path, thumb_path FROM recipes ORDER BY id DESC",
+        "SELECT id, name, image_path, thumb_path FROM recipes ORDER BY id DESC",
     )
     .fetch_all(&state.db)
     .await?;
@@ -512,6 +756,10 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn test_router(base_path: Option<&str>) -> Router {
+        test_router_with_config(base_path).await.0
+    }
+
+    pub(crate) async fn test_router_with_config(base_path: Option<&str>) -> (Router, Config) {
         let config = test_config(base_path, None);
         ensure_data_dirs(&config.data_dir).unwrap();
         let pool = SqlitePoolOptions::new()
@@ -520,7 +768,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         run_migrations(&pool).await.unwrap();
-        build_router(AppState { db: pool, data_dir: config.data_dir.clone() }, &config)
+        (
+            build_router(AppState { db: pool, data_dir: config.data_dir.clone() }, &config),
+            config,
+        )
     }
 
     pub(crate) async fn json_response(
@@ -544,23 +795,100 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn create_recipe_splits_ingredients_into_grocery_list() {
+    async fn create_recipe_stores_details_and_leaves_grocery_alone() {
         let app = test_router(None).await;
         let (status, body) = json_response(
             app.clone(),
             "POST",
             "/api/recipes",
-            Some(r#"{"name":"Soup","ingredients":"Water, Salt\nPepper"}"#),
+            Some(
+                r#"{"name":"Soup","ingredients":[
+                     {"quantity":300,"unit":"ml","name":"water","prep":null},
+                     {"quantity":1,"unit":"tbsp","name":"salt","prep":"to taste"}],
+                   "instructions":["Boil water","Add salt"]}"#,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert!(body.contains("\"Soup\""), "{body}");
+        let recipe: Recipe = serde_json::from_str(&body).unwrap();
+        let id = recipe.id;
 
+        // Detail view round-trips the structured data.
+        let (status, body) = json_response(app.clone(), "GET", &format!("/api/recipes/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail: RecipeDetail = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail.name, "Soup");
+        assert_eq!(detail.ingredients.len(), 2);
+        assert_eq!(detail.ingredients[0].name, "water");
+        assert_eq!(detail.ingredients[0].unit.as_deref(), Some("ml"));
+        assert_eq!(detail.ingredients[1].quantity, Some(1.0));
+        assert_eq!(detail.instructions, vec!["Boil water", "Add salt"]);
+
+        // The shopping list must NOT receive recipe ingredients anymore.
         let (status, body) = json_response(app, "GET", "/api/grocery", None).await;
         assert_eq!(status, StatusCode::OK);
-        for ingredient in ["Water", "Salt", "Pepper"] {
-            assert!(body.contains(ingredient), "missing {ingredient}: {body}");
-        }
+        assert_eq!(body.trim(), "[]", "grocery list must stay empty: {body}");
+    }
+
+    #[tokio::test]
+    async fn update_recipe_replaces_fields() {
+        let app = test_router(None).await;
+        let (_, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"Old","ingredients":[{"quantity":1,"unit":null,"name":"onion","prep":null}],"instructions":["a"]}"#),
+        )
+        .await;
+        let recipe: Recipe = serde_json::from_str(&body).unwrap();
+
+        // PUT is multipart (same format as the client sends).
+        let payload = concat!(
+            "--UpDbOuNd\r\n",
+            "Content-Disposition: form-data; name=\"name\"\r\n\r\n",
+            "New\r\n",
+            "--UpDbOuNd\r\n",
+            "Content-Disposition: form-data; name=\"ingredients\"\r\n\r\n",
+            "[{\"quantity\":2,\"unit\":\"g\",\"name\":\"carrot\",\"prep\":\"grated\"}]\r\n",
+            "--UpDbOuNd\r\n",
+            "Content-Disposition: form-data; name=\"instructions\"\r\n\r\n",
+            "[\"step one\",\"step two\"]\r\n",
+            "--UpDbOuNd--\r\n",
+        );
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/api/recipes/{}", recipe.id))
+            .header("content-type", "multipart/form-data; boundary=UpDbOuNd")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let detail: RecipeDetail = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(detail.name, "New");
+        assert_eq!(detail.ingredients.len(), 1);
+        assert_eq!(detail.ingredients[0].name, "carrot");
+        assert_eq!(detail.ingredients[0].prep.as_deref(), Some("grated"));
+        assert_eq!(detail.instructions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_recipe_removes_row() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"Goner","ingredients":[],"instructions":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let recipe: Recipe = serde_json::from_str(&body).unwrap();
+
+        let (status, _) = json_response(app.clone(), "DELETE", &format!("/api/recipes/{}", recipe.id), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = json_response(app, "GET", &format!("/api/recipes/{}", recipe.id), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -592,7 +920,7 @@ pub(crate) mod tests {
             app,
             "POST",
             "/api/recipes",
-            Some(r#"{"name":"   ","ingredients":""}"#),
+            Some(r#"{"name":"   ","ingredients":[],"instructions":[]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -641,12 +969,17 @@ mod photo_tests {
 
     #[tokio::test]
     async fn multipart_recipe_with_photo_persists_paths() {
-        let app = test_router(None).await;
+        let (app, config) = test_router_with_config(None).await;
         let boundary = "XyZbOuNdArY";
         let png = png_bytes();
         let mut body: Vec<u8> = Vec::new();
         body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nPancakes\r\n").as_bytes());
-        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\nFlour, Milk\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n[{{\"quantity\":200,\"unit\":\"g\",\"name\":\"flour\",\"prep\":\"sifted\"}}]\r\n").as_bytes(),
+        );
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n[\"Mix\",\"Cook\"]\r\n").as_bytes(),
+        );
         body.extend_from_slice(
             format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes(),
         );
@@ -659,7 +992,7 @@ mod photo_tests {
             .header("content-type", format!("multipart/form-data; boundary={boundary}"))
             .body(Body::from(body))
             .unwrap();
-        let resp = app.oneshot(request).await.unwrap();
+        let resp = app.clone().oneshot(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let recipe: Recipe = serde_json::from_slice(&bytes).unwrap();
@@ -667,6 +1000,26 @@ mod photo_tests {
         let thumb_url = recipe.thumb.expect("thumb url must be set");
         assert!(image_url.starts_with("/api/images/images/"));
         assert!(thumb_url.starts_with("/api/images/images/thumbs/"));
+
+        // Detail round-trip.
+        let (status, body) =
+            json_response(app.clone(), "GET", &format!("/api/recipes/{}", recipe.id), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail: RecipeDetail = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail.ingredients[0].quantity, Some(200.0));
+        assert_eq!(detail.ingredients[0].prep.as_deref(), Some("sifted"));
+        assert_eq!(detail.instructions, vec!["Mix", "Cook"]);
+
+        // The stored files exist, and DELETE removes them together with the row.
+        let image_file = config.data_dir.join(image_url.trim_start_matches("/api/images/"));
+        let thumb_file = config.data_dir.join(thumb_url.trim_start_matches("/api/images/"));
+        assert!(image_file.exists());
+        assert!(thumb_file.exists());
+        let (status, _) =
+            json_response(app, "DELETE", &format!("/api/recipes/{}", recipe.id), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!image_file.exists(), "full-res file must be deleted");
+        assert!(!thumb_file.exists(), "thumbnail file must be deleted");
     }
 
     #[tokio::test]

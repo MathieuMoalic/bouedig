@@ -1712,6 +1712,7 @@ dependencies = [
  "tempfile",
  "thirtyfour",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

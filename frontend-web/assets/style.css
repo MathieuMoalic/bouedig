@@ -421,3 +421,211 @@ button[type="submit"]:hover {
 .placeholder-card p {
     color: var(--muted);
 }
+
+/* ------------------------------------------------------------------ */
+/* Recipe detail                                                       */
+/* ------------------------------------------------------------------ */
+
+.detail-header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 0 12px;
+}
+
+.detail-header .hdr-spacer {
+    flex: 1;
+}
+
+.hdr-btn {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+
+.hdr-btn:hover {
+    background: var(--pill);
+}
+
+.hdr-btn.ph {
+    color: var(--muted);
+    opacity: 0.75;
+}
+
+.hdr-btn.danger:hover {
+    background: rgba(229, 115, 115, 0.18);
+    color: var(--error);
+}
+
+.detail-name {
+    font-size: 26px;
+    margin: 4px 0 12px;
+}
+
+.detail-photo {
+    border-radius: 16px;
+    overflow: hidden;
+    margin-bottom: 14px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+    background: var(--surface-solid);
+}
+
+.detail-photo img {
+    display: block;
+    width: 100%;
+    max-height: 420px;
+    object-fit: cover;
+}
+
+.detail-page .card h2 {
+    margin: 0 0 10px;
+    font-size: 17px;
+}
+
+ul.ingredient-list,
+ol.instruction-list {
+    margin: 0;
+    padding-left: 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+ol.instruction-list li {
+    padding-left: 4px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Delete dialog                                                       */
+/* ------------------------------------------------------------------ */
+
+.dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.dialog {
+    background: var(--surface-solid);
+    border-radius: 20px;
+    padding: 22px 24px;
+    min-width: 260px;
+    max-width: 340px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+}
+
+.dialog-text {
+    margin: 0 0 18px;
+    font-size: 16px;
+    overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+.dialog-btn {
+    border: none;
+    background: var(--pill);
+    color: var(--text);
+    font: inherit;
+    font-weight: 600;
+    padding: 9px 18px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.dialog-btn.danger {
+    background: var(--accent);
+    color: #fff;
+}
+
+.dialog-btn.danger:hover {
+    background: #b04a45;
+}
+
+/* ------------------------------------------------------------------ */
+/* Structured ingredient editor                                        */
+/* ------------------------------------------------------------------ */
+
+.ingredient-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.ingredient-row {
+    display: grid;
+    grid-template-columns: 64px 72px 1fr 1fr 30px;
+    gap: 6px;
+    align-items: center;
+}
+
+.ingredient-row input {
+    background: #101512;
+    border: 1px solid var(--divider);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 8px;
+    font: inherit;
+    min-width: 0;
+}
+
+.ing-remove {
+    width: 30px;
+    height: 34px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 18px;
+    cursor: pointer;
+    border-radius: 8px;
+}
+
+.ing-remove:hover {
+    color: var(--error);
+    background: rgba(229, 115, 115, 0.12);
+}
+
+.secondary-btn {
+    margin-top: 8px;
+    background: var(--raised);
+    border: 1px solid var(--divider);
+    color: var(--text);
+    font: inherit;
+    font-weight: 600;
+    padding: 8px 14px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.secondary-btn:hover {
+    background: var(--pill);
+}
+
+.photo-preview {
+    display: block;
+    width: 140px;
+    border-radius: 10px;
+    margin: 6px 0;
+}
+
+/* Grid cards open the detail view. */
+.recipe-card.clickable {
+    cursor: pointer;
+}

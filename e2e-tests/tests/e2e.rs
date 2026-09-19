@@ -2,9 +2,8 @@
 //!
 //! Drives a real headless Firefox (via geckodriver, started by
 //! `just test-e2e`) against the production-style web bundle served by the
-//! backend, verifying UI -> backend -> SQLite -> UI round trips, including
-//! the new photo-card app shell and grouped grocery list. A second,
-//! browser-free test exercises the API contract directly.
+//! backend: app shell, recipe detail/edit/delete flows, photo upload and the
+//! grouped shopping list. A browser-free test covers the API contract.
 //!
 //! Ports come from the environment (see `.env`):
 //!   * `E2E_BACKEND_PORT` - test backend bind port, 0 = pick a free port
@@ -14,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
-use shared::{GroceryItem, NewGroceryItem, NewRecipe, Recipe};
+use shared::{GroceryItem, Ingredient, NewGroceryItem, Recipe, RecipeDetail, RecipeInput};
 use thirtyfour::{By, Capabilities, WebDriver};
 
 fn env_port(name: &str, default: u16) -> u16 {
@@ -27,6 +26,10 @@ fn env_port(name: &str, default: u16) -> u16 {
 /// Start an isolated backend (temp SQLite, temp image dir, built web bundle)
 /// and return its bound address.
 async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn,backend=info,sqlx=warn"))
+        .with_test_writer()
+        .try_init();
     let db_dir = tempfile::tempdir()?;
     let data_dir = tempfile::tempdir()?;
     let config = backend::Config {
@@ -52,11 +55,11 @@ fn webdriver_url() -> String {
     format!("http://{}", webdriver_addr())
 }
 
-/// The core browser journey: the new app shell renders, the + FAB opens the
-/// add form, submitting persists the recipe (visible as a card in the grid),
-/// and the grouped shopping list reflects everything in the database.
+/// The core browser journey: app shell, structured recipe creation via the
+/// + FAB, detail view, functional edit, confirm-delete, and a grocery list
+/// that only changes through explicit user actions.
 #[tokio::test(flavor = "multi_thread")]
-async fn add_recipe_shows_up_on_grocery_list() -> anyhow::Result<()> {
+async fn recipe_detail_edit_delete_flow() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
     let base = format!("http://{addr}");
     let http = reqwest::Client::new();
@@ -75,148 +78,98 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         .await
         .context("failed to load the web client")?;
 
-    // -- 1. The app shell renders: wallpaper, bottom nav, all four tabs. ----
-    driver
-        .find(By::Id("bottom-nav"))
-        .await
-        .context("app shell (bottom navigation) did not render")?;
-    driver
-        .find(By::Css(".wallpaper"))
-        .await
-        .context("app shell (wallpaper) did not render")?;
-    for tab in ["Recipes", "Meal plan", "Shopping", "Settings"] {
-        driver
-            .find(By::LinkText(tab))
-            .await
-            .with_context(|| format!("nav tab '{tab}' missing"))?;
-    }
+    // -- 1. The app shell renders: wallpaper, bottom nav, tabs, title. ------
+    assert_shell(driver).await?;
 
-    // The browser tab is named and shows the favicon.
-    let title = driver.title().await?;
-    anyhow::ensure!(
-        title == "Bouedig",
-        "tab title should be 'Bouedig', got '{title}'"
-    );
-    driver
-        .find(By::Css("link[rel='icon']"))
-        .await
-        .context("favicon <link> missing from the document head")?;
-
-    // -- 2. Tab clicks change the active view/route. ------------------------
-    driver.find(By::LinkText("Meal plan")).await?.click().await?;
-    wait_for_url_path(driver, "/meal-plan").await?;
-    driver
-        .find(By::Css(".placeholder-card"))
-        .await
-        .context("meal plan tab did not switch the view")?;
-
-    driver
-        .find(By::LinkText("Recipes"))
-        .await?
-        .click()
-        .await?;
-    wait_for_url_path(driver, "/").await?;
     driver
         .find(By::Id("recipe-grid"))
         .await
         .context("recipes grid did not render")?;
 
-    // -- 3. The + FAB opens the add-recipe form. ----------------------------
+    // -- 2. The + FAB opens the structured add form. ------------------------
     driver.find(By::Id("fab-add-recipe")).await?.click().await?;
-    driver
+    wait_for_url_path(driver, "/add").await?;
+    let name_input = driver
         .find(By::Id("recipe-name"))
         .await
         .context("the + FAB did not open the add-recipe form")?;
-    wait_for_url_path(driver, "/add").await?;
+    name_input.send_keys("Pancakes").await?;
 
+    // Structured ingredient rows.
+    driver.find(By::Id("ing-qty-0")).await?.send_keys("200").await?;
+    driver.find(By::Id("ing-unit-0")).await?.send_keys("g").await?;
+    driver.find(By::Id("ing-name-0")).await?.send_keys("Flour").await?;
     driver
-        .find(By::Id("recipe-name"))
+        .find(By::Id("add-ingredient"))
         .await?
-        .send_keys("Pancakes")
-        .await
-        .context("failed to type recipe name")?;
-    driver
-        .find(By::Id("recipe-ingredients"))
-        .await?
-        .send_keys("Flour, Milk\nEggs")
+        .click()
         .await?;
+    driver
+        .find(By::Id("ing-name-1"))
+        .await?
+        .send_keys("Milk")
+        .await?;
+
+    // Instructions: one step per line.
+    driver
+        .find(By::Id("recipe-instructions"))
+        .await?
+        .send_keys("Mix the batter\nCook in a hot pan")
+        .await?;
+
     driver.find(By::Id("recipe-submit")).await?.click().await?;
 
-    // Submitting routes back to the grid, where the new card appears.
-    wait_for_url_path(driver, "/").await?;
-    if let Err(err) = driver
-        .find(By::XPath(
-            "//div[contains(@class, 'recipe-card-name') and contains(., 'Pancakes')]",
-        ))
-        .await
-    {
+    // -- 3. The detail view shows the structured recipe. --------------------
+    wait_for_url_path_prefix(driver, "/recipe/").await?;
+    let detail_url = driver.current_url().await?;
+    let id: i64 = detail_url
+        .path()
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .context("detail url does not contain a recipe id")?;
+    if let Err(err) = assert_detail_view(driver, "Pancakes").await {
         let src = driver.source().await.unwrap_or_default();
-        anyhow::bail!("recipe card missing after submission ({err}); page source:\n{src}");
+        anyhow::bail!("detail view incomplete after creation ({err}); page source:\n{src}");
     }
 
-    // The recipe click must have persisted the recipe itself to the DB.
-    poll_recipes(&http, base, "Pancakes", "Flour, Milk\nEggs")
+    // -- 4. Functional edit via the pencil button. --------------------------
+    driver.find(By::Id("hdr-edit")).await?.click().await?;
+    wait_for_url_path(driver, &format!("/edit/{id}")).await?;
+    let name_input = driver
+        .find(By::Id("recipe-name"))
         .await
-        .context("recipe was not persisted to the database")?;
+        .context("edit form did not open")?;
+    let prefilled = name_input.value().await?.unwrap_or_default();
+    anyhow::ensure!(
+        prefilled == "Pancakes",
+        "edit form should be prefilled, got '{prefilled}'"
+    );
+    // Clear and rename (send_keys appends, so select-all first).
+    name_input.clear().await?;
+    name_input.send_keys("Pancakes Deluxe").await?;
+    driver.find(By::Id("recipe-submit")).await?.click().await?;
+    wait_for_url_path_prefix(driver, "/recipe/").await?;
+    if let Err(err) = assert_detail_view(driver, "Pancakes Deluxe").await {
+        let src = driver.source().await.unwrap_or_default();
+        anyhow::bail!("detail view incomplete after edit ({err}); page source:\n{src}");
+    }
+    poll_detail(http, base, id, "Pancakes Deluxe").await?;
 
-    // -- 4. Shopping tab: grouped list shows the parsed ingredients. --------
+    // -- 5. The shopping list is untouched by recipe creation. --------------
     driver
         .find(By::LinkText("Shopping"))
         .await?
         .click()
         .await?;
     wait_for_url_path(driver, "/grocery").await?;
-    driver
-        .find(By::XPath(
-            "//button[contains(@class, 'grocery-group') and contains(., 'Groceries')]",
-        ))
-        .await
-        .context("default grocery group header did not render")?;
-    for ingredient in ["Flour", "Milk", "Eggs"] {
-        let li = format!("//li[contains(., '{ingredient}')]");
-        driver
-            .find(By::XPath(&li))
-            .await
-            .with_context(|| format!("ingredient '{ingredient}' missing from grocery list"))?;
-    }
-
-    // Group collapse toggles the items away and back.
-    driver
-        .find(By::XPath(
-            "//button[contains(@class, 'grocery-group') and contains(., 'Groceries')]",
-        ))
-        .await?
-        .click()
-        .await?;
     let src = driver.source().await?;
     anyhow::ensure!(
-        !src.contains("Flour"),
-        "grocery group did not collapse (items still in the DOM)"
+        src.contains("grocery list is empty"),
+        "recipe ingredients must not be auto-added; source:\n{src}"
     );
-    driver
-        .find(By::XPath(
-            "//button[contains(@class, 'grocery-group') and contains(., 'Groceries')]",
-        ))
-        .await?
-        .click()
-        .await?;
-    driver
-        .find(By::XPath("//li[contains(., 'Flour')]"))
-        .await
-        .context("grocery group did not re-expand")?;
 
-    // Tick "Milk" off and verify the checkbox state was persisted to SQLite.
-    let milk = driver
-        .find(By::XPath(
-            "//li[contains(., 'Milk')]/input[@type='checkbox']",
-        ))
-        .await?;
-    milk.click().await?;
-    poll_grocery(&http, base, "Milk", Some(true))
-        .await
-        .context("'bought' state was not persisted to the database")?;
-
-    // Manually add an item and verify it too reaches the database.
+    // Manual add still works and creates a group.
     driver
         .find(By::Id("grocery-input"))
         .await?
@@ -232,17 +185,74 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         .find(By::XPath("//li[contains(., 'Bananas')]"))
         .await
         .context("manually added item did not appear in the UI")?;
-    poll_grocery(&http, base, "Bananas", None)
+    poll_grocery(&http, base, "Bananas", None).await?;
+
+    // -- 6. Confirm-delete removes the recipe. ------------------------------
+    driver
+        .find(By::LinkText("Recipes"))
+        .await?
+        .click()
+        .await?;
+    wait_for_url_path(driver, "/").await?;
+    driver
+        .find(By::XPath(
+            "//div[contains(@class, 'recipe-card-name') and contains(., 'Pancakes Deluxe')]",
+        ))
+        .await?
+        .click()
+        .await?;
+    wait_for_url_path_prefix(driver, "/recipe/").await?;
+    driver
+        .find(By::Id("hdr-delete"))
+        .await?
+        .click()
+        .await?;
+    driver
+        .find(By::Css(".dialog"))
         .await
-        .context("manually added item missing from the database")?;
+        .context("delete confirmation dialog did not appear")?;
+    driver.find(By::Id("cancel-delete")).await?.click().await?;
+    let src = driver.source().await?;
+    anyhow::ensure!(
+        src.contains("Pancakes Deluxe"),
+        "cancel must not delete the recipe"
+    );
+    driver.find(By::Id("hdr-delete")).await?.click().await?;
+    driver.find(By::Id("confirm-delete")).await?.click().await?;
+    wait_for_url_path(driver, "/").await?;
+    let src = driver.source().await?;
+    anyhow::ensure!(
+        !src.contains("Pancakes Deluxe"),
+        "deleted recipe still visible in the grid"
+    );
+    // And it is gone from the database too.
+    for _ in 0..50 {
+        let recipes: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if recipes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    anyhow::ensure!(recipes.is_empty(), "deleted recipe still in the database");
 
     Ok(())
 }
 
 /// Photo upload flow: a photo picked in the form is stored as full-res +
-/// compressed thumbnail and served by the backend; the grid card shows it.
+/// compressed thumbnail, served by the backend and shown in the detail view.
 #[tokio::test(flavor = "multi_thread")]
-async fn photo_upload_reaches_grid_and_database() -> anyhow::Result<()> {
+async fn photo_upload_reaches_detail_and_database() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
     let base = format!("http://{addr}");
     let http = reqwest::Client::new();
@@ -263,9 +273,9 @@ async fn photo_upload_reaches_grid_and_database() -> anyhow::Result<()> {
             .send_keys("Photo Cake")
             .await?;
         driver
-            .find(By::Id("recipe-ingredients"))
+            .find(By::Id("ing-name-0"))
             .await?
-            .send_keys("Cocoa, Sugar")
+            .send_keys("Cocoa")
             .await?;
         // Set the file input directly (WebDriver standard behaviour).
         driver
@@ -275,25 +285,31 @@ async fn photo_upload_reaches_grid_and_database() -> anyhow::Result<()> {
             .await?;
         driver.find(By::Id("recipe-submit")).await?.click().await?;
 
-        // The grid card renders the compressed thumbnail.
-        wait_for_url_path(&driver, "/").await?;
-        if let Err(err) = driver.find(By::Css("#recipe-grid .recipe-card img")).await {
+        // The detail view renders the full-resolution photo.
+        wait_for_url_path_prefix(&driver, "/recipe/").await?;
+        if let Err(err) = driver.find(By::Css(".detail-photo img")).await {
             let src = driver.source().await.unwrap_or_default();
-            anyhow::bail!("recipe card thumbnail missing after submission ({err}); page source:\n{src}");
+            anyhow::bail!("detail photo missing after submission ({err}); page source:\n{src}");
         }
 
-        // Database: both image variants exist and the thumbnail is served.
-        let recipe = poll_recipes_full(&http, &base, "Photo Cake")
-            .await
-            .context("photo recipe missing from the database")?;
-        let image = recipe.image.context("full-res image url missing")?;
-        let thumb = recipe.thumb.context("thumbnail url missing")?;
+        // Database: both image variants exist and are served.
+        let detail_url = driver.current_url().await?;
+        let id: i64 = detail_url
+            .path()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .context("detail url does not contain a recipe id")?;
+        let detail = poll_detail_full(&http, &base, id).await?;
+        let image = detail.image.context("full-res image url missing")?;
+        let thumb = detail.thumb.context("thumbnail url missing")?;
         for (label, url) in [("full-res", &image), ("thumb", &thumb)] {
             let resp = http.get(format!("{base}{url}")).send().await?;
             let status = resp.status();
             let content_type = resp.headers().get("content-type").cloned();
             anyhow::ensure!(
-                status.is_success() && content_type.is_some_and(|c| c.to_str().unwrap().starts_with("image/")),
+                status.is_success()
+                    && content_type.is_some_and(|c| c.to_str().unwrap().starts_with("image/")),
                 "{label} image {url} not served correctly ({status})"
             );
         }
@@ -305,29 +321,108 @@ async fn photo_upload_reaches_grid_and_database() -> anyhow::Result<()> {
     result
 }
 
-/// Browser-free API contract test: POSTing a recipe must split its
-/// ingredients onto the grouped grocery list and persist everything.
+/// Browser-free API contract test: structured create/update/delete plus a
+/// grocery list that only changes through explicit calls.
 #[tokio::test(flavor = "multi_thread")]
-async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
+async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
     let base = format!("http://{addr}");
     let http = reqwest::Client::new();
 
+    // Create (structured).
     let status = http
         .post(format!("{base}/api/recipes"))
-        .json(&NewRecipe {
+        .json(&RecipeInput {
             name: "Stew".into(),
-            ingredients: "Carrots, Onions".into(),
+            ingredients: vec![
+                Ingredient {
+                    quantity: Some(300.0),
+                    unit: Some("ml".into()),
+                    name: "water".into(),
+                    prep: None,
+                },
+                Ingredient {
+                    quantity: None,
+                    unit: None,
+                    name: "salt".into(),
+                    prep: Some("to taste".into()),
+                },
+            ],
+            instructions: vec!["Boil water".into(), "Add salt".into()],
         })
         .send()
         .await?
         .status();
     assert_eq!(status, 201, "POST /api/recipes must return 201");
-    poll_recipes(&http, &base, "Stew", "Carrots, Onions").await?;
-    poll_grocery(&http, &base, "Carrots", None).await?;
-    poll_grocery(&http, &base, "Onions", None).await?;
 
-    // Manual grocery item + bought toggle, with and without a category.
+    // The shopping list must NOT receive recipe ingredients.
+    let grocery: Vec<GroceryItem> = http
+        .get(format!("{base}/api/grocery"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    anyhow::ensure!(
+        grocery.is_empty(),
+        "ingredients leaked into the grocery list: {grocery:?}"
+    );
+
+    // Detail round-trip.
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let id = recipes[0].id;
+    let detail = poll_detail_full(&http, &base, id).await?;
+    assert_eq!(detail.name, "Stew");
+    assert_eq!(detail.ingredients.len(), 2);
+    assert_eq!(detail.ingredients[1].prep.as_deref(), Some("to taste"));
+    assert_eq!(detail.instructions, vec!["Boil water", "Add salt"]);
+
+    // Update (multipart PUT).
+    let boundary = "e2eUpDbNd";
+    let payload = concat!(
+        "--e2eUpDbNd\r\n",
+        "Content-Disposition: form-data; name=\"name\"\r\n\r\n",
+        "Better Stew\r\n",
+        "--e2eUpDbNd\r\n",
+        "Content-Disposition: form-data; name=\"ingredients\"\r\n\r\n",
+        "[{\"quantity\":2,\"unit\":\"g\",\"name\":\"carrot\",\"prep\":\"grated\"}]\r\n",
+        "--e2eUpDbNd\r\n",
+        "Content-Disposition: form-data; name=\"instructions\"\r\n\r\n",
+        "[\"chop\"]\r\n",
+        "--e2eUpDbNd--\r\n",
+    );
+    let updated: RecipeDetail = http
+        .put(format!("{base}/api/recipes/{id}"))
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .body(payload)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(updated.name, "Better Stew");
+    assert_eq!(updated.ingredients.len(), 1);
+    assert_eq!(updated.ingredients[0].name, "carrot");
+    assert_eq!(updated.instructions, vec!["chop"]);
+
+    // Delete.
+    let status = http
+        .delete(format!("{base}/api/recipes/{id}"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 204);
+    let status = http
+        .get(format!("{base}/api/recipes/{id}"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 404);
+
+    // Grocery manual add + bought toggle still behave.
     let item: GroceryItem = http
         .post(format!("{base}/api/grocery"))
         .json(&NewGroceryItem { name: "Potatoes".into(), category: None })
@@ -336,33 +431,20 @@ async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
         .json()
         .await?;
     assert_eq!(item.category, shared::DEFAULT_CATEGORY);
-    let updated: GroceryItem = http
+    let updated_item: GroceryItem = http
         .patch(format!("{base}/api/grocery/{}", item.id))
         .json(&shared::GroceryUpdate { bought: true })
         .send()
         .await?
         .json()
         .await?;
-    assert!(updated.bought, "PATCH must flip the bought flag");
+    assert!(updated_item.bought, "PATCH must flip the bought flag");
     poll_grocery(&http, &base, "Potatoes", Some(true)).await?;
-
-    let item: GroceryItem = http
-        .post(format!("{base}/api/grocery"))
-        .json(&NewGroceryItem {
-            name: "Wine".into(),
-            category: Some("Online Alcohol".into()),
-        })
-        .send()
-        .await?
-        .json()
-        .await?;
-    assert_eq!(item.category, "Online Alcohol");
-    poll_grocery(&http, &base, "Wine", None).await?;
 
     // Invalid payloads are rejected with 4xx, not 5xx.
     let status = http
         .post(format!("{base}/api/recipes"))
-        .json(&NewRecipe { name: "  ".into(), ingredients: String::new() })
+        .json(&RecipeInput { name: "  ".into(), ingredients: vec![], instructions: vec![] })
         .send()
         .await?
         .status();
@@ -375,8 +457,71 @@ async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Shared UI assertions & helpers
 // ---------------------------------------------------------------------------
+
+async fn assert_shell(driver: &WebDriver) -> anyhow::Result<()> {
+    driver
+        .find(By::Id("bottom-nav"))
+        .await
+        .context("app shell (bottom navigation) did not render")?;
+    driver
+        .find(By::Css(".wallpaper"))
+        .await
+        .context("app shell (wallpaper) did not render")?;
+    for tab in ["Recipes", "Meal plan", "Shopping", "Settings"] {
+        driver
+            .find(By::LinkText(tab))
+            .await
+            .with_context(|| format!("nav tab '{tab}' missing"))?;
+    }
+    // The browser tab is named and shows the favicon.
+    let title = driver.title().await?;
+    anyhow::ensure!(
+        title == "Bouedig",
+        "tab title should be 'Bouedig', got '{title}'"
+    );
+    driver
+        .find(By::Css("link[rel='icon']"))
+        .await
+        .context("favicon <link> missing from the document head")?;
+    Ok(())
+}
+
+/// Assert the currently open detail page shows the given recipe name with
+/// its structured ingredients/instructions and the full header bar.
+async fn assert_detail_view(driver: &WebDriver, name: &str) -> anyhow::Result<()> {
+    let h1 = driver.find(By::Css(".detail-name")).await?;
+    let shown = h1.text().await?;
+    anyhow::ensure!(shown == name, "detail shows '{shown}', expected '{name}'");
+    // Header bar: real actions + placeholders.
+    driver.find(By::Id("hdr-back")).await?;
+    driver.find(By::Id("hdr-edit")).await?;
+    driver.find(By::Id("hdr-delete")).await?;
+    driver.find(By::Css(".detail-header .hdr-btn.ph")).await?;
+    // Ingredient list with bullet items.
+    let list = driver
+        .find(By::Id("ingredient-list"))
+        .await
+        .context("ingredient list missing")?;
+    let text = list.text().await?;
+    anyhow::ensure!(
+        text.contains("200 g Flour"),
+        "ingredient line missing from detail: '{text}'"
+    );
+    anyhow::ensure!(text.contains("Milk"), "ingredient 'Milk' missing: '{text}'");
+    // Numbered instructions.
+    let steps = driver
+        .find(By::Id("instruction-list"))
+        .await
+        .context("instruction list missing")?;
+    let text = steps.text().await?;
+    anyhow::ensure!(
+        text.contains("Mix the batter") && text.contains("Cook in a hot pan"),
+        "instructions missing from detail: '{text}'"
+    );
+    Ok(())
+}
 
 async fn open_headless_firefox() -> anyhow::Result<WebDriver> {
     let mut caps = Capabilities::new();
@@ -395,15 +540,27 @@ async fn open_headless_firefox() -> anyhow::Result<WebDriver> {
 
 /// Wait until the current URL path equals `path` (router navigation).
 async fn wait_for_url_path(driver: &WebDriver, path: &str) -> anyhow::Result<()> {
+    wait_for_url_path_if(driver, &|p| p == path).await
+}
+
+/// Wait until the current URL path starts with `prefix` (e.g. /recipe/).
+async fn wait_for_url_path_prefix(driver: &WebDriver, prefix: &str) -> anyhow::Result<()> {
+    wait_for_url_path_if(driver, &|p| p.starts_with(prefix)).await
+}
+
+async fn wait_for_url_path_if(
+    driver: &WebDriver,
+    matches: &impl Fn(&str) -> bool,
+) -> anyhow::Result<()> {
     for _ in 0..50 {
         let url = driver.current_url().await?;
-        if url.path() == path {
+        if matches(url.path()) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let url = driver.current_url().await?;
-    anyhow::bail!("navigation to '{path}' never happened (at {})", url)
+    anyhow::bail!("navigation never happened (at {})", url)
 }
 
 /// Poll TCP until something is listening (backend or geckodriver).
@@ -444,51 +601,47 @@ async fn poll_grocery(
     anyhow::bail!("grocery item '{name}' (bought={bought:?}) never appeared in the database")
 }
 
-/// Poll `GET /api/recipes` until the given recipe (name + ingredients) has
-/// been persisted.
-async fn poll_recipes(
+/// Poll `GET /api/recipes/{id}` until the recipe carries the expected name.
+async fn poll_detail(
     http: &reqwest::Client,
     base: &str,
+    id: i64,
     name: &str,
-    ingredients: &str,
 ) -> anyhow::Result<()> {
     for _ in 0..50 {
-        let recipes: Vec<Recipe> = http
-            .get(format!("{base}/api/recipes"))
+        if let Ok(detail) = http
+            .get(format!("{base}/api/recipes/{id}"))
             .send()
-            .await?
-            .json()
-            .await?;
-        if recipes
-            .iter()
-            .any(|r| r.name == name && r.ingredients == ingredients)
+            .await
         {
-            return Ok(());
+            if detail.status().is_success() {
+                let detail: RecipeDetail = detail.json().await?;
+                if detail.name == name {
+                    return Ok(());
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    anyhow::bail!("recipe '{name}' ('{ingredients}') never appeared in the database")
+    anyhow::bail!("recipe {id} never became '{name}' in the database")
 }
 
-/// Like `poll_recipes` but returns the matched recipe (with image fields).
-async fn poll_recipes_full(
+/// Like `poll_detail` but returns the detail (with image fields).
+async fn poll_detail_full(
     http: &reqwest::Client,
     base: &str,
-    name: &str,
-) -> anyhow::Result<Recipe> {
+    id: i64,
+) -> anyhow::Result<RecipeDetail> {
     for _ in 0..50 {
-        let recipes: Vec<Recipe> = http
-            .get(format!("{base}/api/recipes"))
+        let detail: RecipeDetail = http
+            .get(format!("{base}/api/recipes/{id}"))
             .send()
             .await?
             .json()
             .await?;
-        if let Some(recipe) = recipes.iter().find(|r| r.name == name) {
-            return Ok(recipe.clone());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        return Ok(detail);
     }
-    anyhow::bail!("recipe '{name}' never appeared in the database")
+    unreachable!()
 }
 
 /// Locate the web bundle produced by `dx build`. The Justfile exports

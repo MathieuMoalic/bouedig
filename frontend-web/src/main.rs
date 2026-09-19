@@ -3,9 +3,12 @@
 use std::collections::HashSet;
 
 use dioxus::prelude::*;
-use wasm_bindgen::JsCast;
 use serde::de::DeserializeOwned;
-use shared::{GroceryItem, GroceryUpdate, NewGroceryItem, NewRecipe, Recipe};
+use wasm_bindgen::JsCast;
+use shared::{
+    GroceryItem, GroceryUpdate, Ingredient, NewGroceryItem, Recipe,
+    RecipeDetail as RecipeDetailModel, RecipeInput,
+};
 
 const WALLPAPER: Asset = asset!("/assets/background.avif");
 const FAVICON: Asset = asset!("/assets/icon.png");
@@ -26,6 +29,10 @@ enum Route {
     Recipes {},
     #[route("/add")]
     AddRecipe {},
+    #[route("/recipe/:id")]
+    RecipeDetail { id: i64 },
+    #[route("/edit/:id")]
+    EditRecipe { id: i64 },
     #[route("/grocery")]
     Grocery {},
     #[route("/meal-plan")]
@@ -42,7 +49,7 @@ fn App() -> Element {
 }
 
 // ---------------------------------------------------------------------------
-// App shell: wallpaper + content + bottom navigation (blaz-style)
+// App shell: wallpaper + content + bottom navigation
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -139,6 +146,8 @@ impl Icons {
     }
 }
 
+// --- small icons used across pages -----------------------------------------
+
 #[component]
 fn IconPlus() -> Element {
     rsx! {
@@ -195,6 +204,66 @@ fn IconCalendar() -> Element {
     }
 }
 
+#[component]
+fn IconBack() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round",
+            path { d: "M19 12H5M11 18l-6-6 6-6" }
+        }
+    }
+}
+
+#[component]
+fn IconTimer() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round",
+            circle { cx: "12", cy: "13", r: "7.5" }
+            path { d: "M12 9.5V13l2.5 2M9.5 2.5h5M12 2.5V5" }
+        }
+    }
+}
+
+#[component]
+fn IconShare() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round",
+            circle { cx: "6", cy: "12", r: "2.6" }
+            circle { cx: "18", cy: "6", r: "2.6" }
+            circle { cx: "18", cy: "18", r: "2.6" }
+            path { d: "M8.3 10.8l7.4-3.6M8.3 13.2l7.4 3.6" }
+        }
+    }
+}
+
+#[component]
+fn IconCart() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round",
+            path { d: "M2.5 4h2.6l2.5 11.5h11l2.4-8.5H6.2" }
+            circle { cx: "9", cy: "20", r: "1.4" }
+            circle { cx: "17", cy: "20", r: "1.4" }
+        }
+    }
+}
+
+#[component]
+fn IconPencil() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round",
+            path { d: "M4 20h4l11-11-4-4L4 16v4zM13.5 5.5l4 4" }
+        }
+    }
+}
+
+#[component]
+fn IconTrash() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round",
+            path { d: "M4 7h16M9 7V4h6v3M6.5 7l1 13h9l1-13M10 11v6M14 11v6" }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // API helpers
 // ---------------------------------------------------------------------------
@@ -242,26 +311,30 @@ async fn api_get<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
 /// not available on wasm). Returns the `Content-Type` header value and body.
 fn build_multipart(
     name: &str,
-    ingredients: &str,
-    filename: &str,
-    image: &[u8],
+    ingredients_json: &str,
+    instructions_json: &str,
+    image: Option<(&str, &[u8])>,
 ) -> (String, Vec<u8>) {
     // `SystemTime::now` is not implemented on wasm, use the JS clock.
     let boundary = format!("bouedig{}", js_sys::Date::now() as u64);
-    let mime = match filename.rsplit('.').next().unwrap_or_default() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => "application/octet-stream",
-    };
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n").as_bytes());
-    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n{ingredients}\r\n").as_bytes());
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes(),
-    );
-    body.extend_from_slice(image);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n{ingredients_json}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n{instructions_json}\r\n").as_bytes());
+    if let Some((filename, bytes)) = image {
+        let mime = match filename.rsplit('.').next().unwrap_or_default() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "application/octet-stream",
+        };
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
@@ -271,8 +344,8 @@ fn build_multipart(
 
 #[component]
 fn Recipes() -> Element {
-    let recipes = use_signal(Vec::<Recipe>::new);
-    let error = use_signal(|| String::new());
+    let mut recipes = use_signal(Vec::<Recipe>::new);
+    let mut error = use_signal(|| String::new());
     let mut loaded = use_signal(|| false);
     let navigator = use_navigator();
 
@@ -280,7 +353,17 @@ fn Recipes() -> Element {
         if !loaded() {
             loaded.set(true);
             spawn(async move {
-                refresh_recipes(recipes, error).await;
+                match api_get::<Vec<Recipe>>("/api/recipes").await {
+                    Ok(list) => {
+                        tracing::debug!("recipes refreshed: {} items", list.len());
+                        recipes.set(list);
+                        error.set(String::new());
+                    }
+                    Err(err) => {
+                        tracing::error!("recipes refresh failed: {err:#}");
+                        error.set(err.to_string());
+                    }
+                }
             });
         }
     });
@@ -294,7 +377,7 @@ fn Recipes() -> Element {
             }
             div { id: "recipe-grid", class: "recipe-grid",
                 for recipe in list {
-                    RecipeCard { recipe: recipe }
+                    RecipeCard { key: "{recipe.id}", recipe: recipe }
                 }
             }
             div { class: "fab-stack",
@@ -317,6 +400,7 @@ fn Recipes() -> Element {
 
 #[component]
 fn RecipeCard(recipe: Recipe) -> Element {
+    let navigator = use_navigator();
     let initials: String = recipe
         .name
         .split_whitespace()
@@ -326,64 +410,205 @@ fn RecipeCard(recipe: Recipe) -> Element {
         .to_uppercase();
 
     rsx! {
-        div { class: "recipe-card", id: "recipe-card-{recipe.id}",
+        div {
+            class: "recipe-card clickable",
+            id: "recipe-card-{recipe.id}",
+            role: "button",
+            tabindex: "0",
+            onclick: move |_| {
+                tracing::info!("recipe card {} clicked, opening detail", recipe.id);
+                navigator.push(Route::RecipeDetail { id: recipe.id });
+            },
             div { class: "recipe-card-media",
                 if let Some(thumb) = &recipe.thumb {
                     img { src: "{thumb}", loading: "lazy", alt: "{recipe.name}" }
                 } else {
                     div { class: "recipe-placeholder", "{initials}" }
                 }
-                button { class: "card-fab", title: "Add to meal plan", IconCalendar {} }
+                button { class: "card-fab", title: "Add to meal plan", onclick: move |e: MouseEvent| e.stop_propagation(), IconCalendar {} }
             }
             div { class: "recipe-card-name", "{recipe.name}" }
         }
     }
 }
 
-/// Load the recipes grid from the backend.
-async fn refresh_recipes(mut recipes: Signal<Vec<Recipe>>, mut error: Signal<String>) {
-    match api_get::<Vec<Recipe>>("/api/recipes").await {
-        Ok(list) => {
-            tracing::debug!("recipes refreshed: {} items", list.len());
-            recipes.set(list);
-            error.set(String::new());
-        }
-        Err(err) => {
-            tracing::error!("recipes refresh failed: {err:#}");
-            error.set(err.to_string());
-        }
+// ---------------------------------------------------------------------------
+// Tab: Add / Edit recipe (shared structured form)
+// ---------------------------------------------------------------------------
+
+/// In-progress ingredient fields as raw strings (parsed on submit).
+#[derive(Clone, Default, PartialEq)]
+struct IngredientDraft {
+    quantity: String,
+    unit: String,
+    name: String,
+    prep: String,
+}
+
+/// In-progress ingredient row. `initial` seeds the input's `value` attribute
+/// exactly once (dioxus only rewrites changed attributes, so a value bound to
+/// live state would fight the caret while typing); `draft` mirrors what the
+/// user typed, purely for parsing on submit.
+#[derive(Clone, PartialEq)]
+struct IngredientRow {
+    id: u64,
+    initial: IngredientDraft,
+    draft: IngredientDraft,
+}
+
+impl IngredientRow {
+    fn empty(id: u64) -> Self {
+        Self { id, initial: IngredientDraft::default(), draft: IngredientDraft::default() }
+    }
+    fn from_draft(id: u64, draft: IngredientDraft) -> Self {
+        Self { id, initial: draft.clone(), draft }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tab: Add recipe (opened via the + FAB)
-// ---------------------------------------------------------------------------
+/// In-progress text field: static initial value + live mirror for parsing.
+#[derive(Clone, Default, PartialEq)]
+struct TextField {
+    initial: String,
+    draft: String,
+}
+
+impl TextField {
+    fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self { initial: value.clone(), draft: value }
+    }
+}
+
+fn parse_drafts(rows: &[IngredientRow]) -> Vec<Ingredient> {
+    rows.iter()
+        .filter(|r| !r.draft.name.trim().is_empty())
+        .map(|r| Ingredient {
+            quantity: r.draft.quantity.trim().parse::<f64>().ok(),
+            unit: (!r.draft.unit.trim().is_empty()).then(|| r.draft.unit.trim().to_string()),
+            name: r.draft.name.trim().to_string(),
+            prep: (!r.draft.prep.trim().is_empty()).then(|| r.draft.prep.trim().to_string()),
+        })
+        .collect()
+}
+
+fn parse_instructions(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Format a quantity without trailing zeros (200.0 -> "200", 1.5 -> "1.5").
+fn fmt_qty(q: f64) -> String {
+    let s = format!("{q}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
 
 #[component]
 fn AddRecipe() -> Element {
-    let mut name = use_signal(String::new);
-    let mut ingredients = use_signal(String::new);
+    rsx! {
+        RecipeForm { editing: None }
+    }
+}
+
+#[component]
+fn EditRecipe(id: i64) -> Element {
+    rsx! {
+        RecipeForm { editing: Some(id) }
+    }
+}
+
+#[component]
+fn RecipeForm(editing: Option<i64>) -> Element {
+    let mut detail = use_signal(|| None::<RecipeDetailModel>);
+    let mut load_error = use_signal(|| String::new());
+
+    // Load the existing recipe when editing; create mode renders immediately.
+    use_effect(move || {
+        let Some(id) = editing else { return };
+        spawn(async move {
+            match api_get::<RecipeDetailModel>(&format!("/api/recipes/{id}")).await {
+                Ok(d) => detail.set(Some(d)),
+                Err(err) => {
+                    tracing::error!("failed to load recipe {id} for editing: {err:#}");
+                    load_error.set(err.to_string());
+                }
+            }
+        });
+    });
+
+    let loaded = detail.read().clone();
+    match (editing, loaded) {
+        (None, _) => rsx! {
+            RecipeFormFields { initial: RecipeDetailModel::default(), editing_id: None }
+        },
+        (Some(_), Some(initial)) => rsx! {
+            RecipeFormFields { initial: initial, editing_id: editing }
+        },
+        (Some(_), None) => rsx! {
+            if load_error.read().is_empty() {
+                p { class: "empty", "Loading…" }
+            } else {
+                p { class: "status-error", "{load_error}" }
+            }
+        },
+    }
+}
+
+#[component]
+fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Element {
+    let mut next_row_id = use_signal(|| initial.ingredients.len() as u64);
+    let mut name = use_signal(|| TextField::new(initial.name.clone()));
+    let mut rows = use_signal(|| {
+        if initial.ingredients.is_empty() {
+            vec![IngredientRow::empty(0)]
+        } else {
+            initial
+                .ingredients
+                .iter()
+                .enumerate()
+                .map(|(i, ingredient)| {
+                    IngredientRow::from_draft(
+                        i as u64,
+                        IngredientDraft {
+                            quantity: ingredient.quantity.map(fmt_qty).unwrap_or_default(),
+                            unit: ingredient.unit.clone().unwrap_or_default(),
+                            name: ingredient.name.clone(),
+                            prep: ingredient.prep.clone().unwrap_or_default(),
+                        },
+                    )
+                })
+                .collect()
+        }
+    });
+    let mut instructions_text = use_signal(|| TextField::new(initial.instructions.join("\n")));
     let mut photo = use_signal(|| None::<(String, Vec<u8>)>);
     let mut status = use_signal(|| String::new());
     let mut status_error = use_signal(|| false);
     let navigator = use_navigator();
 
-    let preview = shared::parse_ingredients(&ingredients.read()).join(", ");
-    let photo_name = photo.read().as_ref().map(|(n, _)| n.clone());
+    let existing_thumb = initial.thumb.clone();
 
     rsx! {
         div { class: "page",
-            h1 { "Add a Recipe" }
+            h1 { if editing_id.is_some() { "Edit Recipe" } else { "Add a Recipe" } }
             form {
                 class: "card",
                 onsubmit: move |e: FormEvent| {
                     e.prevent_default();
                     status_error.set(false);
-                    let recipe = NewRecipe {
-                        name: name.read().clone(),
-                        ingredients: ingredients.read().clone(),
+                    let ingredients = parse_drafts(&rows.read());
+                    let input = RecipeInput {
+                        name: name.read().draft.trim().to_string(),
+                        ingredients: ingredients.clone(),
+                        instructions: parse_instructions(&instructions_text.read().draft),
                     };
-                    if recipe.name.trim().is_empty() {
+                    if input.name.trim().is_empty() {
                         status.set("Please enter a recipe name.".into());
                         status_error.set(true);
                         return;
@@ -391,45 +616,70 @@ fn AddRecipe() -> Element {
                     let image = photo.read().clone();
                     spawn(async move {
                         let client = reqwest::Client::new();
-                        let url = format!("{}/api/recipes", api_base());
+                        let base = api_base();
                         tracing::info!(
-                            "Add Recipe button: POST (name={:?}, ingredients={:?}, photo={})",
-                            recipe.name,
-                            recipe.ingredients,
-                            image.is_some()
+                            "Recipe form submit (edit={:?}, name={:?}, ingredients={}, photo={})",
+                            editing_id, input.name, input.ingredients.len(), image.is_some()
                         );
-                        let result = match image {
-                            Some((filename, bytes)) => {
-                                let url = format!("{url}/photo");
-                                let (content_type, body) =
-                                    build_multipart(&recipe.name, &recipe.ingredients, &filename, &bytes);
+                        let ingredients_json = serde_json::to_string(&input.ingredients).unwrap_or_default();
+                        let instructions_json = serde_json::to_string(&input.instructions).unwrap_or_default();
+
+                        let result = match (editing_id, image) {
+                            (None, None) => client
+                                .post(format!("{base}/api/recipes"))
+                                .json(&input)
+                                .send()
+                                .await
+                                .map(|r| (r, None)),
+                            (None, Some((filename, bytes))) => {
+                                let (ct, body) = build_multipart(
+                                    &input.name, &ingredients_json, &instructions_json,
+                                    Some((&filename, &bytes)),
+                                );
                                 client
-                                    .post(url)
-                                    .header("Content-Type", content_type)
+                                    .post(format!("{base}/api/recipes/photo"))
+                                    .header("Content-Type", ct)
                                     .body(body)
                                     .send()
                                     .await
+                                    .map(|r| (r, None))
                             }
-                            None => client.post(url).json(&recipe).send().await,
+                            (Some(id), image) => {
+                                let image_ref = image.as_ref()
+                                    .map(|(f, b)| (f.as_str(), b.as_slice()));
+                                let (ct, body) = build_multipart(
+                                    &input.name, &ingredients_json, &instructions_json, image_ref,
+                                );
+                                client
+                                    .put(format!("{base}/api/recipes/{id}"))
+                                    .header("Content-Type", ct)
+                                    .body(body)
+                                    .send()
+                                    .await
+                                    .map(|r| (r, editing_id))
+                            }
                         };
                         match result {
-                            Ok(r) if r.status().is_success() => {
+                            Ok((r, redirect)) if r.status().is_success() => {
                                 tracing::info!("recipe saved ({})", r.status());
-                                status.set("Recipe added! Ingredients moved to your grocery list.".into());
-                                name.set(String::new());
-                                ingredients.set(String::new());
-                                photo.set(None);
-                                // Back to the grid, which reloads automatically.
-                                navigator.replace(Route::Recipes {});
+                                // Detailed responses carry the id; navigate there.
+                                let saved_id = match redirect {
+                                    Some(id) => Some(id),
+                                    None => r.json::<Recipe>().await.ok().map(|recipe| recipe.id),
+                                };
+                                match saved_id {
+                                    Some(id) => navigator.replace(Route::RecipeDetail { id }),
+                                    None => navigator.replace(Route::Recipes {}),
+                                };
                             }
-                            Ok(r) => {
+                            Ok((r, _)) => {
                                 let msg = format!("Server error: {}", r.status());
-                                tracing::error!("POST recipe failed: {msg}");
+                                tracing::error!("recipe save failed: {msg}");
                                 status.set(msg);
                                 status_error.set(true);
                             }
                             Err(err) => {
-                                tracing::error!("POST recipe request failed: {err:#}");
+                                tracing::error!("recipe save request failed: {err:#}");
                                 status.set(format!("Request failed: {err}"));
                                 status_error.set(true);
                             }
@@ -440,18 +690,130 @@ fn AddRecipe() -> Element {
                 input {
                     id: "recipe-name",
                     r#type: "text",
-                    value: "{name}",
+                    value: "{name.read().draft}",
                     placeholder: "e.g. Pancakes",
-                    oninput: move |e: FormEvent| name.set(e.value()),
+                    oninput: move |e: FormEvent| {
+                        let v = e.value();
+                        name.with_mut(|f| f.draft = v);
+                    },
                 }
+
                 label { "Ingredients" }
-                textarea {
-                    id: "recipe-ingredients",
-                    value: "{ingredients}",
-                    placeholder: "Flour, Milk\nEggs (comma or newline separated)",
-                    oninput: move |e: FormEvent| ingredients.set(e.value()),
+                div { id: "ingredient-rows", class: "ingredient-rows",
+                    for row in rows.read().clone() {
+                        div { class: "ingredient-row", key: "{row.id}",
+                            input {
+                                id: "ing-qty-{row.id}",
+                                class: "ing-qty",
+                                r#type: "text",
+                                value: "{row.draft.quantity}",
+                                placeholder: "Qty",
+                                oninput: move |e: FormEvent| {
+                                    let v = e.value();
+                                    let id = row.id;
+                                    rows.with_mut(|r| {
+                                        if let Some(row) = r.iter_mut().find(|r| r.id == id) {
+                                            row.draft.quantity = v;
+                                        }
+                                    });
+                                },
+                            }
+                            input {
+                                id: "ing-unit-{row.id}",
+                                class: "ing-unit",
+                                r#type: "text",
+                                value: "{row.draft.unit}",
+                                placeholder: "Unit",
+                                oninput: move |e: FormEvent| {
+                                    let v = e.value();
+                                    let id = row.id;
+                                    rows.with_mut(|r| {
+                                        if let Some(row) = r.iter_mut().find(|r| r.id == id) {
+                                            row.draft.unit = v;
+                                        }
+                                    });
+                                },
+                            }
+                            input {
+                                id: "ing-name-{row.id}",
+                                class: "ing-name",
+                                r#type: "text",
+                                value: "{row.draft.name}",
+                                placeholder: "Ingredient",
+                                oninput: move |e: FormEvent| {
+                                    let v = e.value();
+                                    let id = row.id;
+                                    rows.with_mut(|r| {
+                                        if let Some(row) = r.iter_mut().find(|r| r.id == id) {
+                                            row.draft.name = v;
+                                        }
+                                    });
+                                },
+                            }
+                            input {
+                                id: "ing-prep-{row.id}",
+                                class: "ing-prep",
+                                r#type: "text",
+                                value: "{row.draft.prep}",
+                                placeholder: "Prep",
+                                oninput: move |e: FormEvent| {
+                                    let v = e.value();
+                                    let id = row.id;
+                                    rows.with_mut(|r| {
+                                        if let Some(row) = r.iter_mut().find(|r| r.id == id) {
+                                            row.draft.prep = v;
+                                        }
+                                    });
+                                },
+                            }
+                            button {
+                                id: "ing-remove-{row.id}",
+                                class: "ing-remove",
+                                title: "Remove ingredient",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    let id = row.id;
+                                    tracing::debug!("removing ingredient row {id}");
+                                    rows.with_mut(|r| r.retain(|r| r.id != id));
+                                    if rows.read().is_empty() {
+                                        rows.with_mut(|r| r.push(IngredientRow::empty(0)));
+                                    }
+                                },
+                                "×"
+                            }
+                        }
+                    }
                 }
+                button {
+                    id: "add-ingredient",
+                    class: "secondary-btn",
+                    r#type: "button",
+                    onclick: move |_| {
+                        tracing::debug!("adding ingredient row");
+                        let id = next_row_id.read().max(1);
+                        rows.with_mut(|r| r.push(IngredientRow::empty(id)));
+                        next_row_id.set(id + 1);
+                    },
+                    "+ Add ingredient"
+                }
+
+                label { "Instructions (one step per line)" }
+                textarea {
+                    id: "recipe-instructions",
+                    value: "{instructions_text.read().draft}",
+                    placeholder: "1. Mix the batter\n2. Cook in a hot pan",
+                    oninput: move |e: FormEvent| {
+                        let v = e.value();
+                        instructions_text.with_mut(|f| f.draft = v);
+                    },
+                }
+
                 label { "Photo (optional)" }
+                if let Some(thumb) = &existing_thumb {
+                    if editing_id.is_some() {
+                        img { class: "photo-preview", src: "{thumb}", alt: "current photo" }
+                    }
+                }
                 input {
                     id: "recipe-photo",
                     r#type: "file",
@@ -471,13 +833,191 @@ fn AddRecipe() -> Element {
                         });
                     },
                 }
-                if let Some(fname) = photo_name {
+                if let Some((fname, _)) = photo.read().clone() {
                     p { class: "hint", "Selected: {fname}" }
                 }
-                p { class: "hint", "Will be added to the grocery list: {preview}" }
-                button { id: "recipe-submit", r#type: "submit", "Add Recipe" }
+
+                button { id: "recipe-submit", r#type: "submit",
+                    if editing_id.is_some() { "Save Changes" } else { "Add Recipe" }
+                }
             }
             p { id: "recipe-status", class: if status_error() { "error" } else { "" }, "{status}" }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Recipe detail (blaz-style)
+// ---------------------------------------------------------------------------
+
+#[component]
+fn RecipeDetail(id: i64) -> Element {
+    let mut detail = use_signal(|| None::<RecipeDetailModel>);
+    let mut error = use_signal(|| String::new());
+    let mut confirm_delete = use_signal(|| false);
+    let navigator = use_navigator();
+
+    use_effect(move || {
+        spawn(async move {
+            match api_get::<RecipeDetailModel>(&format!("/api/recipes/{id}")).await {
+                Ok(d) => {
+                    tracing::debug!("recipe {id} loaded: {} ingredients", d.ingredients.len());
+                    detail.set(Some(d));
+                }
+                Err(err) => {
+                    tracing::error!("recipe {id} failed to load: {err:#}");
+                    error.set(err.to_string());
+                }
+            }
+        });
+    });
+
+    let loaded = detail.read().clone();
+    let image_url = loaded.as_ref().and_then(|d| d.image.clone());
+
+    rsx! {
+        div { class: "page detail-page",
+            div { class: "detail-header",
+                button {
+                    id: "hdr-back",
+                    class: "hdr-btn",
+                    title: "Back",
+                    onclick: move |_| { navigator.push(Route::Recipes {}); },
+                    IconBack {}
+                }
+                div { class: "hdr-spacer" }
+                button { class: "hdr-btn ph", title: "Timer", IconTimer {} }
+                button { class: "hdr-btn ph", title: "Share", IconShare {} }
+                button { class: "hdr-btn ph", title: "Add to meal plan", IconCalendar {} }
+                button { class: "hdr-btn ph", title: "Add to shopping list", IconCart {} }
+                button {
+                    id: "hdr-edit",
+                    class: "hdr-btn",
+                    title: "Edit",
+                    onclick: move |_| { navigator.push(Route::EditRecipe { id }); },
+                    IconPencil {}
+                }
+                button {
+                    id: "hdr-delete",
+                    class: "hdr-btn danger",
+                    title: "Delete",
+                    onclick: move |_| {
+                        tracing::info!("delete requested for recipe {id}");
+                        confirm_delete.set(true);
+                    },
+                    IconTrash {}
+                }
+            }
+
+            match loaded.as_ref() {
+                Some(d) => rsx! {
+                    h1 { class: "detail-name", "{d.name}" }
+                    if let Some(url) = &image_url {
+                        div { class: "detail-photo",
+                            img { src: "{url}", alt: "{d.name}" }
+                        }
+                    }
+                    div { class: "card",
+                        h2 { "Ingredients" }
+                        if d.ingredients.is_empty() {
+                            p { class: "empty", "No ingredients yet." }
+                        } else {
+                            ul { class: "ingredient-list", id: "ingredient-list",
+                                for ingredient in &d.ingredients {
+                                    li { class: "ingredient-item", "{ingredient_line(ingredient)}" }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "card",
+                        h2 { "Instructions" }
+                        if d.instructions.is_empty() {
+                            p { class: "empty", "No instructions yet." }
+                        } else {
+                            ol { class: "instruction-list", id: "instruction-list",
+                                for (i, step) in d.instructions.iter().enumerate() {
+                                    li { key: "{i}", "{step}" }
+                                }
+                            }
+                        }
+                    }
+                },
+                None => rsx! {
+                    if error.read().is_empty() {
+                        p { class: "empty", "Loading…" }
+                    } else {
+                        p { class: "status-error", "{error}" }
+                    }
+                },
+            }
+
+            if confirm_delete() {
+                DeleteDialog {
+                    name: loaded.as_ref().map(|d| d.name.clone()).unwrap_or_default(),
+                    on_cancel: move |_| confirm_delete.set(false),
+                    on_confirm: move |_| {
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/recipes/{id}", api_base());
+                            tracing::info!("deleting recipe {id}: DELETE {url}");
+                            match client.delete(&url).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    tracing::info!("recipe {id} deleted");
+                                    navigator.replace(Route::Recipes {});
+                                }
+                                Ok(r) => {
+                                    tracing::error!("delete failed: {}", r.status());
+                                    confirm_delete.set(false);
+                                    error.set(format!("Delete failed: {}", r.status()));
+                                }
+                                Err(err) => {
+                                    tracing::error!("delete request failed: {err:#}");
+                                    confirm_delete.set(false);
+                                    error.set(format!("Delete failed: {err}"));
+                                }
+                            }
+                        });
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// One ingredient line, e.g. `180 g buckwheat flour, finely chopped`.
+fn ingredient_line(ingredient: &Ingredient) -> String {
+    let mut line = String::new();
+    if let Some(q) = ingredient.quantity {
+        line.push_str(&fmt_qty(q));
+        line.push(' ');
+    }
+    if let Some(unit) = &ingredient.unit {
+        line.push_str(unit);
+        line.push(' ');
+    }
+    line.push_str(&ingredient.name);
+    if let Some(prep) = &ingredient.prep {
+        line.push_str(", ");
+        line.push_str(prep);
+    }
+    line
+}
+
+#[component]
+fn DeleteDialog(
+    name: String,
+    on_cancel: EventHandler<MouseEvent>,
+    on_confirm: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div { class: "dialog-backdrop",
+            div { class: "dialog", role: "dialog",
+                p { class: "dialog-text", "Delete \u{201c}{name}\u{201d}?" }
+                div { class: "dialog-actions",
+                    button { id: "cancel-delete", class: "dialog-btn", onclick: on_cancel, "Cancel" }
+                    button { id: "confirm-delete", class: "dialog-btn danger", onclick: on_confirm, "Delete" }
+                }
+            }
         }
     }
 }
@@ -576,7 +1116,7 @@ fn Grocery() -> Element {
                 p { class: "status-error", "{error}" }
             }
             if groups.is_empty() {
-                p { class: "empty", "Your grocery list is empty. Add a recipe or an item above." }
+                p { class: "empty", "Your grocery list is empty. Add an item above." }
             } else {
                 div { id: "grocery-list", class: "grocery-groups",
                     for (category, group_items) in groups {
@@ -700,6 +1240,21 @@ fn GroceryRow(
     }
 }
 
+/// Re-fetch the grocery list from the backend.
+async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>) {
+    match api_get::<Vec<GroceryItem>>("/api/grocery").await {
+        Ok(list) => {
+            tracing::debug!("grocery list refreshed: {} items", list.len());
+            items.set(list);
+            error.set(String::new());
+        }
+        Err(err) => {
+            tracing::error!("grocery list refresh failed: {err:#}");
+            error.set(err.to_string());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tabs: Meal plan & Settings (placeholders)
 // ---------------------------------------------------------------------------
@@ -732,21 +1287,6 @@ fn PlaceholderPage(title: String, text: String) -> Element {
                 h1 { "{title}" }
                 p { "{text}" }
             }
-        }
-    }
-}
-
-/// Re-fetch the grocery list from the backend.
-async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>) {
-    match api_get::<Vec<GroceryItem>>("/api/grocery").await {
-        Ok(list) => {
-            tracing::debug!("grocery list refreshed: {} items", list.len());
-            items.set(list);
-            error.set(String::new());
-        }
-        Err(err) => {
-            tracing::error!("grocery list refresh failed: {err:#}");
-            error.set(err.to_string());
         }
     }
 }

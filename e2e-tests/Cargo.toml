@@ -16,3 +16,4 @@ tokio.workspace = true
 thirtyfour = "0.37"
 backend = { path = "../backend" }
 shared = { path = "../shared" }
+tracing-subscriber = { workspace = true }
