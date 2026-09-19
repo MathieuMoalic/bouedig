@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared",
+    "backend",
+    "frontend-web",
+    "frontend-android",
+    "e2e-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+shared = { path = "shared" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.7", features = ["fs", "cors"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+dioxus = { version = "0.7", features = ["router"] }
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

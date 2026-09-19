@@ -1,0 +1,6 @@
+[application]
+name = "frontend-android"
+default_platform = "android"
+
+[web.app]
+title = "Bouedig"

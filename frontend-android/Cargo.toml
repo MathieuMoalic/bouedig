@@ -1,0 +1,12 @@
+[package]
+name = "frontend-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shared.workspace = true
+dioxus = { workspace = true, features = ["mobile"] }
+reqwest.workspace = true
+serde.workspace = true
+anyhow.workspace = true

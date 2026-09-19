@@ -1,0 +1,8 @@
+/target
+/dist
+**/*.rs.bk
+*.db
+*.db-shm
+*.db-wal
+result
+.env

@@ -1,0 +1,12 @@
+[package]
+name = "frontend-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shared.workspace = true
+dioxus = { workspace = true, features = ["web"] }
+reqwest.workspace = true
+serde.workspace = true
+anyhow.workspace = true
