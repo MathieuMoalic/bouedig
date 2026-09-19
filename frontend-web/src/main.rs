@@ -27,12 +27,12 @@ fn App() -> Element {
 #[component]
 fn Layout() -> Element {
     rsx! {
-        style { include_str!("../assets/style.css") }
+        style { {include_str!("../assets/style.css")} }
         div { class: "app",
             header { class: "navbar",
                 nav {
-                    Link { to: Route::AddRecipe, class: "nav-link", "Add Recipe" }
-                    Link { to: Route::Grocery, class: "nav-link", "Grocery List" }
+                    Link { to: Route::AddRecipe {}, class: "nav-link", "Add Recipe" }
+                    Link { to: Route::Grocery {}, class: "nav-link", "Grocery List" }
                 }
             }
             main { class: "content",
@@ -43,16 +43,27 @@ fn Layout() -> Element {
 }
 
 // ---------------------------------------------------------------------------
-// API helpers (same-origin `/api` works in dev via the dx proxy and in
-// production behind the reverse proxy).
+// API helpers
 // ---------------------------------------------------------------------------
 
+/// The browser origin, e.g. `http://localhost:8788` in dev (behind the dx
+/// proxy) or the production origin behind the reverse proxy. reqwest on
+/// wasm cannot build relative URLs, so we absolutise every path.
+fn api_base() -> String {
+    web_sys::window()
+        .expect("no window")
+        .location()
+        .origin()
+        .expect("no origin")
+}
+
 async fn api_get<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
-    let resp = reqwest::get(path).await?;
+    let url = format!("{}{}", api_base(), path);
+    let resp = reqwest::get(&url).await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("GET {path} failed: {status} ({body})");
+        anyhow::bail!("GET {url} failed: {status} ({body})");
     }
     Ok(serde_json::from_str(&body)?)
 }
@@ -89,7 +100,8 @@ fn AddRecipe() -> Element {
                     }
                     spawn(async move {
                         let client = reqwest::Client::new();
-                        let resp = client.post("/api/recipes").json(&recipe).send().await;
+                        let url = format!("{}/api/recipes", api_base());
+                        let resp = client.post(url).json(&recipe).send().await;
                         match resp {
                             Ok(r) if r.status().is_success() => {
                                 status.set("Recipe added! Ingredients moved to your grocery list.".into());
@@ -136,7 +148,7 @@ fn AddRecipe() -> Element {
 
 #[component]
 fn Grocery() -> Element {
-    let mut items = use_signal(Vec::<GroceryItem>::new);
+    let items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut error = use_signal(|| String::new());
     let mut loaded = use_signal(|| false);
@@ -174,7 +186,8 @@ fn Grocery() -> Element {
                         new_item.set(String::new());
                         spawn(async move {
                             let client = reqwest::Client::new();
-                            let resp = client.post("/api/grocery").json(&item).send().await;
+                            let url = format!("{}/api/grocery", api_base());
+                            let resp = client.post(url).json(&item).send().await;
                             if resp.is_err() {
                                 error.set("Failed to add item.".into());
                             }
@@ -216,11 +229,8 @@ fn GroceryRow(item: GroceryItem, mut items: Signal<Vec<GroceryItem>>, mut error:
                     let update = GroceryUpdate { bought: !item.bought };
                     spawn(async move {
                         let client = reqwest::Client::new();
-                        let resp = client
-                            .patch(format!("/api/grocery/{id}"))
-                            .json(&update)
-                            .send()
-                            .await;
+                        let url = format!("{}/api/grocery/{id}", api_base());
+                        let resp = client.patch(url).json(&update).send().await;
                         match resp {
                             Ok(r) if r.status().is_success() => {
                                 items.with_mut(|v| {

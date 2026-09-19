@@ -48,8 +48,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
 
     // Tab 1 is the default route; the wasm app must have booted.
     let name_input = driver
-        .wait()
-        .for_element(By::Id("recipe-name"))
+        .find(By::Id("recipe-name"))
         .await
         .context("web client did not render the Add Recipe tab")?;
     name_input
@@ -64,11 +63,13 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
     driver.find(By::Id("recipe-submit")).await?.click().await?;
 
     // The POST must succeed before we switch tabs.
-    driver
-        .wait()
-        .for_element(By::XPath("//*[contains(text(), 'Recipe added!')]"))
+    if let Err(err) = driver
+        .find(By::XPath("//*[contains(text(), 'Recipe added!')]"))
         .await
-        .context("recipe submission did not succeed")?;
+    {
+        let src = driver.source().await.unwrap_or_default();
+        anyhow::bail!("recipe submission feedback missing ({err}); page source:\n{src}");
+    }
 
     // -- Tab 2: the grocery list must show the parsed ingredients. ----------
     driver
@@ -79,8 +80,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
     for ingredient in ["Flour", "Milk", "Eggs"] {
         let li = format!("//li[contains(., '{ingredient}')]");
         driver
-            .wait()
-            .for_element(By::XPath(&li))
+            .find(By::XPath(&li))
             .await
             .with_context(|| format!("ingredient '{ingredient}' missing from grocery list"))?;
     }
@@ -104,8 +104,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
         .await?;
     driver.find(By::Id("grocery-add")).await?.click().await?;
     driver
-        .wait()
-        .for_element(By::XPath("//li[contains(., 'Bananas')]"))
+        .find(By::XPath("//li[contains(., 'Bananas')]"))
         .await
         .context("manually added item did not appear in the UI")?;
     poll_grocery(http, "Bananas", None)
@@ -121,13 +120,16 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
 
 async fn open_headless_firefox() -> anyhow::Result<WebDriver> {
     let mut caps = Capabilities::new();
-    caps.insert("browserName", serde_json::json!("firefox"));
-    caps.insert(
+    caps.set("browserName", serde_json::json!("firefox"))?;
+    caps.set(
         "moz:firefoxOptions",
         serde_json::json!({ "args": ["--headless", "--width=1280", "--height=800"] }),
-    );
+    )?;
     let driver = WebDriver::new(WEBDRIVER_URL, caps).await?;
-    driver.config().poll_interval = Duration::from_millis(250);
+    // Make every subsequent `find` poll for up to 30s (wasm boot, fetches…).
+    driver
+        .set_implicit_wait_timeout(Duration::from_secs(30))
+        .await?;
     Ok(driver)
 }
 
@@ -175,7 +177,10 @@ fn find_web_bundle() -> anyhow::Result<std::path::PathBuf> {
         return Ok(dir.into());
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for candidate in ["../frontend-web/dist", "../dist", "dist"] {
+    for candidate in [
+        "../target/dx/frontend-web/debug/web/public",
+        "../target/dx/frontend-web/release/web/public",
+    ] {
         let path = manifest.join(candidate);
         if path.is_dir() {
             return Ok(path);

@@ -32,12 +32,12 @@ fn App() -> Element {
 #[component]
 fn Layout() -> Element {
     rsx! {
-        style { include_str!("../assets/style.css") }
+        style { {include_str!("../assets/style.css")} }
         div { class: "app",
             header { class: "navbar",
                 nav {
-                    Link { to: Route::AddRecipe, class: "nav-link", "Add Recipe" }
-                    Link { to: Route::Grocery, class: "nav-link", "Grocery List" }
+                    Link { to: Route::AddRecipe {}, class: "nav-link", "Add Recipe" }
+                    Link { to: Route::Grocery {}, class: "nav-link", "Grocery List" }
                 }
             }
             main { class: "content",
@@ -145,7 +145,7 @@ fn AddRecipe() -> Element {
 
 #[component]
 fn Grocery() -> Element {
-    let mut items = use_signal(Vec::<GroceryItem>::new);
+    let items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut error = use_signal(|| String::new());
     let mut loaded = use_signal(|| false);

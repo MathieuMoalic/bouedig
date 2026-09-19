@@ -9,4 +9,5 @@ shared.workspace = true
 dioxus = { workspace = true, features = ["mobile"] }
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true

@@ -49,6 +49,7 @@
             pkgs.geckodriver
             pkgs.firefox
             pkgs.android-tools
+            pkgs.binaryen # wasm-opt, required by `dx build --release`
           ];
 
           # Let geckodriver locate the Nix firefox and write to its profile dir.

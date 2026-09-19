@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch};
 use axum::{Json, Router};
 use shared::{GroceryItem, GroceryUpdate, NewGroceryItem, NewRecipe, Recipe};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -64,7 +64,8 @@ pub struct AppState {
 
 /// Open (creating if needed) the SQLite pool for `db_url`.
 pub async fn open_db(db_url: &str) -> anyhow::Result<SqlitePool> {
-    let options = SqliteConnectOptions::from_str(db_url)
+    let options = db_url
+        .parse::<SqliteConnectOptions>()
         .context("invalid BOUEDIG_DB_URL")?
         .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
@@ -87,28 +88,58 @@ pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Build the complete application router (API + optional static files).
 pub fn build_router(state: AppState, config: &Config) -> Router {
     let api = Router::new()
-        .route("/recipes", post(create_recipe).join(get(list_recipes)))
-        .route("/grocery", get(list_grocery).join(post(add_grocery_item)))
+        .route("/recipes", get(list_recipes).post(create_recipe))
+        .route("/grocery", get(list_grocery).post(add_grocery_item))
         .route("/grocery/{id}", patch(update_grocery_item))
         .layer(CorsLayer::very_permissive())
         .with_state(state);
 
-    let mut app = Router::new().merge(api);
+    let mut app = Router::new().nest("/api", api);
     if let Some(static_dir) = &config.static_dir {
         let index = static_dir.join("index.html");
         let serve = ServeDir::new(static_dir)
             .append_index_html_on_directories(true)
-            .fallback(ServeFile::new(index));
-        app = app.fallback_service(serve);
+            .fallback(ServeFile::new(index.clone()));
+        app = app
+            // Explicit index route: axum does not reliably hit the fallback
+            // service for the empty remainder of a nested base path.
+            .route("/", axum::routing::get_service(ServeFile::new(index)))
+            .fallback_service(serve);
     }
 
     // When mounted behind a reverse proxy that does not strip the prefix
     // (e.g. /bouedig/api/... hits us directly), nest everything under it.
-    if let Some(base_path) = config.base_path.as_deref().filter(|p| p != "/") {
-        Router::new().nest(base_path, app)
+    if let Some(base_path) = config.base_path.as_deref().filter(|p| *p != "/") {
+        // axum never dispatches the empty remainder of a nested prefix
+        // (`/{base_path}/`) to the inner router, so redirect it to the bare
+        // prefix, which is routed (and serves the SPA index).
+        Router::new()
+            .nest(base_path, app)
+            .layer(axum::middleware::from_fn_with_state(
+                base_path.to_string(),
+                redirect_trailing_slash,
+            ))
     } else {
         app
     }
+}
+
+/// Redirect `/{prefix}/…/` to `/{prefix}/…` (except the site root `/`).
+async fn redirect_trailing_slash(
+    axum::extract::State(_base): axum::extract::State<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    if path.len() > 1 && path.ends_with('/') {
+        let target = path.trim_end_matches('/');
+        let location = match req.uri().query() {
+            Some(q) if !q.is_empty() => format!("{target}?{q}"),
+            _ => target.to_string(),
+        };
+        return axum::response::Redirect::permanent(&location).into_response();
+    }
+    next.run(req).await
 }
 
 /// Bind, migrate and serve. Resolves when the server shuts down.
@@ -141,8 +172,14 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl<E: Into<anyhow::Error>> From<E> for ApiError {
-    fn from(err: E) -> Self {
+impl From<anyhow::Error> for ApiError {
+    fn from(err: anyhow::Error) -> Self {
+        Self(err)
+    }
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(err: sqlx::Error) -> Self {
         Self(err.into())
     }
 }
@@ -170,7 +207,9 @@ async fn create_recipe(
     Json(recipe): Json<NewRecipe>,
 ) -> Result<(StatusCode, Json<Recipe>), ApiError> {
     let name = recipe.name.trim();
-    anyhow::ensure!(!name.is_empty(), "recipe name must not be empty");
+    if name.is_empty() {
+        return Err(ApiError(anyhow::anyhow!("recipe name must not be empty")));
+    }
 
     let mut tx = state.db.begin().await?;
     let row = sqlx::query("INSERT INTO recipes (name, ingredients) VALUES (?, ?) RETURNING id, name, ingredients")
@@ -215,7 +254,9 @@ async fn add_grocery_item(
     Json(item): Json<NewGroceryItem>,
 ) -> Result<(StatusCode, Json<GroceryItem>), ApiError> {
     let name = item.name.trim();
-    anyhow::ensure!(!name.is_empty(), "item name must not be empty");
+    if name.is_empty() {
+        return Err(ApiError(anyhow::anyhow!("item name must not be empty")));
+    }
     let row = sqlx::query("INSERT INTO grocery_items (name) VALUES (?) RETURNING id, name, bought")
         .bind(name)
         .fetch_one(&state.db)
