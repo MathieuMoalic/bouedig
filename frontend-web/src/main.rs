@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use shared::{GroceryItem, GroceryUpdate, NewGroceryItem, NewRecipe, Recipe};
 
 const WALLPAPER: Asset = asset!("/assets/background.avif");
+const FAVICON: Asset = asset!("/assets/icon.png");
 
 fn main() {
     // Set up logging and panic reporting first, so that anything that goes
@@ -48,6 +49,8 @@ fn App() -> Element {
 fn Layout() -> Element {
     rsx! {
         style { {include_str!("../assets/style.css")} }
+        document::Title { "Bouedig" }
+        document::Link { rel: "icon", r#type: "image/png", href: FAVICON }
         div { class: "app",
             div { class: "wallpaper", style: "background-image: url('{WALLPAPER}')" }
             main { class: "content",

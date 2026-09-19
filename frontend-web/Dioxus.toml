@@ -2,8 +2,11 @@
 name = "frontend-web"
 default_platform = "web"
 
+# The tab title lives in index.html. dx *appends* this value to the static
+# <title> when rendering the bundle, so keep it empty to avoid duplications
+# like "BouedigBouedig" or "Bouedigdioxus | ⛺".
 [web.app]
-title = "Bouedig"
+title = ""
 
 [web.watcher]
 reload_html = true

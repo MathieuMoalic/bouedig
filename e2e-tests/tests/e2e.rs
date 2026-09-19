@@ -91,6 +91,17 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
             .with_context(|| format!("nav tab '{tab}' missing"))?;
     }
 
+    // The browser tab is named and shows the favicon.
+    let title = driver.title().await?;
+    anyhow::ensure!(
+        title == "Bouedig",
+        "tab title should be 'Bouedig', got '{title}'"
+    );
+    driver
+        .find(By::Css("link[rel='icon']"))
+        .await
+        .context("favicon <link> missing from the document head")?;
+
     // -- 2. Tab clicks change the active view/route. ------------------------
     driver.find(By::LinkText("Meal plan")).await?.click().await?;
     wait_for_url_path(driver, "/meal-plan").await?;
