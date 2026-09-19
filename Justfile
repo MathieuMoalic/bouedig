@@ -60,4 +60,5 @@ test-e2e:
     geckodriver --port {{gecko_port}} &
     gecko_pid=$!
     trap 'kill $gecko_pid 2>/dev/null || true' EXIT
-    cargo test -p e2e-tests -- --nocapture
+    # geckodriver serves a single session at a time -> run tests serially.
+    cargo test -p e2e-tests -- --nocapture --test-threads=1

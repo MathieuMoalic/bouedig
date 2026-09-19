@@ -2,8 +2,9 @@
 //!
 //! Drives a real headless Firefox (via geckodriver, started by
 //! `just test-e2e`) against the production-style web bundle served by the
-//! backend, verifying UI -> backend -> SQLite -> UI round trips. A second,
-//! browser-free test exercises the same API contract directly.
+//! backend, verifying UI -> backend -> SQLite -> UI round trips, including
+//! the new photo-card app shell and grouped grocery list. A second,
+//! browser-free test exercises the API contract directly.
 //!
 //! Ports come from the environment (see `.env`):
 //!   * `E2E_BACKEND_PORT` - test backend bind port, 0 = pick a free port
@@ -23,19 +24,22 @@ fn env_port(name: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-/// Start an isolated backend (temp SQLite + built web bundle) and return its
-/// bound address.
+/// Start an isolated backend (temp SQLite, temp image dir, built web bundle)
+/// and return its bound address.
 async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
     let db_dir = tempfile::tempdir()?;
+    let data_dir = tempfile::tempdir()?;
     let config = backend::Config {
         addr: SocketAddr::from(([127, 0, 0, 1], env_port("E2E_BACKEND_PORT", 0))),
         db_url: format!("sqlite://{}/bouedig-test.db?mode=rwc", db_dir.path().display()),
         base_path: None,
         static_dir: Some(find_web_bundle()?),
+        data_dir: data_dir.path().to_path_buf(),
     };
     let addr = backend::spawn_server(config).await?;
-    // Keep the tempdir alive for the rest of the process.
+    // Keep the tempdirs alive for the rest of the process.
     std::mem::forget(db_dir);
+    std::mem::forget(data_dir);
     Ok(addr)
 }
 
@@ -48,38 +52,75 @@ fn webdriver_url() -> String {
     format!("http://{}", webdriver_addr())
 }
 
-/// The core browser journey: clicking the buttons must add the recipe and
-/// its ingredients, persisting them to the database.
+/// The core browser journey: the new app shell renders, the + FAB opens the
+/// add form, submitting persists the recipe (visible as a card in the grid),
+/// and the grouped shopping list reflects everything in the database.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_recipe_shows_up_on_grocery_list() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
     let http = reqwest::Client::new();
 
     wait_for_port(&addr.to_string()).await?;
     wait_for_port(&webdriver_addr()).await?;
     let driver = open_headless_firefox().await?;
-    let result = run_flow(&driver, &http, &format!("http://{addr}/"), &format!("http://{addr}")).await;
+    let result = run_flow(&driver, &http, &base).await;
     let _ = driver.quit().await;
     result
 }
 
-async fn run_flow(
-    driver: &WebDriver,
-    http: &reqwest::Client,
-    app_url: &str,
-    base_url: &str,
-) -> anyhow::Result<()> {
+async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> anyhow::Result<()> {
     driver
-        .goto(app_url)
+        .goto(format!("{base}/"))
         .await
         .context("failed to load the web client")?;
 
-    // Tab 1 is the default route; the wasm app must have booted.
-    let name_input = driver
+    // -- 1. The app shell renders: wallpaper, bottom nav, all four tabs. ----
+    driver
+        .find(By::Id("bottom-nav"))
+        .await
+        .context("app shell (bottom navigation) did not render")?;
+    driver
+        .find(By::Css(".wallpaper"))
+        .await
+        .context("app shell (wallpaper) did not render")?;
+    for tab in ["Recipes", "Meal plan", "Shopping", "Settings"] {
+        driver
+            .find(By::LinkText(tab))
+            .await
+            .with_context(|| format!("nav tab '{tab}' missing"))?;
+    }
+
+    // -- 2. Tab clicks change the active view/route. ------------------------
+    driver.find(By::LinkText("Meal plan")).await?.click().await?;
+    wait_for_url_path(driver, "/meal-plan").await?;
+    driver
+        .find(By::Css(".placeholder-card"))
+        .await
+        .context("meal plan tab did not switch the view")?;
+
+    driver
+        .find(By::LinkText("Recipes"))
+        .await?
+        .click()
+        .await?;
+    wait_for_url_path(driver, "/").await?;
+    driver
+        .find(By::Id("recipe-grid"))
+        .await
+        .context("recipes grid did not render")?;
+
+    // -- 3. The + FAB opens the add-recipe form. ----------------------------
+    driver.find(By::Id("fab-add-recipe")).await?.click().await?;
+    driver
         .find(By::Id("recipe-name"))
         .await
-        .context("web client did not render the Add Recipe tab")?;
-    name_input
+        .context("the + FAB did not open the add-recipe form")?;
+    wait_for_url_path(driver, "/add").await?;
+
+    driver
+        .find(By::Id("recipe-name"))
+        .await?
         .send_keys("Pancakes")
         .await
         .context("failed to type recipe name")?;
@@ -90,26 +131,36 @@ async fn run_flow(
         .await?;
     driver.find(By::Id("recipe-submit")).await?.click().await?;
 
-    // The POST must succeed before we switch tabs.
+    // Submitting routes back to the grid, where the new card appears.
+    wait_for_url_path(driver, "/").await?;
     if let Err(err) = driver
-        .find(By::XPath("//*[contains(text(), 'Recipe added!')]"))
+        .find(By::XPath(
+            "//div[contains(@class, 'recipe-card-name') and contains(., 'Pancakes')]",
+        ))
         .await
     {
         let src = driver.source().await.unwrap_or_default();
-        anyhow::bail!("recipe submission feedback missing ({err}); page source:\n{src}");
+        anyhow::bail!("recipe card missing after submission ({err}); page source:\n{src}");
     }
 
     // The recipe click must have persisted the recipe itself to the DB.
-    poll_recipes(&http, base_url, "Pancakes", "Flour, Milk\nEggs")
+    poll_recipes(&http, base, "Pancakes", "Flour, Milk\nEggs")
         .await
         .context("recipe was not persisted to the database")?;
 
-    // -- Tab 2: the grocery list must show the parsed ingredients. ----------
+    // -- 4. Shopping tab: grouped list shows the parsed ingredients. --------
     driver
-        .find(By::LinkText("Grocery List"))
+        .find(By::LinkText("Shopping"))
         .await?
         .click()
         .await?;
+    wait_for_url_path(driver, "/grocery").await?;
+    driver
+        .find(By::XPath(
+            "//button[contains(@class, 'grocery-group') and contains(., 'Groceries')]",
+        ))
+        .await
+        .context("default grocery group header did not render")?;
     for ingredient in ["Flour", "Milk", "Eggs"] {
         let li = format!("//li[contains(., '{ingredient}')]");
         driver
@@ -118,6 +169,31 @@ async fn run_flow(
             .with_context(|| format!("ingredient '{ingredient}' missing from grocery list"))?;
     }
 
+    // Group collapse toggles the items away and back.
+    driver
+        .find(By::XPath(
+            "//button[contains(@class, 'grocery-group') and contains(., 'Groceries')]",
+        ))
+        .await?
+        .click()
+        .await?;
+    let src = driver.source().await?;
+    anyhow::ensure!(
+        !src.contains("Flour"),
+        "grocery group did not collapse (items still in the DOM)"
+    );
+    driver
+        .find(By::XPath(
+            "//button[contains(@class, 'grocery-group') and contains(., 'Groceries')]",
+        ))
+        .await?
+        .click()
+        .await?;
+    driver
+        .find(By::XPath("//li[contains(., 'Flour')]"))
+        .await
+        .context("grocery group did not re-expand")?;
+
     // Tick "Milk" off and verify the checkbox state was persisted to SQLite.
     let milk = driver
         .find(By::XPath(
@@ -125,7 +201,7 @@ async fn run_flow(
         ))
         .await?;
     milk.click().await?;
-    poll_grocery(&http, base_url, "Milk", Some(true))
+    poll_grocery(&http, base, "Milk", Some(true))
         .await
         .context("'bought' state was not persisted to the database")?;
 
@@ -135,27 +211,97 @@ async fn run_flow(
         .await?
         .send_keys("Bananas")
         .await?;
+    driver
+        .find(By::Id("grocery-category"))
+        .await?
+        .send_keys("Fresh")
+        .await?;
     driver.find(By::Id("grocery-add")).await?.click().await?;
     driver
         .find(By::XPath("//li[contains(., 'Bananas')]"))
         .await
         .context("manually added item did not appear in the UI")?;
-    poll_grocery(&http, base_url, "Bananas", None)
+    poll_grocery(&http, base, "Bananas", None)
         .await
         .context("manually added item missing from the database")?;
 
     Ok(())
 }
 
+/// Photo upload flow: a photo picked in the form is stored as full-res +
+/// compressed thumbnail and served by the backend; the grid card shows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_upload_reaches_grid_and_database() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // A small valid PNG on disk, selectable by the browser.
+    let png_path = std::env::temp_dir().join("bouedig-e2e-photo.png");
+    std::fs::write(&png_path, tiny_png()).context("failed to write test photo")?;
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/")).await?;
+        driver.find(By::Id("fab-add-recipe")).await?.click().await?;
+        driver
+            .find(By::Id("recipe-name"))
+            .await?
+            .send_keys("Photo Cake")
+            .await?;
+        driver
+            .find(By::Id("recipe-ingredients"))
+            .await?
+            .send_keys("Cocoa, Sugar")
+            .await?;
+        // Set the file input directly (WebDriver standard behaviour).
+        driver
+            .find(By::Id("recipe-photo"))
+            .await?
+            .send_keys(png_path.to_str().unwrap())
+            .await?;
+        driver.find(By::Id("recipe-submit")).await?.click().await?;
+
+        // The grid card renders the compressed thumbnail.
+        wait_for_url_path(&driver, "/").await?;
+        if let Err(err) = driver.find(By::Css("#recipe-grid .recipe-card img")).await {
+            let src = driver.source().await.unwrap_or_default();
+            anyhow::bail!("recipe card thumbnail missing after submission ({err}); page source:\n{src}");
+        }
+
+        // Database: both image variants exist and the thumbnail is served.
+        let recipe = poll_recipes_full(&http, &base, "Photo Cake")
+            .await
+            .context("photo recipe missing from the database")?;
+        let image = recipe.image.context("full-res image url missing")?;
+        let thumb = recipe.thumb.context("thumbnail url missing")?;
+        for (label, url) in [("full-res", &image), ("thumb", &thumb)] {
+            let resp = http.get(format!("{base}{url}")).send().await?;
+            let status = resp.status();
+            let content_type = resp.headers().get("content-type").cloned();
+            anyhow::ensure!(
+                status.is_success() && content_type.is_some_and(|c| c.to_str().unwrap().starts_with("image/")),
+                "{label} image {url} not served correctly ({status})"
+            );
+        }
+        anyhow::ensure!(image != thumb, "thumb must be a separate file");
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 /// Browser-free API contract test: POSTing a recipe must split its
-/// ingredients onto the grocery list and persist everything.
+/// ingredients onto the grouped grocery list and persist everything.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
     let base = format!("http://{addr}");
     let http = reqwest::Client::new();
 
-    // Clicking-equivalent: POST the recipe.
     let status = http
         .post(format!("{base}/api/recipes"))
         .json(&NewRecipe {
@@ -170,14 +316,15 @@ async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
     poll_grocery(&http, &base, "Carrots", None).await?;
     poll_grocery(&http, &base, "Onions", None).await?;
 
-    // Manual grocery item + bought toggle.
+    // Manual grocery item + bought toggle, with and without a category.
     let item: GroceryItem = http
         .post(format!("{base}/api/grocery"))
-        .json(&NewGroceryItem { name: "Potatoes".into() })
+        .json(&NewGroceryItem { name: "Potatoes".into(), category: None })
         .send()
         .await?
         .json()
         .await?;
+    assert_eq!(item.category, shared::DEFAULT_CATEGORY);
     let updated: GroceryItem = http
         .patch(format!("{base}/api/grocery/{}", item.id))
         .json(&shared::GroceryUpdate { bought: true })
@@ -187,6 +334,19 @@ async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
         .await?;
     assert!(updated.bought, "PATCH must flip the bought flag");
     poll_grocery(&http, &base, "Potatoes", Some(true)).await?;
+
+    let item: GroceryItem = http
+        .post(format!("{base}/api/grocery"))
+        .json(&NewGroceryItem {
+            name: "Wine".into(),
+            category: Some("Online Alcohol".into()),
+        })
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(item.category, "Online Alcohol");
+    poll_grocery(&http, &base, "Wine", None).await?;
 
     // Invalid payloads are rejected with 4xx, not 5xx.
     let status = http
@@ -220,6 +380,19 @@ async fn open_headless_firefox() -> anyhow::Result<WebDriver> {
         .set_implicit_wait_timeout(Duration::from_secs(30))
         .await?;
     Ok(driver)
+}
+
+/// Wait until the current URL path equals `path` (router navigation).
+async fn wait_for_url_path(driver: &WebDriver, path: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let url = driver.current_url().await?;
+        if url.path() == path {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let url = driver.current_url().await?;
+    anyhow::bail!("navigation to '{path}' never happened (at {})", url)
 }
 
 /// Poll TCP until something is listening (backend or geckodriver).
@@ -286,6 +459,27 @@ async fn poll_recipes(
     anyhow::bail!("recipe '{name}' ('{ingredients}') never appeared in the database")
 }
 
+/// Like `poll_recipes` but returns the matched recipe (with image fields).
+async fn poll_recipes_full(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+) -> anyhow::Result<Recipe> {
+    for _ in 0..50 {
+        let recipes: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(recipe) = recipes.iter().find(|r| r.name == name) {
+            return Ok(recipe.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("recipe '{name}' never appeared in the database")
+}
+
 /// Locate the web bundle produced by `dx build`. The Justfile exports
 /// `BOUEDIG_DIST_DIR`; fall back to the conventional output locations.
 fn find_web_bundle() -> anyhow::Result<std::path::PathBuf> {
@@ -305,4 +499,29 @@ fn find_web_bundle() -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!(
         "web bundle not found - run `just build-web` (or `just test-e2e`) first"
     )
+}
+
+/// A 1x1 red PNG, hardcoded (no image crate needed in the test suite).
+fn tiny_png() -> Vec<u8> {
+    const B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    fn b64_decode(input: &str) -> Vec<u8> {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for c in input.bytes() {
+            if c == b'=' {
+                break;
+            }
+            let v = TABLE.iter().position(|t| *t == c).unwrap() as u32;
+            buf = (buf << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
+    }
+    b64_decode(B64)
 }
