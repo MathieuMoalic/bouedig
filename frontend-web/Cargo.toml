@@ -11,6 +11,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+tracing-wasm.workspace = true
+console_error_panic_hook.workspace = true
 
 # Version pins to keep `dx` (which bundles wasm-bindgen-cli 0.2.126) happy.
 wasm-bindgen.workspace = true

@@ -311,6 +311,7 @@ dependencies = [
  "shared",
  "sqlx",
  "tokio",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
@@ -609,6 +610,16 @@ checksum = "cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1972,6 +1983,8 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1979,12 +1992,15 @@ name = "frontend-web"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "console_error_panic_hook",
  "dioxus",
  "js-sys",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "shared",
+ "tracing",
+ "tracing-wasm",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

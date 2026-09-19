@@ -1,48 +1,76 @@
 //! End-to-end test suite for Bouedig.
 //!
 //! Drives a real headless Firefox (via geckodriver, started by
-//! `just test-e2e` on port 4445) against the production-style web bundle
-//! served by the backend, verifying UI -> backend -> SQLite -> UI round trips.
+//! `just test-e2e`) against the production-style web bundle served by the
+//! backend, verifying UI -> backend -> SQLite -> UI round trips. A second,
+//! browser-free test exercises the same API contract directly.
+//!
+//! Ports come from the environment (see `.env`):
+//!   * `E2E_BACKEND_PORT` - test backend bind port, 0 = pick a free port
+//!   * `E2E_GECKO_PORT`   - geckodriver started by `just test-e2e`
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
-use shared::GroceryItem;
+use shared::{GroceryItem, NewGroceryItem, NewRecipe, Recipe};
 use thirtyfour::{By, Capabilities, WebDriver};
 
-/// Address the test backend binds to.
-const BACKEND_ADDR: &str = "127.0.0.1:3100";
-const APP_URL: &str = "http://127.0.0.1:3100/";
-/// Geckodriver started by `just test-e2e`.
-const WEBDRIVER_URL: &str = "http://127.0.0.1:4445";
+fn env_port(name: &str, default: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default)
+}
 
-#[tokio::test(flavor = "multi_thread")]
-async fn add_recipe_shows_up_on_grocery_list() -> anyhow::Result<()> {
-    // -- Backend: isolated temp database + the built web bundle. ------------
+/// Start an isolated backend (temp SQLite + built web bundle) and return its
+/// bound address.
+async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
     let db_dir = tempfile::tempdir()?;
     let config = backend::Config {
-        addr: BACKEND_ADDR.parse().unwrap(),
+        addr: SocketAddr::from(([127, 0, 0, 1], env_port("E2E_BACKEND_PORT", 0))),
         db_url: format!("sqlite://{}/bouedig-test.db?mode=rwc", db_dir.path().display()),
         base_path: None,
         static_dir: Some(find_web_bundle()?),
     };
-    tokio::spawn(backend::run(config));
-    wait_for_port(BACKEND_ADDR).await?;
+    let addr = backend::spawn_server(config).await?;
+    // Keep the tempdir alive for the rest of the process.
+    std::mem::forget(db_dir);
+    Ok(addr)
+}
+
+/// Geckodriver host:port, started by `just test-e2e`.
+fn webdriver_addr() -> String {
+    format!("127.0.0.1:{}", env_port("E2E_GECKO_PORT", 4445))
+}
+
+fn webdriver_url() -> String {
+    format!("http://{}", webdriver_addr())
+}
+
+/// The core browser journey: clicking the buttons must add the recipe and
+/// its ingredients, persisting them to the database.
+#[tokio::test(flavor = "multi_thread")]
+async fn add_recipe_shows_up_on_grocery_list() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
     let http = reqwest::Client::new();
 
-    // -- WebDriver: headless Firefox. ---------------------------------------
-    wait_for_port("127.0.0.1:4445").await?;
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
     let driver = open_headless_firefox().await?;
-    let result = run_flow(&driver, &http).await;
+    let result = run_flow(&driver, &http, &format!("http://{addr}/"), &format!("http://{addr}")).await;
     let _ = driver.quit().await;
     result
 }
 
-/// The core user journey: add a recipe, see its ingredients on the grocery
-/// list, tick one off, add an item manually.
-async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<()> {
+async fn run_flow(
+    driver: &WebDriver,
+    http: &reqwest::Client,
+    app_url: &str,
+    base_url: &str,
+) -> anyhow::Result<()> {
     driver
-        .goto(APP_URL)
+        .goto(app_url)
         .await
         .context("failed to load the web client")?;
 
@@ -71,6 +99,11 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
         anyhow::bail!("recipe submission feedback missing ({err}); page source:\n{src}");
     }
 
+    // The recipe click must have persisted the recipe itself to the DB.
+    poll_recipes(&http, base_url, "Pancakes", "Flour, Milk\nEggs")
+        .await
+        .context("recipe was not persisted to the database")?;
+
     // -- Tab 2: the grocery list must show the parsed ingredients. ----------
     driver
         .find(By::LinkText("Grocery List"))
@@ -92,7 +125,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
         ))
         .await?;
     milk.click().await?;
-    poll_grocery(http, "Milk", Some(true))
+    poll_grocery(&http, base_url, "Milk", Some(true))
         .await
         .context("'bought' state was not persisted to the database")?;
 
@@ -107,9 +140,65 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client) -> anyhow::Result<
         .find(By::XPath("//li[contains(., 'Bananas')]"))
         .await
         .context("manually added item did not appear in the UI")?;
-    poll_grocery(http, "Bananas", None)
+    poll_grocery(&http, base_url, "Bananas", None)
         .await
         .context("manually added item missing from the database")?;
+
+    Ok(())
+}
+
+/// Browser-free API contract test: POSTing a recipe must split its
+/// ingredients onto the grocery list and persist everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_round_trip_recipe_to_grocery() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // Clicking-equivalent: POST the recipe.
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&NewRecipe {
+            name: "Stew".into(),
+            ingredients: "Carrots, Onions".into(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201, "POST /api/recipes must return 201");
+    poll_recipes(&http, &base, "Stew", "Carrots, Onions").await?;
+    poll_grocery(&http, &base, "Carrots", None).await?;
+    poll_grocery(&http, &base, "Onions", None).await?;
+
+    // Manual grocery item + bought toggle.
+    let item: GroceryItem = http
+        .post(format!("{base}/api/grocery"))
+        .json(&NewGroceryItem { name: "Potatoes".into() })
+        .send()
+        .await?
+        .json()
+        .await?;
+    let updated: GroceryItem = http
+        .patch(format!("{base}/api/grocery/{}", item.id))
+        .json(&shared::GroceryUpdate { bought: true })
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(updated.bought, "PATCH must flip the bought flag");
+    poll_grocery(&http, &base, "Potatoes", Some(true)).await?;
+
+    // Invalid payloads are rejected with 4xx, not 5xx.
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&NewRecipe { name: "  ".into(), ingredients: String::new() })
+        .send()
+        .await?
+        .status();
+    assert!(
+        status.is_client_error(),
+        "empty recipe name must be rejected, got {status}"
+    );
 
     Ok(())
 }
@@ -125,7 +214,7 @@ async fn open_headless_firefox() -> anyhow::Result<WebDriver> {
         "moz:firefoxOptions",
         serde_json::json!({ "args": ["--headless", "--width=1280", "--height=800"] }),
     )?;
-    let driver = WebDriver::new(WEBDRIVER_URL, caps).await?;
+    let driver = WebDriver::new(webdriver_url(), caps).await?;
     // Make every subsequent `find` poll for up to 30s (wasm boot, fetches…).
     driver
         .set_implicit_wait_timeout(Duration::from_secs(30))
@@ -148,12 +237,13 @@ async fn wait_for_port(addr: &str) -> anyhow::Result<()> {
 /// given, has the expected `bought` state.
 async fn poll_grocery(
     http: &reqwest::Client,
+    base: &str,
     name: &str,
     bought: Option<bool>,
 ) -> anyhow::Result<()> {
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
-            .get(format!("http://{BACKEND_ADDR}/api/grocery"))
+            .get(format!("{base}/api/grocery"))
             .send()
             .await?
             .json()
@@ -168,6 +258,32 @@ async fn poll_grocery(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     anyhow::bail!("grocery item '{name}' (bought={bought:?}) never appeared in the database")
+}
+
+/// Poll `GET /api/recipes` until the given recipe (name + ingredients) has
+/// been persisted.
+async fn poll_recipes(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+    ingredients: &str,
+) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let recipes: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if recipes
+            .iter()
+            .any(|r| r.name == name && r.ingredients == ingredients)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("recipe '{name}' ('{ingredients}') never appeared in the database")
 }
 
 /// Locate the web bundle produced by `dx build`. The Justfile exports

@@ -10,6 +10,17 @@ use shared::{GroceryItem, GroceryUpdate, NewGroceryItem, NewRecipe};
 const API_BASE: &str = "http://10.0.2.2:3000";
 
 fn main() {
+    // Logging + panic reporting first so nothing fails silently on-device.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic: {info}");
+    }));
+    tracing::info!("Bouedig mobile client starting");
     dioxus::launch(App);
 }
 
@@ -53,13 +64,30 @@ fn Layout() -> Element {
 
 async fn api_get<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     let url = format!("{API_BASE}{path}");
-    let resp = reqwest::get(&url).await?;
+    tracing::info!("GET {url}");
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|err| {
+            tracing::error!("GET {url} request failed: {err:#}");
+            err
+        })?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
+        tracing::error!("GET {url} failed: {status} ({body})");
         anyhow::bail!("GET {url} failed: {status} ({body})");
     }
-    Ok(serde_json::from_str(&body)?)
+    // Result parsing is logged: a malformed payload must never be silent.
+    match serde_json::from_str(&body) {
+        Ok(parsed) => {
+            tracing::debug!("GET {url} ok ({status})");
+            Ok(parsed)
+        }
+        Err(err) => {
+            tracing::error!("GET {url}: failed to parse response body: {err} (body: {body})");
+            Err(err.into())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,22 +122,28 @@ fn AddRecipe() -> Element {
                     }
                     spawn(async move {
                         let client = reqwest::Client::new();
-                        let resp = client
-                            .post(format!("{API_BASE}/api/recipes"))
-                            .json(&recipe)
-                            .send()
-                            .await;
+                        let url = format!("{API_BASE}/api/recipes");
+                        tracing::info!(
+                            "Add Recipe button: POST {url} (name={:?}, ingredients={:?})",
+                            recipe.name,
+                            recipe.ingredients
+                        );
+                        let resp = client.post(url).json(&recipe).send().await;
                         match resp {
                             Ok(r) if r.status().is_success() => {
+                                tracing::info!("POST /api/recipes succeeded ({})", r.status());
                                 status.set("Recipe added! Ingredients moved to your grocery list.".into());
                                 name.set(String::new());
                                 ingredients.set(String::new());
                             }
                             Ok(r) => {
-                                status.set(format!("Server error: {}", r.status()));
+                                let msg = format!("Server error: {}", r.status());
+                                tracing::error!("POST /api/recipes failed: {msg}");
+                                status.set(msg);
                                 status_error.set(true);
                             }
                             Err(err) => {
+                                tracing::error!("POST /api/recipes request failed: {err:#}");
                                 status.set(format!("Request failed: {err}"));
                                 status_error.set(true);
                             }
@@ -183,13 +217,18 @@ fn Grocery() -> Element {
                         new_item.set(String::new());
                         spawn(async move {
                             let client = reqwest::Client::new();
-                            let resp = client
-                                .post(format!("{API_BASE}/api/grocery"))
-                                .json(&item)
-                                .send()
-                                .await;
-                            if resp.is_err() {
-                                error.set("Failed to add item.".into());
+                            let url = format!("{API_BASE}/api/grocery");
+                            tracing::info!("Grocery Add button: POST {url} (name={:?})", item.name);
+                            let resp = client.post(url).json(&item).send().await;
+                            match &resp {
+                                Ok(r) if r.status().is_success() => {
+                                    tracing::info!("POST /api/grocery succeeded ({})", r.status());
+                                }
+                                Ok(r) => tracing::error!("POST /api/grocery failed: {}", r.status()),
+                                Err(err) => {
+                                    tracing::error!("POST /api/grocery request failed: {err:#}");
+                                    error.set("Failed to add item.".into());
+                                }
                             }
                             refresh(items, error).await;
                         });
@@ -229,20 +268,26 @@ fn GroceryRow(item: GroceryItem, mut items: Signal<Vec<GroceryItem>>, mut error:
                     let update = GroceryUpdate { bought: !item.bought };
                     spawn(async move {
                         let client = reqwest::Client::new();
-                        let resp = client
-                            .patch(format!("{API_BASE}/api/grocery/{id}"))
-                            .json(&update)
-                            .send()
-                            .await;
+                        let url = format!("{API_BASE}/api/grocery/{id}");
+                        tracing::info!("Grocery checkbox: PATCH {url} (bought={})", update.bought);
+                        let resp = client.patch(url).json(&update).send().await;
                         match resp {
                             Ok(r) if r.status().is_success() => {
+                                tracing::info!("PATCH /api/grocery/{id} succeeded ({})", r.status());
                                 items.with_mut(|v| {
                                     if let Some(it) = v.iter_mut().find(|i| i.id == id) {
                                         it.bought = update.bought;
                                     }
                                 });
                             }
-                            _ => error.set("Failed to update item.".into()),
+                            Ok(r) => {
+                                tracing::error!("PATCH /api/grocery/{id} failed: {}", r.status());
+                                error.set("Failed to update item.".into());
+                            }
+                            Err(err) => {
+                                tracing::error!("PATCH /api/grocery/{id} request failed: {err:#}");
+                                error.set("Failed to update item.".into());
+                            }
                         }
                     });
                 },
@@ -256,9 +301,13 @@ fn GroceryRow(item: GroceryItem, mut items: Signal<Vec<GroceryItem>>, mut error:
 async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>) {
     match api_get::<Vec<GroceryItem>>("/api/grocery").await {
         Ok(list) => {
+            tracing::debug!("grocery list refreshed: {} items", list.len());
             items.set(list);
             error.set(String::new());
         }
-        Err(err) => error.set(err.to_string()),
+        Err(err) => {
+            tracing::error!("grocery list refresh failed: {err:#}");
+            error.set(err.to_string());
+        }
     }
 }

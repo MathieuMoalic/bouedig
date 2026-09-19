@@ -154,33 +154,68 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     axum::serve(listener, app).await.context("server error")
 }
 
+/// Bind, migrate and serve **in the background**, returning the bound
+/// address. Used by the E2E suite, which passes port 0 to get a free port.
+pub async fn spawn_server(config: Config) -> anyhow::Result<SocketAddr> {
+    let pool = open_db(&config.db_url).await?;
+    run_migrations(&pool).await?;
+    let app = build_router(AppState { db: pool }, &config);
+    let listener = tokio::net::TcpListener::bind(config.addr)
+        .await
+        .context("failed to bind address")?;
+    let addr = listener.local_addr()?;
+    tracing::info!("listening on http://{addr}");
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::error!("server error: {err:#}");
+        }
+    });
+    Ok(addr)
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// Uniform error response for handlers.
-struct ApiError(anyhow::Error);
+/// Uniform error response for handlers: either a pre-baked status + message
+/// or an internal error that is logged and reported as 500.
+struct ApiError(axum::response::Response);
+
+impl ApiError {
+    fn internal(err: impl Into<anyhow::Error>) -> Self {
+        let err = err.into();
+        tracing::error!("api error: {:#}", err);
+        Self(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response(),
+        )
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        tracing::error!("api error: {:#}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        self.0
+    }
+}
+
+impl From<(StatusCode, &'static str)> for ApiError {
+    fn from((status, msg): (StatusCode, &'static str)) -> Self {
+        Self((status, Json(serde_json::json!({ "error": msg }))).into_response())
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
-        Self(err)
+        Self::internal(err)
     }
 }
 
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
-        Self(err.into())
+        Self::internal(err)
     }
 }
 
@@ -208,7 +243,9 @@ async fn create_recipe(
 ) -> Result<(StatusCode, Json<Recipe>), ApiError> {
     let name = recipe.name.trim();
     if name.is_empty() {
-        return Err(ApiError(anyhow::anyhow!("recipe name must not be empty")));
+        return Err(ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "recipe name must not be empty").into_response(),
+        ));
     }
 
     let mut tx = state.db.begin().await?;
@@ -255,7 +292,9 @@ async fn add_grocery_item(
 ) -> Result<(StatusCode, Json<GroceryItem>), ApiError> {
     let name = item.name.trim();
     if name.is_empty() {
-        return Err(ApiError(anyhow::anyhow!("item name must not be empty")));
+        return Err(ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
+        ));
     }
     let row = sqlx::query("INSERT INTO grocery_items (name) VALUES (?) RETURNING id, name, bought")
         .bind(name)
@@ -276,4 +315,120 @@ async fn update_grocery_item(
         .await?
         .context("no such grocery item")?;
     Ok(Json(row_to_item(&row)))
+}
+
+// ---------------------------------------------------------------------------
+// Tests (router level, no HTTP server or browser required)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_config(base_path: Option<&str>, static_dir: Option<PathBuf>) -> Config {
+        Config {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            db_url: String::new(),
+            base_path: base_path.map(String::from),
+            static_dir,
+        }
+    }
+
+    async fn test_router(base_path: Option<&str>) -> Router {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        build_router(AppState { db: pool }, &test_config(base_path, None))
+    }
+
+    async fn json_response(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let builder = Request::builder().method(method).uri(uri);
+        let request = match body {
+            Some(b) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn create_recipe_splits_ingredients_into_grocery_list() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"Soup","ingredients":"Water, Salt\nPepper"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("\"Soup\""), "{body}");
+
+        let (status, body) = json_response(app, "GET", "/api/grocery", None).await;
+        assert_eq!(status, StatusCode::OK);
+        for ingredient in ["Water", "Salt", "Pepper"] {
+            assert!(body.contains(ingredient), "missing {ingredient}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grocery_toggle_and_manual_add_persist() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Rice"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = id["id"].as_i64().unwrap();
+
+        let (status, body) = json_response(
+            app.clone(),
+            "PATCH",
+            &format!("/api/grocery/{id}"),
+            Some(r#"{"bought":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"bought\":true"), "{body}");
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        assert!(body.contains("\"name\":\"Rice\"") && body.contains("\"bought\":true"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn empty_recipe_name_is_rejected() {
+        let app = test_router(None).await;
+        let (status, _) = json_response(
+            app,
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"   ","ingredients":""}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn base_path_nests_api_and_redirects_trailing_slash() {
+        let app = test_router(Some("/bouedig")).await;
+        let (status, body) = json_response(app.clone(), "GET", "/bouedig/api/grocery", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, _) = json_response(app, "GET", "/bouedig/", None).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    }
 }
