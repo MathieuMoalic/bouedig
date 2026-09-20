@@ -43,7 +43,9 @@ body {
     position: relative;
     z-index: 1;
     width: 100%;
-    max-width: 720px;
+    /* Android-first layout: constrain the app to a phone-like portrait
+       column so the web view mirrors the mobile experience. */
+    max-width: 440px;
     margin: 0 auto;
     padding: 16px 16px 130px;
 }
@@ -54,8 +56,10 @@ body {
 
 .bottom-nav {
     position: fixed;
-    left: 0;
-    right: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100%;
+    max-width: 440px;
     bottom: 0;
     z-index: 10;
     display: flex;
@@ -113,7 +117,8 @@ svg.icon.small {
 
 .fab-stack {
     position: fixed;
-    right: 18px;
+    /* Align with the phone column's right edge on wide screens. */
+    right: max(18px, calc((100% - 440px) / 2 + 18px));
     bottom: 96px;
     z-index: 9;
     display: flex;
