@@ -37,15 +37,35 @@ pub struct Ingredient {
 pub struct RecipeDetail {
     pub id: i64,
     pub name: String,
-    /// Ordered section names (may include empty sections).
+    /// Ordered ingredient section names (may include empty sections).
     pub sections: Vec<String>,
     pub ingredients: Vec<Ingredient>,
-    /// Ordered instruction steps.
-    pub instructions: Vec<String>,
+    /// Ordered instruction steps (may carry their section name).
+    pub instructions: Vec<InstructionStep>,
+    /// Ordered instruction section names (may include empty sections).
+    pub instruction_sections: Vec<String>,
+    /// Free-form notes shown on the detail page.
+    #[serde(default)]
+    pub notes: String,
+    /// e.g. "2 portions" or "12 cookies".
+    #[serde(default)]
+    #[serde(rename = "yield")]
+    pub yield_amount: String,
+    /// Where the recipe comes from (book, URL, person…).
+    #[serde(default)]
+    pub source: String,
     /// URL of the full-resolution photo, if one was uploaded.
     pub image: Option<String>,
     /// URL of the compressed thumbnail shown in the recipe grid.
     pub thumb: Option<String>,
+}
+
+/// One instruction step, optionally grouped under a named section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstructionStep {
+    pub text: String,
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 /// Payload used to create or update a recipe (name + structured fields).
@@ -57,7 +77,16 @@ pub struct RecipeInput {
     #[serde(default)]
     pub ingredients: Vec<Ingredient>,
     #[serde(default)]
-    pub instructions: Vec<String>,
+    pub instructions: Vec<InstructionStep>,
+    #[serde(default)]
+    pub instruction_sections: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    #[serde(rename = "yield")]
+    pub yield_amount: String,
+    #[serde(default)]
+    pub source: String,
 }
 
 /// A grocery list item as stored in the database.

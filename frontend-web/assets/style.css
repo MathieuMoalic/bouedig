@@ -19,14 +19,35 @@
 html,
 body {
     margin: 0;
+    height: 100%;
     background: var(--bg);
     color: var(--text);
     font-family: Roboto, system-ui, -apple-system, "Segoe UI", sans-serif;
+    /* Discrete dark scrollbars (Firefox + WebKit/Android webview). */
+    scrollbar-width: thin;
+    scrollbar-color: #2c3531 transparent;
+}
+
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #2c3531;
+    border-radius: 3px;
 }
 
 .app {
-    min-height: 100vh;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
     position: relative;
+    overflow: hidden;
 }
 
 .wallpaper {
@@ -40,6 +61,8 @@ body {
 }
 
 .content {
+    flex: 1;
+    overflow-y: auto;
     position: relative;
     z-index: 1;
     width: 100%;
@@ -48,6 +71,9 @@ body {
     max-width: 440px;
     margin: 0 auto;
     padding: 16px 16px 130px;
+    /* Discrete dark scrollbar for the content scroller. */
+    scrollbar-width: thin;
+    scrollbar-color: #2c3531 transparent;
 }
 
 /* ------------------------------------------------------------------ */
@@ -55,17 +81,16 @@ body {
 /* ------------------------------------------------------------------ */
 
 .bottom-nav {
-    position: fixed;
-    left: 50%;
-    transform: translateX(-50%);
+    position: relative;
+    z-index: 10;
     width: 100%;
     max-width: 440px;
-    bottom: 0;
-    z-index: 10;
+    margin: 0 auto;
     display: flex;
     justify-content: space-around;
     align-items: center;
     height: 76px;
+    flex-shrink: 0;
     background: rgba(14, 19, 16, 0.94);
     backdrop-filter: blur(10px);
     border-top: 1px solid var(--divider);
@@ -497,7 +522,8 @@ button[type="submit"]:hover {
 ul.ingredient-list,
 ol.instruction-list {
     margin: 0;
-    padding-left: 22px;
+    padding-left: 0;
+    list-style: none;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -859,4 +885,65 @@ ol.instruction-list li {
 
 .ingredient-groups .ingredient-list {
     margin: 2px 0 4px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Scale control + meta sections                                       */
+/* ------------------------------------------------------------------ */
+
+.scale-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.scale-row label {
+    margin: 0;
+}
+
+.scale-row input {
+    width: 90px;
+    padding: 8px 10px;
+    border: 1px solid var(--divider);
+    border-radius: 10px;
+    background: #101512;
+    color: var(--text);
+    font: inherit;
+}
+
+.scale-row input.invalid {
+    border-color: var(--error);
+}
+
+.scale-row .scale-hint {
+    color: var(--error);
+    font-size: 13px;
+}
+
+.scale-row .scale-reset {
+    background: transparent;
+    border: none;
+    color: var(--accent-bright);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 4px 6px;
+}
+
+.meta-card p {
+    margin: 0;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+/* Validation state inside the ingredient modal */
+#editor-modal input.invalid {
+    border-color: var(--error);
+}
+
+.modal-error {
+    color: var(--error);
+    font-size: 13px;
+    margin: -4px 0 10px;
 }

@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
-use shared::{GroceryItem, Ingredient, NewGroceryItem, Recipe, RecipeDetail, RecipeInput};
+use shared::{GroceryItem, Ingredient, InstructionStep, NewGroceryItem, Recipe, RecipeDetail, RecipeInput};
 use thirtyfour::{By, Capabilities, WebDriver};
 
 fn env_port(name: &str, default: u16) -> u16 {
@@ -117,9 +117,46 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
     add_ingredient_modal(driver, "200", "g", "Flour", "").await?;
     add_ingredient_modal(driver, "", "", "Milk", "").await?;
 
-    // Instructions: one step per modal.
-    add_step_modal(driver, "Mix the batter").await?;
-    add_step_modal(driver, "Cook in a hot pan").await?;
+    // An invalid quantity must show an inline error and block the save.
+    open_ingredient_modal(driver).await?;
+    driver.find(By::Id("modal-qty")).await?.send_keys("0").await?;
+    driver
+        .find(By::Css("#modal-qty.invalid"))
+        .await
+        .context("invalid quantity does not turn the field red")?;
+    driver
+        .find(By::Css(".modal-error"))
+        .await
+        .context("quantity error message not shown while invalid")?;
+    click_scrolled(driver, "modal-save").await?;
+    driver
+        .find(By::Id("modal-name"))
+        .await
+        .context("save must be blocked while the quantity is invalid")?;
+    click_scrolled(driver, "modal-cancel").await?;
+
+    // Instructions: one step per modal, then an instruction section and a
+    // step inside it (the section select defaults to the last section).
+    add_step_modal(driver, "Mix the batter", None).await?;
+    add_step_section_modal(driver, "Cooking").await?;
+    add_step_modal(driver, "Cook in a hot pan", Some("Cooking")).await?;
+
+    // Meta fields between instructions and the photo.
+    driver
+        .find(By::Id("recipe-yield"))
+        .await?
+        .send_keys("4 pancakes")
+        .await?;
+    driver
+        .find(By::Id("recipe-source"))
+        .await?
+        .send_keys("Grandma")
+        .await?;
+    driver
+        .find(By::Id("recipe-notes"))
+        .await?
+        .send_keys("Best eaten warm")
+        .await?;
 
     click_scrolled(&driver, "recipe-submit").await?;
 
@@ -132,7 +169,13 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         .next()
         .and_then(|s| s.parse().ok())
         .context("detail url does not contain a recipe id")?;
-    if let Err(err) = assert_detail_view(driver, "Pancakes", &["Mix the batter", "Cook in a hot pan"]).await {
+    if let Err(err) = assert_detail_view(
+        driver,
+        "Pancakes",
+        &["Mix the batter", "Cook in a hot pan"],
+    )
+    .await
+    {
         let src = driver.source().await.unwrap_or_default();
         anyhow::bail!("detail view incomplete after creation ({err}); page source:\n{src}");
     }
@@ -409,7 +452,14 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
                     section: None,
                 },
             ],
-            instructions: vec!["Boil water".into(), "Add salt".into()],
+            instructions: vec![
+                InstructionStep { text: "Boil water".into(), section: None },
+                InstructionStep { text: "Add salt".into(), section: None },
+            ],
+            instruction_sections: vec![],
+            notes: "Tastes better the next day.".into(),
+            yield_amount: "4 bowls".into(),
+            source: "Old family cookbook".into(),
         })
         .send()
         .await?
@@ -441,7 +491,17 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     assert_eq!(detail.sections, vec!["Base"]);
     assert_eq!(detail.ingredients.len(), 2);
     assert_eq!(detail.ingredients[1].prep.as_deref(), Some("to taste"));
-    assert_eq!(detail.instructions, vec!["Boil water", "Add salt"]);
+    assert_eq!(
+        detail.instructions,
+        vec![
+            InstructionStep { text: "Boil water".into(), section: None },
+            InstructionStep { text: "Add salt".into(), section: None },
+        ]
+    );
+    assert_eq!(detail.instruction_sections, Vec::<String>::new());
+    assert_eq!(detail.notes, "Tastes better the next day.");
+    assert_eq!(detail.yield_amount, "4 bowls");
+    assert_eq!(detail.source, "Old family cookbook");
 
     // Update (multipart PUT).
     let boundary = "e2eUpDbNd";
@@ -454,7 +514,13 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
         "[{\"quantity\":2,\"unit\":\"g\",\"name\":\"carrot\",\"prep\":\"grated\"}]\r\n",
         "--e2eUpDbNd\r\n",
         "Content-Disposition: form-data; name=\"instructions\"\r\n\r\n",
-        "[\"chop\"]\r\n",
+        "[{\"text\":\"chop\",\"section\":\"Prep\"}]\r\n",
+        "--e2eUpDbNd\r\n",
+        "Content-Disposition: form-data; name=\"instruction_sections\"\r\n\r\n",
+        "[\"Prep\"]\r\n",
+        "--e2eUpDbNd\r\n",
+        "Content-Disposition: form-data; name=\"notes\"\r\n\r\n",
+        "Updated notes\r\n",
         "--e2eUpDbNd--\r\n",
     );
     let updated: RecipeDetail = http
@@ -468,7 +534,14 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     assert_eq!(updated.name, "Better Stew");
     assert_eq!(updated.ingredients.len(), 1);
     assert_eq!(updated.ingredients[0].name, "carrot");
-    assert_eq!(updated.instructions, vec!["chop"]);
+    assert_eq!(
+        updated.instructions,
+        vec![InstructionStep { text: "chop".into(), section: Some("Prep".into()) }]
+    );
+    assert_eq!(updated.instruction_sections, vec!["Prep"]);
+    assert_eq!(updated.notes, "Updated notes");
+    // Meta fields not present in the PUT are cleared.
+    assert_eq!(updated.yield_amount, "");
 
     // Delete.
     let status = http
@@ -506,7 +579,16 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     // Invalid payloads are rejected with 4xx, not 5xx.
     let status = http
         .post(format!("{base}/api/recipes"))
-        .json(&RecipeInput { name: "  ".into(), sections: vec![], ingredients: vec![], instructions: vec![] })
+        .json(&RecipeInput {
+            name: "  ".into(),
+            sections: vec![],
+            ingredients: vec![],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
         .send()
         .await?
         .status();
@@ -533,7 +615,14 @@ async fn drag_reorders_steps() -> anyhow::Result<()> {
             name: "Sortable".into(),
             sections: vec![],
             ingredients: vec![],
-            instructions: vec!["First step".into(), "Second step".into()],
+            instructions: vec![
+                InstructionStep { text: "First step".into(), section: None },
+                InstructionStep { text: "Second step".into(), section: None },
+            ],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
         })
         .send()
         .await?
@@ -579,6 +668,102 @@ async fn drag_reorders_steps() -> anyhow::Result<()> {
         anyhow::ensure!(
             after == vec!["Second step", "First step"],
             "drag did not reorder steps: {after:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Detail-view scale: multiplies displayed quantities, validates live and
+/// resets; nothing is persisted.
+#[tokio::test(flavor = "multi_thread")]
+async fn scale_multiplies_quantities() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Scalable".into(),
+            sections: vec![],
+            ingredients: vec![Ingredient {
+                quantity: Some(200.0),
+                unit: Some("g".into()),
+                name: "Flour".into(),
+                prep: None,
+                section: None,
+            }],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        let recipes: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let id = recipes[0].id;
+        driver.goto(format!("{base}/recipe/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/recipe/{id}")).await?;
+        driver.find(By::Id("ingredient-list")).await?;
+        let list = driver.find(By::Id("ingredient-list")).await?;
+        let text = list.text().await?;
+        anyhow::ensure!(text.contains("200 g Flour"), "unscaled text wrong: {text}");
+
+        // Scale 2x -> 400 g.
+        driver.find(By::Id("scale-input")).await?.send_keys("2").await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let text = list.text().await?;
+        anyhow::ensure!(
+            text.contains("400 g Flour"),
+            "scaled quantity missing (expected 400 g): {text}"
+        );
+
+        // An out-of-range scale shows the hint and does not scale.
+        driver
+            .find(By::Id("scale-input"))
+            .await?
+            .send_keys("000")
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        driver
+            .find(By::Css(".scale-hint"))
+            .await
+            .context("scale hint missing for an out-of-range scale")?;
+        let text = list.text().await?;
+        anyhow::ensure!(
+            text.contains("200 g Flour"),
+            "invalid scale must fall back to 1x: {text}"
+        );
+
+        // Reset returns to 1x.
+        driver.find(By::Id("scale-reset")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let text = list.text().await?;
+        anyhow::ensure!(
+            text.contains("200 g Flour"),
+            "reset did not restore 1x: {text}"
+        );
+
+        // The stored recipe is untouched by scaling.
+        let detail = poll_detail_full(&http, &base, id).await?;
+        anyhow::ensure!(
+            detail.ingredients[0].quantity == Some(200.0),
+            "scale must not be persisted into stored quantities"
         );
         Ok(())
     })()
@@ -635,8 +820,19 @@ async fn add_ingredient_modal(
 }
 
 /// Open the instruction modal, fill it and save.
-async fn add_step_modal(driver: &WebDriver, text: &str) -> anyhow::Result<()> {
+async fn add_step_modal(
+    driver: &WebDriver,
+    text: &str,
+    section: Option<&str>,
+) -> anyhow::Result<()> {
     click_scrolled(driver, "add-step").await?;
+    if let Some(section) = section {
+        // The select defaults to the last section; only interact with it when
+        // an explicit different section is requested.
+        let select_elem = driver.find(By::Id("modal-step-section")).await?;
+        let select = thirtyfour::components::SelectElement::new(&select_elem).await?;
+        select.select_by_value(section).await?;
+    }
     driver
         .find(By::Id("modal-step-text"))
         .await
@@ -644,6 +840,29 @@ async fn add_step_modal(driver: &WebDriver, text: &str) -> anyhow::Result<()> {
         .send_keys(text)
         .await?;
     click_scrolled(driver, "modal-save").await?;
+    Ok(())
+}
+
+/// Create a new instruction section via its modal.
+async fn add_step_section_modal(driver: &WebDriver, name: &str) -> anyhow::Result<()> {
+    click_scrolled(driver, "add-step-section").await?;
+    driver
+        .find(By::Id("modal-section-name"))
+        .await
+        .context("instruction-section modal did not open")?
+        .send_keys(name)
+        .await?;
+    click_scrolled(driver, "modal-save").await?;
+    Ok(())
+}
+
+/// Open the ingredient modal in "add" mode.
+async fn open_ingredient_modal(driver: &WebDriver) -> anyhow::Result<()> {
+    click_scrolled(driver, "add-ingredient").await?;
+    driver
+        .find(By::Id("modal-name"))
+        .await
+        .context("ingredient modal did not open")?;
     Ok(())
 }
 
@@ -731,12 +950,29 @@ async fn assert_detail_view(
         .await
         .context("instruction list missing")?;
     let text = steps.text().await?;
+    anyhow::ensure!(
+        text.contains("Cooking"),
+        "instruction section title missing from detail: '{text}'"
+    );
     for expected in expect_instructions {
         anyhow::ensure!(
             text.contains(expected),
             "instruction '{expected}' missing from detail: '{text}'"
         );
     }
+    // Meta sections (filled in by the editor flow).
+    driver
+        .find(By::Id("detail-yield"))
+        .await
+        .context("Yield section missing from detail")?;
+    driver
+        .find(By::Id("detail-source"))
+        .await
+        .context("Source section missing from detail")?;
+    driver
+        .find(By::Id("detail-notes"))
+        .await
+        .context("Notes section missing from detail")?;
     Ok(())
 }
 

@@ -14,7 +14,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use shared::{GroceryItem, GroceryUpdate, Ingredient, NewGroceryItem, Recipe, RecipeDetail, RecipeInput};
+use shared::{
+    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, NewGroceryItem, Recipe, RecipeDetail,
+    RecipeInput,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tower_http::cors::CorsLayer;
@@ -288,20 +291,12 @@ fn row_to_recipe(row: &sqlx::sqlite::SqliteRow) -> Recipe {
     }
 }
 
-/// Decode the instructions JSON column.
-fn decode_instructions(json: Option<String>) -> Result<Vec<String>, ApiError> {
-    match json {
-        None => Ok(Vec::new()),
-        Some(json) => serde_json::from_str(&json)
-            .map_err(|e| ApiError::internal(anyhow::anyhow!("bad instructions JSON: {e}"))),
-    }
-}
-
-/// Assemble the full detail view (recipe row + sections + ordered ingredients).
+/// Assemble the full detail view (recipe + sections + ingredients + steps).
 async fn load_recipe_detail(db: &SqlitePool, id: i64) -> Result<Option<RecipeDetail>, ApiError> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT id, name, instructions, image_path, thumb_path FROM recipes WHERE id = ?",
+        "SELECT id, name, notes, yield_amount, source, image_path, thumb_path \
+         FROM recipes WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(db)
@@ -310,16 +305,22 @@ async fn load_recipe_detail(db: &SqlitePool, id: i64) -> Result<Option<RecipeDet
         return Ok(None);
     };
     let (image, thumb) = recipe_urls(&row);
-    let instructions = decode_instructions(row.get("instructions"))?;
-    let sections: Vec<String> = sqlx::query(
-        "SELECT name FROM recipe_sections WHERE recipe_id = ? ORDER BY position ASC",
+    let sections = load_section_names(db, id, "ingredient").await?;
+    let instruction_sections = load_section_names(db, id, "instruction").await?;
+    let steps = sqlx::query(
+        "SELECT section, text FROM recipe_instructions \
+         WHERE recipe_id = ? ORDER BY position ASC",
     )
     .bind(id)
     .fetch_all(db)
-    .await?
-    .iter()
-    .map(|r| r.get::<String, _>("name"))
-    .collect();
+    .await?;
+    let instructions = steps
+        .iter()
+        .map(|row| InstructionStep {
+            text: row.get::<String, _>("text"),
+            section: row.get::<Option<String>, _>("section"),
+        })
+        .collect();
     let rows = sqlx::query(
         "SELECT quantity, unit, name, prep, section FROM recipe_ingredients \
          WHERE recipe_id = ? ORDER BY position ASC",
@@ -345,9 +346,33 @@ async fn load_recipe_detail(db: &SqlitePool, id: i64) -> Result<Option<RecipeDet
         sections,
         ingredients,
         instructions,
+        instruction_sections,
+        notes: row.get("notes"),
+        yield_amount: row.get("yield_amount"),
+        source: row.get("source"),
         image,
         thumb,
     }))
+}
+
+/// Load one kind of ordered section names for a recipe.
+async fn load_section_names(
+    db: &SqlitePool,
+    recipe_id: i64,
+    kind: &str,
+) -> Result<Vec<String>, ApiError> {
+    use sqlx::Row;
+    Ok(sqlx::query(
+        "SELECT name FROM recipe_sections \
+         WHERE recipe_id = ? AND kind = ? ORDER BY position ASC",
+    )
+    .bind(recipe_id)
+    .bind(kind)
+    .fetch_all(db)
+    .await?
+    .iter()
+    .map(|r| r.get::<String, _>("name"))
+    .collect())
 }
 
 /// Remove the stored photo files of a recipe (best effort).
@@ -372,31 +397,28 @@ async fn insert_recipe(
         Some((i, t)) => (Some(i), Some(t)),
         None => (None, None),
     };
-    let instructions =
-        serde_json::to_string(&input.instructions).context("failed to encode instructions")?;
-    // Every section referenced by an ingredient must exist.
-    let sections = complete_sections(input);
-
+    // Every section referenced by an ingredient/step must exist.
+    let sections = complete_sections(&input.sections, input.ingredients.iter().map(|i| i.section.clone()));
+    let instruction_sections = complete_sections(
+        &input.instruction_sections,
+        input.instructions.iter().map(|s| s.section.clone()),
+    );
     let mut tx = db.begin().await?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO recipes (name, instructions, image_path, thumb_path) \
-         VALUES (?, ?, ?, ?) RETURNING id",
+        "INSERT INTO recipes (name, notes, yield_amount, source, image_path, thumb_path) \
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(input.name.trim())
-    .bind(&instructions)
+    .bind(input.notes.trim())
+    .bind(input.yield_amount.trim())
+    .bind(input.source.trim())
     .bind(image_path.clone())
     .bind(thumb_path.clone())
     .fetch_one(&mut *tx)
     .await?;
 
-    for (position, section) in sections.iter().enumerate() {
-        sqlx::query("INSERT INTO recipe_sections (recipe_id, position, name) VALUES (?, ?, ?)")
-            .bind(id)
-            .bind(position as i64)
-            .bind(section)
-            .execute(&mut *tx)
-            .await?;
-    }
+    insert_sections(&mut tx, id, "ingredient", &sections).await?;
+    insert_sections(&mut tx, id, "instruction", &instruction_sections).await?;
 
     for (position, ingredient) in input.ingredients.iter().enumerate() {
         sqlx::query(
@@ -413,6 +435,19 @@ async fn insert_recipe(
         .execute(&mut *tx)
         .await?;
     }
+
+    for (position, step) in input.instructions.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO recipe_instructions (recipe_id, position, section, text) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(position as i64)
+        .bind(step.section.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(step.text.trim())
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
 
     Ok(Recipe {
@@ -423,26 +458,46 @@ async fn insert_recipe(
     })
 }
 
-/// The input's section list, plus any extra sections referenced by
-/// ingredients (appended in first-seen order).
-fn complete_sections(input: &RecipeInput) -> Vec<String> {
-    let mut sections = input
-        .sections
+/// The provided section list, plus any extra sections referenced by the
+/// items (appended in first-seen order).
+fn complete_sections<I>(provided: &[String], referenced: I) -> Vec<String>
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    let mut sections: Vec<String> = provided
         .iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-    for ingredient in &input.ingredients {
-        if let Some(section) = ingredient.section.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if !sections.iter().any(|s| s == section) {
-                sections.push(section.to_string());
-            }
+        .collect();
+    for section in referenced.into_iter().flatten() {
+        let section = section.trim().to_string();
+        if !section.is_empty() && !sections.iter().any(|s| *s == section) {
+            sections.push(section);
         }
     }
     sections
 }
 
-/// Replace the sections and structured ingredients of a recipe.
+/// Insert ordered section names of one kind.
+async fn insert_sections(
+    tx: &mut sqlx::SqliteConnection,
+    recipe_id: i64,
+    kind: &str,
+    sections: &[String],
+) -> Result<(), ApiError> {
+    for (position, section) in sections.iter().enumerate() {
+        sqlx::query("INSERT INTO recipe_sections (recipe_id, kind, position, name) VALUES (?, ?, ?, ?)")
+            .bind(recipe_id)
+            .bind(kind)
+            .bind(position as i64)
+            .bind(section)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Replace the sections, ingredients and instruction steps of a recipe.
 async fn replace_details(
     tx: &mut sqlx::SqliteConnection,
     recipe_id: i64,
@@ -452,14 +507,13 @@ async fn replace_details(
         .bind(recipe_id)
         .execute(&mut *tx)
         .await?;
-    for (position, section) in complete_sections(input).iter().enumerate() {
-        sqlx::query("INSERT INTO recipe_sections (recipe_id, position, name) VALUES (?, ?, ?)")
-            .bind(recipe_id)
-            .bind(position as i64)
-            .bind(section)
-            .execute(&mut *tx)
-            .await?;
-    }
+    let sections = complete_sections(&input.sections, input.ingredients.iter().map(|i| i.section.clone()));
+    let instruction_sections = complete_sections(
+        &input.instruction_sections,
+        input.instructions.iter().map(|s| s.section.clone()),
+    );
+    insert_sections(tx, recipe_id, "ingredient", &sections).await?;
+    insert_sections(tx, recipe_id, "instruction", &instruction_sections).await?;
 
     sqlx::query("DELETE FROM recipe_ingredients WHERE recipe_id = ?")
         .bind(recipe_id)
@@ -480,6 +534,23 @@ async fn replace_details(
         .execute(&mut *tx)
         .await?;
     }
+
+    sqlx::query("DELETE FROM recipe_instructions WHERE recipe_id = ?")
+        .bind(recipe_id)
+        .execute(&mut *tx)
+        .await?;
+    for (position, step) in input.instructions.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO recipe_instructions (recipe_id, position, section, text) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(recipe_id)
+        .bind(position as i64)
+        .bind(step.section.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(step.text.trim())
+        .execute(&mut *tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -488,6 +559,20 @@ fn validate_recipe_input(input: &RecipeInput) -> Result<(), ApiError> {
         return Err(ApiError(
             (StatusCode::UNPROCESSABLE_ENTITY, "recipe name must not be empty").into_response(),
         ));
+    }
+    // Quantities, when present, must be positive and finite.
+    for ingredient in &input.ingredients {
+        if let Some(quantity) = ingredient.quantity {
+            if !quantity.is_finite() || quantity <= 0.0 {
+                return Err(ApiError(
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "ingredient quantities must be positive numbers",
+                    )
+                        .into_response(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -540,8 +625,8 @@ struct MultipartRecipe {
     image: Option<(String, String)>,
 }
 
-/// Parse `name`, `ingredients` (JSON array), `instructions` (JSON array) and
-/// an optional `image` file field.
+/// Parse `name`, structured lists (JSON), the meta strings and an optional
+/// `image` file field.
 async fn parse_recipe_multipart(
     state: &AppState,
     multipart: &mut axum::extract::Multipart,
@@ -550,6 +635,10 @@ async fn parse_recipe_multipart(
     let mut sections = String::new();
     let mut ingredients = String::new();
     let mut instructions = String::new();
+    let mut instruction_sections = String::new();
+    let mut notes = String::new();
+    let mut yield_amount = String::new();
+    let mut source = String::new();
     let mut image: Option<(String, String)> = None;
 
     while let Some(field) = multipart
@@ -562,6 +651,10 @@ async fn parse_recipe_multipart(
             "sections" => sections = field.text().await.unwrap_or_default(),
             "ingredients" => ingredients = field.text().await.unwrap_or_default(),
             "instructions" => instructions = field.text().await.unwrap_or_default(),
+            "instruction_sections" => instruction_sections = field.text().await.unwrap_or_default(),
+            "notes" => notes = field.text().await.unwrap_or_default(),
+            "yield" => yield_amount = field.text().await.unwrap_or_default(),
+            "source" => source = field.text().await.unwrap_or_default(),
             "image" => {
                 let bytes = field
                     .bytes()
@@ -591,16 +684,35 @@ async fn parse_recipe_multipart(
             ApiError::client(StatusCode::UNPROCESSABLE_ENTITY, format!("bad ingredients JSON: {e}"))
         })?
     };
-    let instructions: Vec<String> = if instructions.trim().is_empty() {
+    let instructions: Vec<InstructionStep> = if instructions.trim().is_empty() {
         Vec::new()
     } else {
         serde_json::from_str(&instructions).map_err(|e| {
             ApiError::client(StatusCode::UNPROCESSABLE_ENTITY, format!("bad instructions JSON: {e}"))
         })?
     };
+    let instruction_sections: Vec<String> = if instruction_sections.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&instruction_sections).map_err(|e| {
+            ApiError::client(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("bad instruction_sections JSON: {e}"),
+            )
+        })?
+    };
 
     Ok(MultipartRecipe {
-        input: RecipeInput { name, sections, ingredients, instructions },
+        input: RecipeInput {
+            name,
+            sections,
+            ingredients,
+            instructions,
+            instruction_sections,
+            notes,
+            yield_amount,
+            source,
+        },
         image,
     })
 }
@@ -650,8 +762,6 @@ async fn update_recipe(
         (existing.get("image_path"), existing.get("thumb_path"))
     };
 
-    let instructions = serde_json::to_string(&input.instructions)
-        .context("failed to encode instructions")?;
     let mut tx = state.db.begin().await?;
     let (new_image, new_thumb) = match &image {
         Some((img, thumb)) => {
@@ -661,11 +771,13 @@ async fn update_recipe(
         None => (old_image, old_thumb),
     };
     let updated = sqlx::query(
-        "UPDATE recipes SET name = ?, instructions = ?, image_path = ?, thumb_path = ? \
-         WHERE id = ? RETURNING id",
+        "UPDATE recipes SET name = ?, notes = ?, yield_amount = ?, source = ?, \
+         image_path = ?, thumb_path = ? WHERE id = ? RETURNING id",
     )
     .bind(input.name.trim())
-    .bind(&instructions)
+    .bind(input.notes.trim())
+    .bind(input.yield_amount.trim())
+    .bind(input.source.trim())
     .bind(new_image)
     .bind(new_thumb)
     .bind(id)
@@ -870,7 +982,7 @@ pub(crate) mod tests {
                 r#"{"name":"Soup","ingredients":[
                      {"quantity":300,"unit":"ml","name":"water","prep":null},
                      {"quantity":1,"unit":"tbsp","name":"salt","prep":"to taste"}],
-                   "instructions":["Boil water","Add salt"]}"#,
+                   "instructions":[{"text":"Boil water"},{"text":"Add salt"}]}"#,
             ),
         )
         .await;
@@ -887,7 +999,7 @@ pub(crate) mod tests {
         assert_eq!(detail.ingredients[0].name, "water");
         assert_eq!(detail.ingredients[0].unit.as_deref(), Some("ml"));
         assert_eq!(detail.ingredients[1].quantity, Some(1.0));
-        assert_eq!(detail.instructions, vec!["Boil water", "Add salt"]);
+        assert_eq!(detail.instructions, vec![InstructionStep { text: "Boil water".into(), section: None }, InstructionStep { text: "Add salt".into(), section: None }]);
 
         // The shopping list must NOT receive recipe ingredients anymore.
         let (status, body) = json_response(app, "GET", "/api/grocery", None).await;
@@ -921,7 +1033,7 @@ pub(crate) mod tests {
         assert_eq!(detail.ingredients[0].section.as_deref(), Some("Crêpes"));
 
         // PUT with a renamed section keeps order; empty sections persist.
-        let boundary = "SecBNd";
+        let _boundary = "SecBNd";
         let payload = concat!(
             "--SecBNd\r\n",
             "Content-Disposition: form-data; name=\"name\"\r\n\r\n",
@@ -956,7 +1068,7 @@ pub(crate) mod tests {
             app.clone(),
             "POST",
             "/api/recipes",
-            Some(r#"{"name":"Old","ingredients":[{"quantity":1,"unit":null,"name":"onion","prep":null}],"instructions":["a"]}"#),
+            Some(r#"{"name":"Old","ingredients":[{"quantity":1,"unit":null,"name":"onion","prep":null}],"instructions":[{"text":"a"}]}"#),
         )
         .await;
         let recipe: Recipe = serde_json::from_str(&body).unwrap();
@@ -971,7 +1083,7 @@ pub(crate) mod tests {
             "[{\"quantity\":2,\"unit\":\"g\",\"name\":\"carrot\",\"prep\":\"grated\"}]\r\n",
             "--UpDbOuNd\r\n",
             "Content-Disposition: form-data; name=\"instructions\"\r\n\r\n",
-            "[\"step one\",\"step two\"]\r\n",
+            "[{\"text\":\"step one\"},{\"text\":\"step two\"}]\r\n",
             "--UpDbOuNd--\r\n",
         );
         let request = axum::http::Request::builder()
@@ -1030,6 +1142,43 @@ pub(crate) mod tests {
 
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         assert!(body.contains("\"name\":\"Rice\"") && body.contains("\"bought\":true"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn non_positive_quantities_are_rejected() {
+        let app = test_router(None).await;
+        for bad in ["-2", "0", "0.0"] {
+            let payload = format!(
+                r#"{{"name":"X","ingredients":[{{"quantity":{bad},"name":"salt"}}],"instructions":[]}}"#
+            );
+            let (status, body) = json_response(app.clone(), "POST", "/api/recipes", Some(&payload)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "qty {bad}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_fields_round_trip() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/recipes",
+            Some(
+                r#"{"name":"Crêpe","notes":"Keep the batter cold.",
+                    "yield":"12 crêpes","source":"Grandma",
+                    "ingredients":[],"instructions":[]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let recipe: Recipe = serde_json::from_str(&body).unwrap();
+        let (status, body) =
+            json_response(app, "GET", &format!("/api/recipes/{}", recipe.id), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail: RecipeDetail = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail.notes, "Keep the batter cold.");
+        assert_eq!(detail.yield_amount, "12 crêpes");
+        assert_eq!(detail.source, "Grandma");
     }
 
     #[tokio::test]
@@ -1097,7 +1246,7 @@ mod photo_tests {
             format!("--{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n[{{\"quantity\":200,\"unit\":\"g\",\"name\":\"flour\",\"prep\":\"sifted\"}}]\r\n").as_bytes(),
         );
         body.extend_from_slice(
-            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n[\"Mix\",\"Cook\"]\r\n").as_bytes(),
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n[{{\"text\":\"Mix\"}},{{\"text\":\"Cook\"}}]\r\n").as_bytes(),
         );
         body.extend_from_slice(
             format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes(),
@@ -1127,7 +1276,7 @@ mod photo_tests {
         let detail: RecipeDetail = serde_json::from_str(&body).unwrap();
         assert_eq!(detail.ingredients[0].quantity, Some(200.0));
         assert_eq!(detail.ingredients[0].prep.as_deref(), Some("sifted"));
-        assert_eq!(detail.instructions, vec!["Mix", "Cook"]);
+        assert_eq!(detail.instructions, vec![InstructionStep { text: "Mix".into(), section: None }, InstructionStep { text: "Cook".into(), section: None }]);
 
         // The stored files exist, and DELETE removes them together with the row.
         let image_file = config.data_dir.join(image_url.trim_start_matches("/api/images/"));

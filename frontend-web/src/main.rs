@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
 use wasm_bindgen::JsCast;
 use shared::{
-    GroceryItem, GroceryUpdate, Ingredient, NewGroceryItem, Recipe,
+    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, NewGroceryItem, Recipe,
     RecipeDetail as RecipeDetailModel, RecipeInput,
 };
 
@@ -314,6 +314,10 @@ fn build_multipart(
     sections_json: &str,
     ingredients_json: &str,
     instructions_json: &str,
+    instruction_sections_json: &str,
+    notes: &str,
+    yield_amount: &str,
+    source: &str,
     image: Option<(&str, &[u8])>,
 ) -> (String, Vec<u8>) {
     // `SystemTime::now` is not implemented on wasm, use the JS clock.
@@ -323,6 +327,10 @@ fn build_multipart(
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"sections\"\r\n\r\n{sections_json}\r\n").as_bytes());
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n{ingredients_json}\r\n").as_bytes());
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n{instructions_json}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"instruction_sections\"\r\n\r\n{instruction_sections_json}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"notes\"\r\n\r\n{notes}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"yield\"\r\n\r\n{yield_amount}\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\n{source}\r\n").as_bytes());
     if let Some((filename, bytes)) = image {
         let mime = match filename.rsplit('.').next().unwrap_or_default() {
             "png" => "image/png",
@@ -460,6 +468,7 @@ struct IngredientRow {
 #[derive(Clone, PartialEq)]
 struct StepRow {
     id: u64,
+    section_id: Option<u64>,
     text: String,
 }
 
@@ -477,9 +486,12 @@ enum Modal {
     Section {
         editing_section: Option<u64>,
         name: String,
+        /// true = an instruction section, false = an ingredient section.
+        is_step: bool,
     },
     Step {
         editing_step: Option<u64>,
+        section_id: Option<u64>,
         text: String,
     },
 }
@@ -489,6 +501,7 @@ enum DragKind {
     Ingredient,
     Section,
     Step,
+    StepSection,
 }
 
 #[derive(Clone, PartialEq)]
@@ -664,15 +677,6 @@ fn IconHandle() -> Element {
 }
 
 #[component]
-fn IconSparkle() -> Element {
-    rsx! {
-        svg { class: "icon small", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round",
-            path { d: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3zM19 15l.9 2.1L22 18l-2.1.9L19 20l-.9-1.9L15 18l2.1-.9L19 15z" }
-        }
-    }
-}
-
-#[component]
 fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Element {
     // One shared id counter so element ids never collide across lists.
     let sec_count = initial.sections.len() as u64;
@@ -712,14 +716,38 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
     });
     let mut steps = use_signal(|| {
         let step_base = sec_count + ing_count;
+        let istep_base = step_base + step_count;
         initial
             .instructions
             .iter()
             .enumerate()
-            .map(|(i, t)| StepRow { id: step_base + i as u64, text: t.clone() })
+            .map(|(i, step)| StepRow {
+                id: step_base + i as u64,
+                section_id: step.section.as_deref().and_then(|s| {
+                    initial
+                        .instruction_sections
+                        .iter()
+                        .position(|sec| sec == s)
+                        .map(|p| istep_base + p as u64)
+                }),
+                text: step.text.clone(),
+            })
             .collect::<Vec<_>>()
     });
-    let mut next_id = use_signal(|| sec_count + ing_count + step_count);
+    let mut step_sections = use_signal(|| {
+        let istep_base = sec_count + ing_count + step_count;
+        initial
+            .instruction_sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| SectionRow { id: istep_base + i as u64, name: s.clone() })
+            .collect::<Vec<_>>()
+    });
+    let mut next_id =
+        use_signal(|| sec_count + ing_count + step_count + initial.instruction_sections.len() as u64);
+    let mut yield_amount = use_signal(|| initial.yield_amount.clone());
+    let mut source = use_signal(|| initial.source.clone());
+    let mut notes = use_signal(|| initial.notes.clone());
     let mut modal = use_signal(|| None::<Modal>);
     let mut drag = use_signal(|| None::<DragState>);
     let mut suppress_click = use_signal(|| false);
@@ -735,9 +763,64 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
     let sections_snapshot = sections.read().clone();
     let rows_snapshot = rows.read().clone();
     let steps_snapshot = steps.read().clone();
+    let step_sections_snapshot = step_sections.read().clone();
     let drag_snapshot = drag.read().clone();
     let modal_snapshot = modal.read().clone();
     let name_value = name.read().clone();
+    let yield_value = yield_amount.read().clone();
+    let source_value = source.read().clone();
+    let notes_value = notes.read().clone();
+
+    // Live quantity validation for the open ingredient modal: empty is
+    // allowed ("–"); otherwise it must parse as a positive, finite number.
+    let qty_valid = match &modal_snapshot {
+        Some(Modal::Ingredient { qty, .. }) => {
+            let qty = qty.trim();
+            qty.is_empty()
+                || qty
+                    .parse::<f64>()
+                    .ok()
+                    .is_some_and(|q| q.is_finite() && q > 0.0)
+        }
+        _ => true,
+    };
+
+    // Instruction steps grouped for display: unsectioned steps first, then
+    // every instruction section in order.
+    let mut step_groups: Vec<(Option<SectionRow>, Vec<StepRow>)> = Vec::new();
+    let plain_steps: Vec<StepRow> = steps_snapshot
+        .iter()
+        .filter(|s| s.section_id.is_none())
+        .cloned()
+        .collect();
+    if !plain_steps.is_empty() {
+        step_groups.push((None, plain_steps));
+    }
+    for section in &step_sections_snapshot {
+        step_groups.push((
+            Some(section.clone()),
+            steps_snapshot
+                .iter()
+                .filter(|s| s.section_id == Some(section.id))
+                .cloned()
+                .collect(),
+        ));
+    }
+    // Continuous step numbering across all groups.
+    let mut step_number = 0usize;
+    let numbered_step_groups: Vec<(Option<SectionRow>, Vec<(usize, StepRow)>)> = step_groups
+        .into_iter()
+        .map(|(section, group)| {
+            let numbered = group
+                .into_iter()
+                .map(|step| {
+                    step_number += 1;
+                    (step_number, step)
+                })
+                .collect();
+            (section, numbered)
+        })
+        .collect();
 
     // Ingredients grouped for display: unsectioned rows first, then every
     // section in order (empty sections still show their header).
@@ -782,6 +865,9 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                         DragKind::Ingredient => rows.with_mut(|r| swap_ingredient(r, d.id, true)),
                         DragKind::Section => sections.with_mut(|s| swap_section(s, d.id, true)),
                         DragKind::Step => steps.with_mut(|s| swap_step(s, d.id, true)),
+                        DragKind::StepSection => {
+                            step_sections.with_mut(|s| swap_section(s, d.id, true))
+                        }
                     };
                     if !ok { break; }
                     d.applied += d.row_height;
@@ -792,6 +878,9 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                         DragKind::Ingredient => rows.with_mut(|r| swap_ingredient(r, d.id, false)),
                         DragKind::Section => sections.with_mut(|s| swap_section(s, d.id, false)),
                         DragKind::Step => steps.with_mut(|s| swap_step(s, d.id, false)),
+                        DragKind::StepSection => {
+                            step_sections.with_mut(|s| swap_section(s, d.id, false))
+                        }
                     };
                     if !ok { break; }
                     d.applied -= d.row_height;
@@ -822,6 +911,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                     let sections_now = sections.read().clone();
                     let rows_now = rows.read().clone();
                     let steps_now = steps.read().clone();
+                    let step_sections_now = step_sections.read().clone();
                     let ingredients: Vec<Ingredient> = rows_now
                         .iter()
                         .filter(|r| !r.name.trim().is_empty())
@@ -838,6 +928,19 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                             }),
                         })
                         .collect();
+                    let instructions: Vec<InstructionStep> = steps_now
+                        .iter()
+                        .filter(|s| !s.text.trim().is_empty())
+                        .map(|s| InstructionStep {
+                            text: s.text.trim().to_string(),
+                            section: s.section_id.and_then(|sid| {
+                                step_sections_now
+                                    .iter()
+                                    .find(|sec| sec.id == sid)
+                                    .map(|sec| sec.name.trim().to_string())
+                            }),
+                        })
+                        .collect();
                     let input = RecipeInput {
                         name: name.read().trim().to_string(),
                         sections: sections_now
@@ -846,11 +949,15 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                             .filter(|s| !s.is_empty())
                             .collect(),
                         ingredients: ingredients.clone(),
-                        instructions: steps_now
+                        instructions: instructions.clone(),
+                        instruction_sections: step_sections_now
                             .iter()
-                            .map(|s| s.text.trim().to_string())
+                            .map(|s| s.name.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .collect(),
+                        notes: notes.read().trim().to_string(),
+                        yield_amount: yield_amount.read().trim().to_string(),
+                        source: source.read().trim().to_string(),
                     };
                     if input.name.trim().is_empty() {
                         status.set("Please enter a recipe name.".into());
@@ -868,6 +975,10 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                         let ingredients_json = serde_json::to_string(&input.ingredients).unwrap_or_default();
                         let sections_json = serde_json::to_string(&input.sections).unwrap_or_default();
                         let instructions_json = serde_json::to_string(&input.instructions).unwrap_or_default();
+                        let instruction_sections_json = serde_json::to_string(&input.instruction_sections).unwrap_or_default();
+                        let notes_json = input.notes.clone();
+                        let yield_json = input.yield_amount.clone();
+                        let source_json = input.source.clone();
 
                         let result = match (editing_id, image) {
                             (None, None) => client
@@ -882,6 +993,10 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                     &sections_json,
                                     &ingredients_json,
                                     &instructions_json,
+                                    &instruction_sections_json,
+                                    &notes_json,
+                                    &yield_json,
+                                    &source_json,
                                     Some((&filename, &bytes)),
                                 );
                                 client
@@ -901,6 +1016,10 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                     &sections_json,
                                     &ingredients_json,
                                     &instructions_json,
+                                    &instruction_sections_json,
+                                    &notes_json,
+                                    &yield_json,
+                                    &source_json,
                                     image_ref,
                                 );
                                 client
@@ -952,7 +1071,6 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
 
                 div { class: "list-tools",
                     label { "Ingredients" }
-                    button { class: "hdr-btn ph small", title: "Expand", r#type: "button", tabindex: "0", onclick: move |e: MouseEvent| e.stop_propagation(), IconSparkle {} }
                 }
                 div { id: "ingredient-rows", class: "ingredient-rows",
                     for (section, group) in groups {
@@ -970,6 +1088,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                             modal.set(Some(Modal::Section {
                                                 editing_section: Some(section.id),
                                                 name: section.name.clone(),
+                                                is_step: false,
                                             }));
                                         },
                                         IconPencil {}
@@ -1093,7 +1212,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                         r#type: "button",
                         onclick: move |_| {
                             tracing::debug!("opening section modal (add)");
-                            modal.set(Some(Modal::Section { editing_section: None, name: String::new() }));
+                            modal.set(Some(Modal::Section { editing_section: None, name: String::new(), is_step: false }));
                         },
                         IconList {}
                         span { "Add section" }
@@ -1102,71 +1221,181 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
 
                 label { "Instructions" }
                 div { id: "step-rows", class: "step-rows",
-                    for (i, step) in steps_snapshot.iter().cloned().enumerate() {
-                        div {
-                            class: if drag_snapshot.as_ref().is_some_and(|d| d.id == step.id && d.kind == DragKind::Step) { "step-row dragging" } else { "step-row" },
-                            id: "step-row-{step.id}",
-                            onclick: move |_| {
-                                if suppress_click() {
-                                    suppress_click.set(false);
-                                    return;
+                    for (section, group) in numbered_step_groups.clone() {
+                        if let Some(section) = section {
+                            div { class: "section-header", id: "step-section-header-{section.id}",
+                                span { class: "section-name", "{section.name}" }
+                                div { class: "row-actions",
+                                    button {
+                                        id: "step-section-edit-{section.id}",
+                                        class: "row-btn",
+                                        title: "Rename section",
+                                        r#type: "button",
+                                        onclick: move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            modal.set(Some(Modal::Section {
+                                                editing_section: Some(section.id),
+                                                name: section.name.clone(),
+                                                is_step: true,
+                                            }));
+                                        },
+                                        IconPencil {}
+                                    }
+                                    button {
+                                        id: "step-section-delete-{section.id}",
+                                        class: "row-btn danger",
+                                        title: "Delete section",
+                                        r#type: "button",
+                                        onclick: move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            tracing::info!("deleting instruction section {} and its steps", section.id);
+                                            step_sections.with_mut(|s| s.retain(|x| x.id != section.id));
+                                            steps.with_mut(|s| s.retain(|x| x.section_id != Some(section.id)));
+                                        },
+                                        IconX {}
+                                    }
+                                    button {
+                                        id: "drag-handle-{section.id}",
+                                        class: "row-btn drag-handle",
+                                        title: "Drag to reorder",
+                                        r#type: "button",
+                                        onpointerdown: move |e: PointerEvent| {
+                                            e.stop_propagation();
+                                            drag.set(Some(DragState {
+                                                kind: DragKind::StepSection,
+                                                id: section.id,
+                                                start_y: e.client_coordinates().y,
+                                                row_height: measure_row_height(&format!("step-section-header-{}", section.id)),
+                                                applied: 0.0,
+                                            }));
+                                        },
+                                        IconHandle {}
+                                    }
                                 }
-                                modal.set(Some(Modal::Step {
-                                    editing_step: Some(step.id),
-                                    text: step.text.clone(),
-                                }));
-                            },
-                            span { class: "step-badge", "{i + 1}" }
-                            span { class: "step-text", "{step.text}" }
-                            div { class: "row-actions", onclick: move |e: MouseEvent| e.stop_propagation(),
-                                button {
-                                    id: "step-delete-{step.id}",
-                                    class: "row-btn danger",
-                                    title: "Delete step",
-                                    r#type: "button",
-                                    onclick: move |e: MouseEvent| {
-                                        e.stop_propagation();
-                                        let id = step.id;
-                                        tracing::debug!("deleting step {id}");
-                                        steps.with_mut(|s| s.retain(|x| x.id != id));
-                                    },
-                                    IconX {}
-                                }
-                                button {
-                                    id: "drag-handle-{step.id}",
-                                    class: "row-btn drag-handle",
-                                    title: "Drag to reorder",
-                                    r#type: "button",
-                                    onpointerdown: move |e: PointerEvent| {
-                                        e.stop_propagation();
-                                        let id = step.id;
-                                        drag.set(Some(DragState {
-                                            kind: DragKind::Step,
-                                            id,
-                                            start_y: e.client_coordinates().y,
-                                            row_height: measure_row_height(&format!("step-row-{id}")),
-                                            applied: 0.0,
-                                        }));
-                                    },
-                                    IconHandle {}
+                            }
+                        }
+                        for (number, step) in group.into_iter() {
+                            div {
+                                class: if drag_snapshot.as_ref().is_some_and(|d| d.id == step.id && d.kind == DragKind::Step) { "step-row dragging" } else { "step-row" },
+                                id: "step-row-{step.id}",
+                                onclick: move |_| {
+                                    if suppress_click() {
+                                        suppress_click.set(false);
+                                        return;
+                                    }
+                                    modal.set(Some(Modal::Step {
+                                        editing_step: Some(step.id),
+                                        section_id: step.section_id,
+                                        text: step.text.clone(),
+                                    }));
+                                },
+                                span { class: "step-badge", "{number}" }
+                                span { class: "step-text", "{step.text}" }
+                                div { class: "row-actions", onclick: move |e: MouseEvent| e.stop_propagation(),
+                                    button {
+                                        id: "step-delete-{step.id}",
+                                        class: "row-btn danger",
+                                        title: "Delete step",
+                                        r#type: "button",
+                                        onclick: move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            let id = step.id;
+                                            tracing::debug!("deleting step {id}");
+                                            steps.with_mut(|s| s.retain(|x| x.id != id));
+                                        },
+                                        IconX {}
+                                    }
+                                    button {
+                                        id: "drag-handle-{step.id}",
+                                        class: "row-btn drag-handle",
+                                        title: "Drag to reorder",
+                                        r#type: "button",
+                                        onpointerdown: move |e: PointerEvent| {
+                                            e.stop_propagation();
+                                            let id = step.id;
+                                            drag.set(Some(DragState {
+                                                kind: DragKind::Step,
+                                                id,
+                                                start_y: e.client_coordinates().y,
+                                                row_height: measure_row_height(&format!("step-row-{id}")),
+                                                applied: 0.0,
+                                            }));
+                                        },
+                                        IconHandle {}
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                button {
-                    id: "add-step",
-                    class: "list-add",
-                    r#type: "button",
-                    onclick: move |_| {
-                        tracing::debug!("opening step modal (add)");
-                        modal.set(Some(Modal::Step { editing_step: None, text: String::new() }));
-                    },
-                    IconPlus {}
-                    span { "Add step" }
+                div { class: "list-actions",
+                    button {
+                        id: "add-step",
+                        class: "list-add",
+                        r#type: "button",
+                        onclick: move |_| {
+                            tracing::debug!("opening step modal (add)");
+                            let default_section = step_sections.read().last().map(|s| s.id);
+                            modal.set(Some(Modal::Step {
+                                editing_step: None,
+                                section_id: default_section,
+                                text: String::new(),
+                            }));
+                        },
+                        IconPlus {}
+                        span { "Add step" }
+                    }
+                    button {
+                        id: "add-step-section",
+                        class: "list-add",
+                        r#type: "button",
+                        onclick: move |_| {
+                            tracing::debug!("opening instruction-section modal (add)");
+                            modal.set(Some(Modal::Section {
+                                editing_section: None,
+                                name: String::new(),
+                                is_step: true,
+                            }));
+                        },
+                        IconList {}
+                        span { "Add section" }
+                    }
                 }
 
-                label { "Photo (optional)" }
+                label { "Yield" }
+                input {
+                    id: "recipe-yield",
+                    r#type: "text",
+                    value: "{yield_value}",
+                    placeholder: "e.g. 12 cookies",
+                    oninput: move |e: FormEvent| {
+                        let v = e.value();
+                        yield_amount.set(v);
+                    },
+                }
+                label { "Source" }
+                input {
+                    id: "recipe-source",
+                    r#type: "text",
+                    value: "{source_value}",
+                    placeholder: "e.g. Grandma's cookbook",
+                    oninput: move |e: FormEvent| {
+                        let v = e.value();
+                        source.set(v);
+                    },
+                }
+                label { "Notes" }
+                textarea {
+                    id: "recipe-notes",
+                    value: "{notes_value}",
+                    placeholder: "Anything worth remembering about this recipe…",
+                    oninput: move |e: FormEvent| {
+                        let v = e.value();
+                        notes.set(v);
+                    },
+                }
+
+                label { "Photo" }
                 if let Some(thumb) = &existing_thumb {
                     if editing {
                         img { class: "photo-preview", src: "{thumb}", alt: "current photo" }
@@ -1214,6 +1443,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                 div { class: "modal-row",
                                     input {
                                         id: "modal-qty",
+                                        class: if qty_valid { "" } else { "invalid" },
                                         r#type: "text",
                                         placeholder: "Qty",
                                         value: "{qty}",
@@ -1248,6 +1478,11 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                             if let Some(Modal::Ingredient { name, .. }) = m { *name = v; }
                                         });
                                     },
+                                }
+                                if !qty_valid {
+                                    p { class: "modal-error",
+                                        "Quantity must be a positive number (or empty)."
+                                    }
                                 }
                                 input {
                                     id: "modal-prep",
@@ -1292,7 +1527,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                         id: "modal-save",
                                         class: "dialog-btn primary",
                                         onclick: move |_| {
-                                            if name.trim().is_empty() {
+                                            if name.trim().is_empty() || !qty_valid {
                                                 return;
                                             }
                                             let row = IngredientRow {
@@ -1322,7 +1557,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                     }
                                 }
                             },
-                            Modal::Section { editing_section, name } => rsx! {
+                            Modal::Section { editing_section, name, is_step } => rsx! {
                                 h2 { class: "dialog-title",
                                     if editing_section.is_some() { "Rename section" } else { "Add section" }
                                 }
@@ -1348,16 +1583,31 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                             if trimmed.is_empty() {
                                                 return;
                                             }
-                                            match editing_section {
-                                                Some(id) => sections.with_mut(|s| {
-                                                    if let Some(section) = s.iter_mut().find(|x| x.id == id) {
-                                                        section.name = trimmed;
+                                            if is_step {
+                                                match editing_section {
+                                                    Some(id) => step_sections.with_mut(|s| {
+                                                        if let Some(section) = s.iter_mut().find(|x| x.id == id) {
+                                                            section.name = trimmed;
+                                                        }
+                                                    }),
+                                                    None => {
+                                                        let id = *next_id.read();
+                                                        step_sections.with_mut(|s| s.push(SectionRow { id, name: trimmed }));
+                                                        next_id.set(id + 1);
                                                     }
-                                                }),
-                                                None => {
-                                                    let id = *next_id.read();
-                                                    sections.with_mut(|s| s.push(SectionRow { id, name: trimmed }));
-                                                    next_id.set(id + 1);
+                                                }
+                                            } else {
+                                                match editing_section {
+                                                    Some(id) => sections.with_mut(|s| {
+                                                        if let Some(section) = s.iter_mut().find(|x| x.id == id) {
+                                                            section.name = trimmed;
+                                                        }
+                                                    }),
+                                                    None => {
+                                                        let id = *next_id.read();
+                                                        sections.with_mut(|s| s.push(SectionRow { id, name: trimmed }));
+                                                        next_id.set(id + 1);
+                                                    }
                                                 }
                                             }
                                             modal.set(None);
@@ -1366,7 +1616,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                     }
                                 }
                             },
-                            Modal::Step { editing_step, text } => rsx! {
+                            Modal::Step { editing_step, section_id, text } => rsx! {
                                 h2 { class: "dialog-title",
                                     if editing_step.is_some() { "Edit instruction" } else { "Add instruction" }
                                 }
@@ -1380,6 +1630,26 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                             if let Some(Modal::Step { text, .. }) = m { *text = v; }
                                         });
                                     },
+                                }
+                                label { class: "modal-label", "Section" }
+                                select {
+                                    id: "modal-step-section",
+                                    onchange: move |e: FormEvent| {
+                                        let v = e.value();
+                                        modal.with_mut(|m| {
+                                            if let Some(Modal::Step { section_id, .. }) = m {
+                                                *section_id = v.parse().ok();
+                                            }
+                                        });
+                                    },
+                                    option { value: "", selected: if section_id.is_none() { "true" } else { "false" }, "No section" }
+                                    for s in &step_sections_snapshot {
+                                        option {
+                                            value: "{s.id}",
+                                            selected: if section_id == Some(s.id) { "true" } else { "false" },
+                                            "{s.name}"
+                                        }
+                                    }
                                 }
                                 div { class: "dialog-actions",
                                     button { id: "modal-cancel", class: "dialog-btn", onclick: move |_| modal.set(None), "Cancel" }
@@ -1395,11 +1665,16 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                                 Some(id) => steps.with_mut(|s| {
                                                     if let Some(step) = s.iter_mut().find(|x| x.id == id) {
                                                         step.text = trimmed;
+                                                        step.section_id = section_id;
                                                     }
                                                 }),
                                                 None => {
                                                     let id = *next_id.read();
-                                                    steps.with_mut(|s| s.push(StepRow { id, text: trimmed }));
+                                                    steps.with_mut(|s| s.push(StepRow {
+                                                        id,
+                                                        section_id,
+                                                        text: trimmed,
+                                                    }));
                                                     next_id.set(id + 1);
                                                 }
                                             }
@@ -1424,6 +1699,7 @@ fn RecipeDetail(id: i64) -> Element {
     let mut detail = use_signal(|| None::<RecipeDetailModel>);
     let mut error = use_signal(|| String::new());
     let mut confirm_delete = use_signal(|| false);
+    let mut scale_text = use_signal(|| String::from("1"));
     let navigator = use_navigator();
 
     use_effect(move || {
@@ -1443,6 +1719,10 @@ fn RecipeDetail(id: i64) -> Element {
 
     let loaded = detail.read().clone();
     let image_url = loaded.as_ref().and_then(|d| d.image.clone());
+    let scale_value = scale_text.read().clone();
+    let scale = scale_value.trim().parse::<f64>().ok();
+    let scale_valid = scale.is_some_and(|s| s.is_finite() && s > 0.0 && s <= 1000.0);
+    let effective_scale = if scale_valid { scale.unwrap() } else { 1.0 };
 
     // Detail view ingredient grouping: unsectioned items first, then one
     // group per section (in order).
@@ -1470,6 +1750,48 @@ fn RecipeDetail(id: i64) -> Element {
                 ));
             }
             groups
+        })
+        .unwrap_or_default();
+
+    // Detail view instruction grouping: unsectioned steps first, then one
+    // group per instruction section (in order), with continuous numbering.
+    let instruction_groups: Vec<(Option<String>, Vec<(usize, InstructionStep)>)> = loaded
+        .as_ref()
+        .map(|d| {
+            let mut groups: Vec<(Option<String>, Vec<InstructionStep>)> = Vec::new();
+            let plain: Vec<InstructionStep> = d
+                .instructions
+                .iter()
+                .filter(|s| s.section.is_none())
+                .cloned()
+                .collect();
+            if !plain.is_empty() {
+                groups.push((None, plain));
+            }
+            for section in &d.instruction_sections {
+                groups.push((
+                    Some(section.clone()),
+                    d.instructions
+                        .iter()
+                        .filter(|s| s.section.as_deref() == Some(section.as_str()))
+                        .cloned()
+                        .collect(),
+                ));
+            }
+            let mut number = 0usize;
+            groups
+                .into_iter()
+                .map(|(section, group)| {
+                    let numbered = group
+                        .into_iter()
+                        .map(|step| {
+                            number += 1;
+                            (number, step)
+                        })
+                        .collect::<Vec<_>>();
+                    (section, numbered)
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -1516,6 +1838,30 @@ fn RecipeDetail(id: i64) -> Element {
                         }
                     }
                     div { class: "card",
+                        div { class: "scale-row",
+                            label { "Scale" }
+                            input {
+                                id: "scale-input",
+                                class: if scale_valid { "" } else { "invalid" },
+                                r#type: "text",
+                                value: "{scale_value}",
+                                oninput: move |e: FormEvent| {
+                                    let v = e.value();
+                                    scale_text.set(v);
+                                },
+                            }
+                            if scale_valid {
+                                span { class: "scale-factor", "{fmt_qty(effective_scale)}x" }
+                            } else {
+                                span { class: "scale-hint", "0 < scale ≤ 1000" }
+                            }
+                            button {
+                                id: "scale-reset",
+                                class: "scale-reset",
+                                onclick: move |_| scale_text.set(String::from("1")),
+                                "Reset"
+                            }
+                        }
                         h2 { "Ingredients" }
                         if d.ingredients.is_empty() && d.sections.is_empty() {
                             p { class: "empty", "No ingredients yet." }
@@ -1529,7 +1875,7 @@ fn RecipeDetail(id: i64) -> Element {
                                     }
                                     ul { class: "ingredient-list",
                                         for ingredient in group {
-                                            li { class: "ingredient-item", "{ingredient_line(ingredient)}" }
+                                            li { class: "ingredient-item", "{ingredient_line(ingredient, effective_scale)}" }
                                         }
                                     }
                                 }
@@ -1538,14 +1884,44 @@ fn RecipeDetail(id: i64) -> Element {
                     }
                     div { class: "card",
                         h2 { "Instructions" }
-                        if d.instructions.is_empty() {
+                        if d.instructions.is_empty() && d.instruction_sections.is_empty() {
                             p { class: "empty", "No instructions yet." }
                         } else {
-                            ol { class: "instruction-list", id: "instruction-list",
-                                for (i, step) in d.instructions.iter().enumerate() {
-                                    li { key: "{i}", "{step}" }
+                            // Grouped view with continuous numbering across
+                            // sections.
+                            div { id: "instruction-list", class: "ingredient-groups",
+                                for (section, group) in &instruction_groups {
+                                    if let Some(name) = section {
+                                        div { class: "detail-section-title", "{name}" }
+                                    }
+                                    ol { class: "instruction-list",
+                                        for (number, step) in group {
+                                            li { key: "{number}", class: "instruction-item",
+                                                span { class: "step-badge", "{number}" }
+                                                span { class: "step-text", "{step.text}" }
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                    }
+                    if !d.yield_amount.trim().is_empty() {
+                        div { class: "card meta-card", id: "detail-yield",
+                            h2 { "Yield" }
+                            p { "{d.yield_amount}" }
+                        }
+                    }
+                    if !d.source.trim().is_empty() {
+                        div { class: "card meta-card", id: "detail-source",
+                            h2 { "Source" }
+                            p { "{d.source}" }
+                        }
+                    }
+                    if !d.notes.trim().is_empty() {
+                        div { class: "card meta-card", id: "detail-notes",
+                            h2 { "Notes" }
+                            p { "{d.notes}" }
                         }
                     }
                 },
@@ -1591,11 +1967,12 @@ fn RecipeDetail(id: i64) -> Element {
     }
 }
 
-/// One ingredient line, e.g. `180 g buckwheat flour, finely chopped`.
-fn ingredient_line(ingredient: &Ingredient) -> String {
+/// One ingredient line, e.g. `180 g buckwheat flour, finely chopped`,
+/// with the quantity multiplied by the detail-view scale factor.
+fn ingredient_line(ingredient: &Ingredient, scale: f64) -> String {
     let mut line = String::new();
     if let Some(q) = ingredient.quantity {
-        line.push_str(&fmt_qty(q));
+        line.push_str(&fmt_qty(q * scale));
         line.push(' ');
     }
     if let Some(unit) = &ingredient.unit {
