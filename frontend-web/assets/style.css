@@ -634,3 +634,229 @@ ol.instruction-list li {
 .recipe-card.clickable {
     cursor: pointer;
 }
+
+/* ------------------------------------------------------------------ */
+/* blaz-style ingredient/step editor                                   */
+/* ------------------------------------------------------------------ */
+
+.list-tools {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 0.75rem;
+}
+
+.hdr-btn.small {
+    width: 32px;
+    height: 32px;
+}
+
+.section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 10px 4px;
+    margin-top: 6px;
+}
+
+.section-name {
+    color: var(--accent-bright);
+    font-weight: 600;
+}
+
+.ingredient-row,
+.step-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 10px;
+    border-bottom: 1px solid var(--divider);
+    cursor: pointer;
+    user-select: none;
+}
+
+.ingredient-row:last-child,
+.step-row:last-child {
+    border-bottom: none;
+}
+
+.ingredient-row:hover,
+.step-row:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.ingredient-row.dragging,
+.step-row.dragging {
+    opacity: 0.45;
+}
+
+.ing-amount {
+    min-width: 64px;
+    text-align: right;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+}
+
+.ing-name {
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+
+.ing-prep-text {
+    color: var(--muted);
+}
+
+.row-actions {
+    display: flex;
+    gap: 2px;
+    align-items: center;
+}
+
+.row-btn {
+    width: 30px;
+    height: 30px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 8px;
+    padding: 0;
+    margin: 0;
+}
+
+.row-btn:hover {
+    color: var(--text);
+    background: var(--pill);
+}
+
+.row-btn.danger:hover {
+    color: var(--error);
+    background: rgba(229, 115, 115, 0.12);
+}
+
+.row-btn.drag-handle {
+    cursor: grab;
+}
+
+.row-btn.drag-handle:active {
+    cursor: grabbing;
+}
+
+.list-actions {
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--divider);
+    margin-top: 6px;
+}
+
+.list-add {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 10px;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+    border-radius: 0 0 10px 10px;
+}
+
+.list-add:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.step-badge {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.step-text {
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+
+/* Modal text inputs */
+.modal-row {
+    display: flex;
+    gap: 8px;
+}
+
+.modal-row input {
+    flex: 1;
+    min-width: 0;
+}
+
+#editor-modal input[type="text"],
+#editor-modal textarea {
+    width: 100%;
+    margin-bottom: 10px;
+    background: #101512;
+    border: 1px solid var(--divider);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+}
+
+#editor-modal textarea {
+    min-height: 90px;
+    resize: vertical;
+}
+
+.modal-label {
+    display: block;
+    font-size: 13px;
+    color: var(--muted);
+    margin: 2px 0 6px;
+}
+
+#editor-modal select {
+    width: 100%;
+    background: #101512;
+    border: 1px solid var(--divider);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+    margin-bottom: 4px;
+}
+
+.dialog-title {
+    margin: 0 0 14px;
+    font-size: 18px;
+}
+
+.dialog-btn.primary {
+    background: var(--accent);
+    color: #fff;
+}
+
+.dialog-btn.primary:hover {
+    background: var(--accent-bright);
+}
+
+.detail-section-title {
+    color: var(--accent-bright);
+    font-weight: 600;
+    margin: 12px 0 4px;
+}
+
+.ingredient-groups .ingredient-list {
+    margin: 2px 0 4px;
+}

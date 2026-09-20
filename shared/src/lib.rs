@@ -27,6 +27,9 @@ pub struct Ingredient {
     pub name: String,
     /// Optional preparation note, e.g. `finely chopped`.
     pub prep: Option<String>,
+    /// Section this ingredient belongs to (e.g. "Crêpes", "Filling").
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 /// The full recipe shown on the detail page.
@@ -34,6 +37,8 @@ pub struct Ingredient {
 pub struct RecipeDetail {
     pub id: i64,
     pub name: String,
+    /// Ordered section names (may include empty sections).
+    pub sections: Vec<String>,
     pub ingredients: Vec<Ingredient>,
     /// Ordered instruction steps.
     pub instructions: Vec<String>,
@@ -47,6 +52,8 @@ pub struct RecipeDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecipeInput {
     pub name: String,
+    #[serde(default)]
+    pub sections: Vec<String>,
     #[serde(default)]
     pub ingredients: Vec<Ingredient>,
     #[serde(default)]

@@ -95,29 +95,33 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         .context("the + FAB did not open the add-recipe form")?;
     name_input.send_keys("Pancakes").await?;
 
-    // Structured ingredient rows.
-    driver.find(By::Id("ing-qty-0")).await?.send_keys("200").await?;
-    driver.find(By::Id("ing-unit-0")).await?.send_keys("g").await?;
-    driver.find(By::Id("ing-name-0")).await?.send_keys("Flour").await?;
+    // Create a section via its modal.
+    click_scrolled(&driver, "add-section").await?;
     driver
-        .find(By::Id("add-ingredient"))
+        .find(By::Id("modal-section-name"))
         .await?
-        .click()
+        .send_keys("Batter")
         .await?;
+    click_scrolled(&driver, "modal-save").await?;
     driver
-        .find(By::Id("ing-name-1"))
+        .find(By::Id("ingredient-rows"))
         .await?
-        .send_keys("Milk")
-        .await?;
+        .text()
+        .await?
+        .contains("Batter")
+        .then_some(())
+        .context("section 'Batter' did not appear after save")?;
 
-    // Instructions: one step per line.
-    driver
-        .find(By::Id("recipe-instructions"))
-        .await?
-        .send_keys("Mix the batter\nCook in a hot pan")
-        .await?;
+    // Add ingredients through the ingredient modal (defaults to the last
+    // section = Batter).
+    add_ingredient_modal(driver, "200", "g", "Flour", "").await?;
+    add_ingredient_modal(driver, "", "", "Milk", "").await?;
 
-    driver.find(By::Id("recipe-submit")).await?.click().await?;
+    // Instructions: one step per modal.
+    add_step_modal(driver, "Mix the batter").await?;
+    add_step_modal(driver, "Cook in a hot pan").await?;
+
+    click_scrolled(&driver, "recipe-submit").await?;
 
     // -- 3. The detail view shows the structured recipe. --------------------
     wait_for_url_path_prefix(driver, "/recipe/").await?;
@@ -128,7 +132,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         .next()
         .and_then(|s| s.parse().ok())
         .context("detail url does not contain a recipe id")?;
-    if let Err(err) = assert_detail_view(driver, "Pancakes").await {
+    if let Err(err) = assert_detail_view(driver, "Pancakes", &["Mix the batter", "Cook in a hot pan"]).await {
         let src = driver.source().await.unwrap_or_default();
         anyhow::bail!("detail view incomplete after creation ({err}); page source:\n{src}");
     }
@@ -145,12 +149,70 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         prefilled == "Pancakes",
         "edit form should be prefilled, got '{prefilled}'"
     );
+    // Tap an ingredient row -> prefilled edit modal -> change its prep.
+    let rows_before = ingredient_row_texts(driver).await?;
+    anyhow::ensure!(
+        rows_before.iter().any(|t| t.contains("200 g Flour")),
+        "prefilled ingredient list wrong: {rows_before:?}"
+    );
+    let flour_row = driver
+        .find(By::XPath(
+            "//div[contains(@class, 'ingredient-row') and contains(., 'Flour')]",
+        ))
+        .await?;
+    flour_row.click().await?;
+    let name_field = driver
+        .find(By::Id("modal-name"))
+        .await
+        .context("ingredient edit modal did not open")?;
+    let prefilled_name = name_field.value().await?.unwrap_or_default();
+    anyhow::ensure!(
+        prefilled_name == "Flour",
+        "modal should be prefilled with 'Flour', got '{prefilled_name}'"
+    );
+    let qty_prefill = driver
+        .find(By::Id("modal-qty"))
+        .await?
+        .value()
+        .await?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        qty_prefill == "200",
+        "modal qty should be prefilled with '200', got '{qty_prefill}'"
+    );
+    driver
+        .find(By::Id("modal-prep"))
+        .await?
+        .send_keys("sifted")
+        .await?;
+    click_scrolled(&driver, "modal-save").await?;
+    let rows_after = ingredient_row_texts(driver).await?;
+    anyhow::ensure!(
+        rows_after
+            .iter()
+            .any(|t| t.contains("200 g Flour") && t.contains("sifted")),
+        "edited prep missing after modal save: {rows_after:?}"
+    );
+
+    // Delete the second step through its × button, then save.
+    let steps_before = step_texts(driver).await?;
+    anyhow::ensure!(steps_before.len() == 2, "expected 2 steps, got {steps_before:?}");
+    driver
+        .find(By::Css("#step-rows .step-row .row-actions .row-btn.danger"))
+        .await?
+        .click()
+        .await?;
+    let steps_after = step_texts(driver).await?;
+    anyhow::ensure!(
+        steps_after.len() == 1,
+        "step was not deleted, still {steps_after:?}"
+    );
     // Clear and rename (send_keys appends, so select-all first).
     name_input.clear().await?;
     name_input.send_keys("Pancakes Deluxe").await?;
-    driver.find(By::Id("recipe-submit")).await?.click().await?;
+    click_scrolled(&driver, "recipe-submit").await?;
     wait_for_url_path_prefix(driver, "/recipe/").await?;
-    if let Err(err) = assert_detail_view(driver, "Pancakes Deluxe").await {
+    if let Err(err) = assert_detail_view(driver, "Pancakes Deluxe", &["Cook in a hot pan"]).await {
         let src = driver.source().await.unwrap_or_default();
         anyhow::bail!("detail view incomplete after edit ({err}); page source:\n{src}");
     }
@@ -272,18 +334,14 @@ async fn photo_upload_reaches_detail_and_database() -> anyhow::Result<()> {
             .await?
             .send_keys("Photo Cake")
             .await?;
-        driver
-            .find(By::Id("ing-name-0"))
-            .await?
-            .send_keys("Cocoa")
-            .await?;
+        add_ingredient_modal(&driver, "", "", "Cocoa", "").await?;
         // Set the file input directly (WebDriver standard behaviour).
         driver
             .find(By::Id("recipe-photo"))
             .await?
             .send_keys(png_path.to_str().unwrap())
             .await?;
-        driver.find(By::Id("recipe-submit")).await?.click().await?;
+        click_scrolled(&driver, "recipe-submit").await?;
 
         // The detail view renders the full-resolution photo.
         wait_for_url_path_prefix(&driver, "/recipe/").await?;
@@ -334,18 +392,21 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
         .post(format!("{base}/api/recipes"))
         .json(&RecipeInput {
             name: "Stew".into(),
+            sections: vec!["Base".into()],
             ingredients: vec![
                 Ingredient {
                     quantity: Some(300.0),
                     unit: Some("ml".into()),
                     name: "water".into(),
                     prep: None,
+                    section: Some("Base".into()),
                 },
                 Ingredient {
                     quantity: None,
                     unit: None,
                     name: "salt".into(),
                     prep: Some("to taste".into()),
+                    section: None,
                 },
             ],
             instructions: vec!["Boil water".into(), "Add salt".into()],
@@ -377,6 +438,7 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     let id = recipes[0].id;
     let detail = poll_detail_full(&http, &base, id).await?;
     assert_eq!(detail.name, "Stew");
+    assert_eq!(detail.sections, vec!["Base"]);
     assert_eq!(detail.ingredients.len(), 2);
     assert_eq!(detail.ingredients[1].prep.as_deref(), Some("to taste"));
     assert_eq!(detail.instructions, vec!["Boil water", "Add salt"]);
@@ -444,7 +506,7 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     // Invalid payloads are rejected with 4xx, not 5xx.
     let status = http
         .post(format!("{base}/api/recipes"))
-        .json(&RecipeInput { name: "  ".into(), ingredients: vec![], instructions: vec![] })
+        .json(&RecipeInput { name: "  ".into(), sections: vec![], ingredients: vec![], instructions: vec![] })
         .send()
         .await?
         .status();
@@ -456,9 +518,154 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drag & drop: dragging a step's ≡ handle below the next step reorders the
+/// list (mouse action chain; pointer events power the real interaction).
+#[tokio::test(flavor = "multi_thread")]
+async fn drag_reorders_steps() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // Create a recipe with two steps directly through the API.
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Sortable".into(),
+            sections: vec![],
+            ingredients: vec![],
+            instructions: vec!["First step".into(), "Second step".into()],
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        let recipes: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let id = recipes[0].id;
+        driver.goto(format!("{base}/edit/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/edit/{id}")).await?;
+
+        let before = step_texts(&driver).await?;
+        anyhow::ensure!(
+            before == vec!["First step", "Second step"],
+            "unexpected initial steps: {before:?}"
+        );
+
+        // Drag the first step's handle ~1.5 rows down.
+        let handle = driver
+            .find(By::Id("drag-handle-0"))
+            .await
+            .context("drag handle for the first step missing")?;
+        let height = handle.rect().await?.height;
+        driver
+            .action_chain()
+            .move_to_element_center(&handle)
+            .click_and_hold()
+            .move_by_offset(0, (height * 1.5) as i64)
+            .release()
+            .perform()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let after = step_texts(&driver).await?;
+        anyhow::ensure!(
+            after == vec!["Second step", "First step"],
+            "drag did not reorder steps: {after:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Shared UI assertions & helpers
 // ---------------------------------------------------------------------------
+
+/// Scroll a form element into view before clicking it (fixed bottom nav
+/// otherwise intercepts clicks near the viewport bottom).
+async fn click_scrolled(driver: &WebDriver, id: &str) -> anyhow::Result<()> {
+    driver
+        .execute(
+            format!(
+                "var el = document.getElementById('{id}'); if (el) el.scrollIntoView({{block: 'center'}});"
+            ),
+            Vec::<serde_json::Value>::new(),
+        )
+        .await?;
+    driver.find(By::Id(id)).await?.click().await?;
+    Ok(())
+}
+
+/// Open the ingredient modal, fill it and save. Empty qty/unit/prep are
+/// skipped so the recipe can have unquantified ingredients.
+async fn add_ingredient_modal(
+    driver: &WebDriver,
+    qty: &str,
+    unit: &str,
+    name: &str,
+    prep: &str,
+) -> anyhow::Result<()> {
+    click_scrolled(driver, "add-ingredient").await?;
+    let modal = driver
+        .find(By::Id("modal-name"))
+        .await
+        .context("ingredient modal did not open")?;
+    if !qty.is_empty() {
+        driver.find(By::Id("modal-qty")).await?.send_keys(qty).await?;
+    }
+    if !unit.is_empty() {
+        driver.find(By::Id("modal-unit")).await?.send_keys(unit).await?;
+    }
+    modal.send_keys(name).await?;
+    if !prep.is_empty() {
+        driver.find(By::Id("modal-prep")).await?.send_keys(prep).await?;
+    }
+    click_scrolled(driver, "modal-save").await?;
+    Ok(())
+}
+
+/// Open the instruction modal, fill it and save.
+async fn add_step_modal(driver: &WebDriver, text: &str) -> anyhow::Result<()> {
+    click_scrolled(driver, "add-step").await?;
+    driver
+        .find(By::Id("modal-step-text"))
+        .await
+        .context("instruction modal did not open")?
+        .send_keys(text)
+        .await?;
+    click_scrolled(driver, "modal-save").await?;
+    Ok(())
+}
+
+/// Texts of the ingredient rows shown in the editor list.
+async fn ingredient_row_texts(driver: &WebDriver) -> anyhow::Result<Vec<String>> {
+    let rows = driver.find_all(By::Css("#ingredient-rows .ingredient-row")).await?;
+    let mut texts = Vec::new();
+    for row in rows {
+        texts.push(row.text().await?.replace('\n', " "));
+    }
+    Ok(texts)
+}
+
+/// Texts of the instruction steps shown in the editor list.
+async fn step_texts(driver: &WebDriver) -> anyhow::Result<Vec<String>> {
+    let rows = driver.find_all(By::Css("#step-rows .step-row .step-text")).await?;
+    let mut texts = Vec::new();
+    for row in rows {
+        texts.push(row.text().await?);
+    }
+    Ok(texts)
+}
 
 async fn assert_shell(driver: &WebDriver) -> anyhow::Result<()> {
     driver
@@ -490,7 +697,11 @@ async fn assert_shell(driver: &WebDriver) -> anyhow::Result<()> {
 
 /// Assert the currently open detail page shows the given recipe name with
 /// its structured ingredients/instructions and the full header bar.
-async fn assert_detail_view(driver: &WebDriver, name: &str) -> anyhow::Result<()> {
+async fn assert_detail_view(
+    driver: &WebDriver,
+    name: &str,
+    expect_instructions: &[&str],
+) -> anyhow::Result<()> {
     let h1 = driver.find(By::Css(".detail-name")).await?;
     let shown = h1.text().await?;
     anyhow::ensure!(shown == name, "detail shows '{shown}', expected '{name}'");
@@ -499,7 +710,7 @@ async fn assert_detail_view(driver: &WebDriver, name: &str) -> anyhow::Result<()
     driver.find(By::Id("hdr-edit")).await?;
     driver.find(By::Id("hdr-delete")).await?;
     driver.find(By::Css(".detail-header .hdr-btn.ph")).await?;
-    // Ingredient list with bullet items.
+    // Grouped ingredient list with bullet items.
     let list = driver
         .find(By::Id("ingredient-list"))
         .await
@@ -510,16 +721,22 @@ async fn assert_detail_view(driver: &WebDriver, name: &str) -> anyhow::Result<()
         "ingredient line missing from detail: '{text}'"
     );
     anyhow::ensure!(text.contains("Milk"), "ingredient 'Milk' missing: '{text}'");
+    anyhow::ensure!(
+        text.contains("Batter"),
+        "section title missing from detail: '{text}'"
+    );
     // Numbered instructions.
     let steps = driver
         .find(By::Id("instruction-list"))
         .await
         .context("instruction list missing")?;
     let text = steps.text().await?;
-    anyhow::ensure!(
-        text.contains("Mix the batter") && text.contains("Cook in a hot pan"),
-        "instructions missing from detail: '{text}'"
-    );
+    for expected in expect_instructions {
+        anyhow::ensure!(
+            text.contains(expected),
+            "instruction '{expected}' missing from detail: '{text}'"
+        );
+    }
     Ok(())
 }
 
