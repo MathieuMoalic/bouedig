@@ -38,6 +38,8 @@ async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
         base_path: None,
         static_dir: Some(find_web_bundle()?),
         data_dir: data_dir.path().to_path_buf(),
+        // The browser import test fetches a loopback fixture page.
+        import_allow_private: true,
     };
     let addr = backend::spawn_server(config).await?;
     // Keep the tempdirs alive for the rest of the process.
@@ -571,8 +573,6 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
         .json(&shared::GroceryUpdate { bought: true })
         .send()
         .await?
-        .json()
-        .await?;
         .status();
     assert_eq!(status, 204, "toggling to bought must delete the item");
     for _ in 0..50 {
@@ -591,6 +591,8 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
         .get(format!("{base}/api/grocery"))
         .send()
         .await?
+        .json()
+        .await?;
     anyhow::ensure!(
         grocery.is_empty(),
         "toggled item must be gone from the database: {grocery:?}"
@@ -792,8 +794,6 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Shared UI assertions & helpers
 /// Shopping-list UX: the suggestions dropdown only opens for typed text while
 /// the input is focused, "appel" fuzzy-matches the past entry "apple", the ×
 /// button removes an item, and a removed item never comes back when another
@@ -932,6 +932,175 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
     result
 }
 
+/// Import-from-URL: the browser flow fetches a local recipe page through the
+/// backend importer, shows the preview in the editor, and saving goes through
+/// the normal API. (The backend in this suite allows loopback targets so the
+/// fixture page below can be fetched.)
+#[tokio::test(flavor = "multi_thread")]
+async fn import_from_url_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // A tiny recipe page (JSON-LD) served on loopback by the test itself.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let fixture_addr = listener.local_addr()?;
+    let fixture = r#"
+<!DOCTYPE html>
+<html><head><title>Breton Galette — Fixture</title>
+<script type="application/ld+json">
+{"@type":"Recipe","name":"Breton Galette Complète",
+ "description":"A complete buckwheat galette.",
+ "recipeYield":"2 galettes",
+ "recipeIngredient":["2 buckwheat galettes","2 eggs","60 g gruyère, grated"],
+ "recipeInstructions":[
+   {"@type":"HowToStep","text":"Warm the galettes."},
+   {"@type":"HowToStep","text":"Crack an egg onto each."},
+   {"@type":"HowToStep","text":"Add cheese, fold and serve."}]}
+</script></head>
+<body><h1>Breton Galette Complète</h1></body></html>
+"#;
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                fixture.len(),
+                fixture
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    // API-level: the endpoint returns a preview; nothing is persisted.
+    let status = http
+        .post(format!("{base}/api/recipes/import"))
+        .json(&serde_json::json!({ "url": format!("http://{fixture_addr}/galette") }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 200, "import endpoint must return a preview");
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    anyhow::ensure!(
+        recipes.is_empty(),
+        "import must not create rows: {recipes:?}"
+    );
+
+    // Browser flow: FAB → /import → URL → preview in the editor → save.
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/")).await?;
+        driver.find(By::Id("fab-import-recipe")).await?.click().await?;
+        wait_for_url_path(&driver, "/import").await?;
+        driver
+            .find(By::Id("import-url"))
+            .await?
+            .send_keys(format!("http://{fixture_addr}/galette"))
+            .await?;
+        driver.find(By::Id("import-fetch")).await?.click().await?;
+
+        // The preview summary shows method + confidence and the editor is
+        // prefilled with the imported data.
+        let summary = driver
+            .find(By::Id("import-summary"))
+            .await
+            .context("import summary did not appear")?;
+        let summary_text = summary.text().await?;
+        anyhow::ensure!(
+            summary_text.contains("json_ld"),
+            "summary should name the extraction method: {summary_text}"
+        );
+
+        // The prefilled editor carries the imported name and ingredients.
+        let name_value = driver
+            .find(By::Id("recipe-name"))
+            .await?
+            .value()
+            .await?
+            .unwrap_or_default();
+        anyhow::ensure!(
+            name_value == "Breton Galette Complète",
+            "editor should be prefilled with the imported name, got '{name_value}'"
+        );
+        let rows = ingredient_row_texts(&driver).await?;
+        anyhow::ensure!(
+            rows.iter().any(|t| t.contains("gruyère")),
+            "imported ingredients missing from the editor: {rows:?}"
+        );
+
+        // Saving goes through the normal create endpoint.
+        click_scrolled(&driver, "recipe-submit").await?;
+        wait_for_url_path_prefix(&driver, "/recipe/").await?;
+        let detail_url = driver.current_url().await?;
+        let id: i64 = detail_url
+            .path()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .context("detail url does not contain a recipe id")?;
+
+        let name_heading = driver.find(By::Css(".detail-name")).await?;
+        let shown = name_heading.text().await?;
+        anyhow::ensure!(
+            shown == "Breton Galette Complète",
+            "detail shows '{shown}', expected 'Breton Galette Complète'"
+        );
+        driver.find(By::Id("hdr-edit")).await?;
+        driver.find(By::Id("hdr-delete")).await?;
+        let ingredients = driver
+            .find(By::Id("ingredient-list"))
+            .await?
+            .text()
+            .await?;
+        for expected in ["2 buckwheat galettes", "2 eggs", "60 g gruyère, grated"] {
+            anyhow::ensure!(
+                ingredients.contains(expected),
+                "imported ingredient '{expected}' missing from detail: {ingredients}"
+            );
+        }
+        let instructions = driver
+            .find(By::Id("instruction-list"))
+            .await?
+            .text()
+            .await?;
+        anyhow::ensure!(
+            instructions.contains("Crack an egg onto each."),
+            "imported instruction missing from detail: {instructions}"
+        );
+        let source_text = driver.find(By::Id("detail-source")).await?.text().await?;
+        anyhow::ensure!(
+            source_text.contains("galette"),
+            "source URL not shown on the detail page: {source_text}"
+        );
+
+        let detail = poll_detail_full(&http, &base, id).await?;
+        anyhow::ensure!(
+            detail.source == format!("http://{fixture_addr}/galette"),
+            "imported source URL must be preserved, got '{}'",
+            detail.source
+        );
+        anyhow::ensure!(
+            detail.ingredients.len() == 3 && detail.yield_amount == "2 galettes",
+            "imported structure incomplete: {detail:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Shared UI assertions & helpers
 // ---------------------------------------------------------------------------
 
 /// Scroll a form element into view before clicking it (fixed bottom nav
@@ -1212,6 +1381,57 @@ async fn poll_grocery(
     anyhow::bail!("grocery item '{name}' (bought={bought:?}) never appeared in the database")
 }
 
+/// Poll `GET /api/grocery` until `name` appears at least `expected` times.
+async fn poll_grocery_count(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+    expected: usize,
+) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if items.iter().filter(|i| i.name == name).count() >= expected {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("grocery item '{name}' never appeared {expected} times")
+}
+
+/// Poll `GET /api/grocery` until `name` is gone from the database.
+async fn poll_grocery_gone(http: &reqwest::Client, base: &str, name: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !items.iter().any(|i| i.name == name) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("grocery item '{name}' never disappeared from the database")
+}
+
+/// Texts of the grocery rows currently rendered in the shopping tab.
+async fn grocery_item_texts(driver: &WebDriver) -> anyhow::Result<Vec<String>> {
+    let rows = driver
+        .find_all(By::Css("#grocery-list li.grocery-item"))
+        .await?;
+    let mut texts = Vec::new();
+    for row in rows {
+        texts.push(row.text().await?.replace('\n', " "));
+    }
+    Ok(texts)
+}
+
 /// Poll `GET /api/recipes/{id}` until the recipe carries the expected name.
 async fn poll_detail(
     http: &reqwest::Client,
@@ -1300,54 +1520,3 @@ fn tiny_png() -> Vec<u8> {
     }
     b64_decode(B64)
 }
-/// Poll `GET /api/grocery` until `name` appears at least `expected` times.
-async fn poll_grocery_count(
-    http: &reqwest::Client,
-    base: &str,
-    name: &str,
-    expected: usize,
-) -> anyhow::Result<()> {
-    for _ in 0..50 {
-        let items: Vec<GroceryItem> = http
-            .get(format!("{base}/api/grocery"))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if items.iter().filter(|i| i.name == name).count() >= expected {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    anyhow::bail!("grocery item '{name}' never appeared {expected} times")
-}
-
-/// Poll `GET /api/grocery` until `name` is gone from the database.
-async fn poll_grocery_gone(http: &reqwest::Client, base: &str, name: &str) -> anyhow::Result<()> {
-    for _ in 0..50 {
-        let items: Vec<GroceryItem> = http
-            .get(format!("{base}/api/grocery"))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if !items.iter().any(|i| i.name == name) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    anyhow::bail!("grocery item '{name}' never disappeared from the database")
-}
-
-/// Texts of the grocery rows currently rendered in the shopping tab.
-async fn grocery_item_texts(driver: &WebDriver) -> anyhow::Result<Vec<String>> {
-    let rows = driver
-        .find_all(By::Css("#grocery-list li.grocery-item"))
-        .await?;
-    let mut texts = Vec::new();
-    for row in rows {
-        texts.push(row.text().await?.replace('\n', " "));
-    }
-    Ok(texts)
-}
-

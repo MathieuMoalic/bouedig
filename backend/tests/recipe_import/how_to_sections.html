@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Lasagna — Sections Test</title>
+<script type="application/ld+json">
+{
+  "@type": "Recipe",
+  "name": "Lasagna",
+  "recipeIngredient": ["250 g pasta sheets", "500 g minced beef", "400 g tomatoes"],
+  "recipeInstructions": [
+    {
+      "@type": "HowToSection",
+      "name": "Meat sauce",
+      "itemListElement": [
+        {"@type": "HowToStep", "text": "Brown the beef."},
+        {"@type": "HowToStep", "text": "Add the tomatoes and simmer."}
+      ]
+    },
+    {
+      "@type": "HowToSection",
+      "name": "Assembly",
+      "itemListElement": [
+        {"@type": "HowToStep", "text": "Layer pasta and sauce."},
+        {"@type": "HowToStep", "text": "Top with cheese."}
+      ]
+    },
+    {"@type": "HowToStep", "text": "Bake for 45 minutes."}
+  ]
+}
+</script>
+</head>
+<body></body>
+</html>

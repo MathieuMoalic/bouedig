@@ -17,6 +17,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 uuid = { version = "1", features = ["v4"] }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+scraper.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

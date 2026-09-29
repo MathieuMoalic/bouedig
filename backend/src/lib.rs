@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, delete, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use shared::{
     GroceryItem, GroceryUpdate, Ingredient, InstructionStep, NewGroceryItem, Recipe, RecipeDetail,
     RecipeInput,
@@ -22,6 +23,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+
+mod recipe_import;
+
+use recipe_import::{ImportError, RecipePreview};
 
 /// Runtime configuration, all overridable via environment variables.
 #[derive(Debug, Clone)]
@@ -36,6 +41,9 @@ pub struct Config {
     pub static_dir: Option<PathBuf>,
     /// Directory for uploaded recipe photos (`images/` + `images/thumbs/`).
     pub data_dir: PathBuf,
+    /// Test/dev escape hatch: allow the importer to fetch loopback/private
+    /// targets (`BOUEDIG_IMPORT_ALLOW_PRIVATE=1`). Never request-controlled.
+    pub import_allow_private: bool,
 }
 
 impl Config {
@@ -60,6 +68,9 @@ impl Config {
             data_dir: std::env::var("BOUEDIG_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("data")),
+            import_allow_private: std::env::var("BOUEDIG_IMPORT_ALLOW_PRIVATE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }
@@ -69,6 +80,7 @@ impl Config {
 pub struct AppState {
     db: SqlitePool,
     data_dir: PathBuf,
+    import_allow_private: bool,
 }
 
 /// Open (creating if needed) the SQLite pool for `db_url`.
@@ -101,6 +113,10 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
     let api = Router::new()
         .route("/recipes", get(list_recipes).post(create_recipe))
         .route("/recipes/photo", post(create_recipe_with_photo))
+        .route(
+            "/recipes/import",
+            post(import_recipe_from_url),
+        )
         .route(
             "/recipes/{id}",
             get(recipe_detail).put(update_recipe).delete(delete_recipe),
@@ -178,7 +194,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let pool = open_db(&config.db_url).await?;
     run_migrations(&pool).await?;
     ensure_data_dirs(&config.data_dir)?;
-    let app = build_router(AppState { db: pool, data_dir: config.data_dir.clone() }, &config);
+    let app = build_router(
+        AppState {
+            db: pool,
+            data_dir: config.data_dir.clone(),
+            import_allow_private: config.import_allow_private,
+        },
+        &config,
+    );
     tracing::info!("listening on http://{}", config.addr);
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
@@ -192,7 +215,14 @@ pub async fn spawn_server(config: Config) -> anyhow::Result<SocketAddr> {
     let pool = open_db(&config.db_url).await?;
     run_migrations(&pool).await?;
     ensure_data_dirs(&config.data_dir)?;
-    let app = build_router(AppState { db: pool, data_dir: config.data_dir.clone() }, &config);
+    let app = build_router(
+        AppState {
+            db: pool,
+            data_dir: config.data_dir.clone(),
+            import_allow_private: config.import_allow_private,
+        },
+        &config,
+    );
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .context("failed to bind address")?;
@@ -850,6 +880,37 @@ async fn serve_image(
         .into_response())
 }
 
+/// `POST /api/recipes/import`: fetch a recipe webpage, extract a structured
+/// recipe and return it as a **preview**. Nothing is persisted here — the
+/// client reviews/edits the preview and saves it through the normal
+/// create/update endpoints.
+#[derive(Debug, Deserialize)]
+pub struct RecipeImportRequest {
+    pub url: String,
+}
+
+async fn import_recipe_from_url(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(request): Json<RecipeImportRequest>,
+) -> Result<(StatusCode, Json<RecipePreview>), ApiError> {
+    match recipe_import::import(&request.url, state.import_allow_private).await {
+        Ok(preview) => Ok((StatusCode::OK, Json(preview))),
+        // Bad input / disallowed target / unreachable page → 4xx, extraction
+        // failures → 422 (the page is fine, we just cannot read a recipe
+        // from it); unexpected errors land in the generic 500 path below.
+        Err(err @ (ImportError::InvalidUrl(_)
+        | ImportError::DisallowedTarget(_)
+        | ImportError::FetchFailed(_))) => Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            err.to_string(),
+        )),
+        Err(err @ ImportError::ExtractionFailed(_)) => Err(ApiError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            err.to_string(),
+        )),
+    }
+}
+
 async fn list_recipes(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<Vec<Recipe>>, ApiError> {
@@ -958,11 +1019,35 @@ pub(crate) mod tests {
             base_path: base_path.map(String::from),
             static_dir,
             data_dir: std::env::temp_dir().join(format!("bouedig-test-{}", uuid::Uuid::new_v4())),
+            import_allow_private: false,
         }
     }
 
     pub(crate) async fn test_router(base_path: Option<&str>) -> Router {
         test_router_with_config(base_path).await.0
+    }
+
+    /// Router whose importer may fetch loopback targets (fixture servers).
+    pub(crate) async fn test_router_import() -> Router {
+        let config = test_config(None, None);
+        ensure_data_dirs(&config.data_dir).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        build_router(
+            AppState {
+                db: pool,
+                data_dir: config.data_dir.clone(),
+                import_allow_private: true,
+            },
+            &Config {
+                import_allow_private: true,
+                ..config
+            },
+        )
     }
 
     pub(crate) async fn test_router_with_config(base_path: Option<&str>) -> (Router, Config) {
@@ -975,7 +1060,14 @@ pub(crate) mod tests {
             .unwrap();
         run_migrations(&pool).await.unwrap();
         (
-            build_router(AppState { db: pool, data_dir: config.data_dir.clone() }, &config),
+            build_router(
+                AppState {
+                    db: pool,
+                    data_dir: config.data_dir.clone(),
+                    import_allow_private: config.import_allow_private,
+                },
+                &config,
+            ),
             config,
         )
     }
@@ -1159,7 +1251,8 @@ pub(crate) mod tests {
         let id: serde_json::Value = serde_json::from_str(&body).unwrap();
         let id = id["id"].as_i64().unwrap();
 
-        let (status, body) = json_response(
+        // Toggle to bought -> item should be deleted
+        let (status, _) = json_response(
             app.clone(),
             "PATCH",
             &format!("/api/grocery/{id}"),
@@ -1168,6 +1261,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
+        // Item should no longer be in the list
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         assert_eq!(body.trim(), "[]", "grocery list must be empty after toggle: {body}");
     }
@@ -1261,8 +1355,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn meta_fields_round_trip() {
         let app = test_router(None).await;
-        // Toggle to bought -> item should be deleted
-        let (status, _) = json_response(
+        let (status, body) = json_response(
             app.clone(),
             "POST",
             "/api/recipes",
@@ -1306,6 +1399,192 @@ pub(crate) mod tests {
         let (status, _) = json_response(app, "GET", "/bouedig/", None).await;
         assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
     }
+
+    // -------------------------------------------------------------------
+    // Recipe import (`POST /api/recipes/import`)
+    // -------------------------------------------------------------------
+
+    /// A minimal one-shot HTTP server serving `body` for every request on a
+    /// free loopback port. Detached: lives until the test process ends.
+    fn fixture_server(body: &'static str) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                use std::io::{Read, Write};
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    fn fixture_page(name: &str) -> &'static str {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/recipe_import")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("fixture {name} unreadable: {e}"))
+            .leak()
+    }
+
+    #[tokio::test]
+    async fn import_rejects_invalid_urls() {
+        let app = test_router(None).await;
+        for url in ["", "not a url", "file:///etc/passwd", "ftp://example.com/x"] {
+            let payload = serde_json::json!({ "url": url }).to_string();
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/recipes/import", Some(&payload)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "url {url:?}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn import_rejects_private_network_targets() {
+        // Without the test opt-in, loopback/private targets must be refused
+        // before any request is made.
+        let app = test_router(None).await;
+        for url in [
+            "http://127.0.0.1:9/recipe",
+            "http://localhost:3000/recipe",
+            "http://10.0.0.5/recipe",
+            "http://192.168.1.10/recipe",
+            "http://169.254.169.254/meta",
+            "http://[::1]/recipe",
+        ] {
+            let payload = serde_json::json!({ "url": url }).to_string();
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/recipes/import", Some(&payload)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "url {url}: {body}");
+            assert!(body.contains("not allowed"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn import_fetch_failure_is_a_client_error() {
+        // Nothing listens on this loopback port, but the import router used
+        // here allows private targets, so the failure is a fetch failure.
+        let app = test_router_import().await;
+        let payload = serde_json::json!({ "url": "http://127.0.0.1:9/recipe" }).to_string();
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/recipes/import", Some(&payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("fetch"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn import_page_without_recipe_is_unprocessable() {
+        let addr = fixture_server("<html><body><p>Just a blog post.</p></body></html>");
+        let app = test_router_import().await;
+        let payload = serde_json::json!({ "url": format!("http://{addr}/post") }).to_string();
+        let (status, body) =
+            json_response(app, "POST", "/api/recipes/import", Some(&payload)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("could not extract"), "{body}");
+    }
+
+    /// The full plan Phase 13 journey: import preview → save → retrieve and
+    /// verify sections, ingredients, instructions and metadata — plus a
+    /// grocery list that stayed untouched.
+    #[tokio::test]
+    async fn import_preview_saves_and_retrieves_through_the_normal_api() {
+        let addr = fixture_server(fixture_page("how_to_sections.html"));
+        let app = test_router_import().await;
+
+        // 1. Import preview (nothing persisted yet).
+        let payload = serde_json::json!({ "url": format!("http://{addr}/lasagna") }).to_string();
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/recipes/import", Some(&payload)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let preview: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(preview["method"], "json_ld", "{body}");
+        assert_eq!(preview["recipe"]["name"], "Lasagna", "{body}");
+        assert_eq!(preview["recipe"]["source"], format!("http://{addr}/lasagna"), "{body}");
+        let confidence = preview["confidence"].as_f64().unwrap();
+        assert!(confidence > 0.5, "confidence {confidence}: {body}");
+
+        // No row was created by the import itself.
+        let (_, body) = json_response(app.clone(), "GET", "/api/recipes", None).await;
+        assert_eq!(body.trim(), "[]", "import must not persist: {body}");
+
+        // 2. Save the previewed recipe through the normal endpoint.
+        let recipe_input = preview["recipe"].clone().to_string();
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/recipes", Some(&recipe_input)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = saved["id"].as_i64().unwrap();
+
+        // 3. Retrieve and verify the structured data survived.
+        let (status, body) =
+            json_response(app.clone(), "GET", &format!("/api/recipes/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail: RecipeDetail = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail.name, "Lasagna");
+        assert_eq!(detail.ingredients.len(), 3);
+        assert_eq!(detail.ingredients[0].name, "pasta sheets");
+        assert_eq!(
+            detail.instruction_sections,
+            vec!["Meat sauce".to_string(), "Assembly".to_string()]
+        );
+        assert_eq!(detail.instructions.len(), 5);
+        assert_eq!(detail.instructions[0].section.as_deref(), Some("Meat sauce"));
+        assert_eq!(detail.instructions[4].section, None);
+        assert_eq!(detail.source, format!("http://{addr}/lasagna"));
+
+        // 4. The grocery list is untouched by the import and the save.
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        assert_eq!(body.trim(), "[]", "grocery list must stay empty: {body}");
+    }
+
+    /// Redirect hops are followed to the final recipe page.
+    #[tokio::test]
+    async fn import_follows_redirects() {
+        // A server that redirects once, then serves the fixture to the
+        // *next* connection (two requests, one thread).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body: &'static str = fixture_page("json_ld_graph.html");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut served_redirect = false;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let response = if served_redirect {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    served_redirect = true;
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let app = test_router_import().await;
+        let payload = serde_json::json!({ "url": format!("http://{addr}/start") }).to_string();
+        let (status, response_body) =
+            json_response(app, "POST", "/api/recipes/import", Some(&payload)).await;
+        assert_eq!(status, StatusCode::OK, "{response_body}");
+        let preview: serde_json::Value = serde_json::from_str(&response_body).unwrap();
+        assert_eq!(preview["recipe"]["name"], "Apple Cake", "{response_body}");
+        // The source is the final URL after the redirect.
+        assert_eq!(preview["recipe"]["source"], format!("http://{addr}/final"));
+    }
 }
 
 #[cfg(test)]
@@ -1335,7 +1614,6 @@ mod photo_tests {
         assert_eq!(std::fs::read(dir.join(&image_path)).unwrap(), png);
         let thumb = image::open(dir.join(&thumb_path)).unwrap();
         assert!(thumb.width() <= 480);
-        // Item should no longer be in the list
         assert!(thumb_path.ends_with(".jpg"));
     }
 
