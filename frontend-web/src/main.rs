@@ -29,6 +29,8 @@ enum Route {
     Recipes {},
     #[route("/add")]
     AddRecipe {},
+    #[route("/import")]
+    ImportRecipe {},
     #[route("/recipe/:id")]
     RecipeDetail { id: i64 },
     #[route("/edit/:id")]
@@ -163,6 +165,17 @@ fn IconSearch() -> Element {
         svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round",
             circle { cx: "11", cy: "11", r: "6.5" }
             path { d: "M16 16l5 5" }
+        }
+    }
+}
+
+/// Globe icon for the "import recipe from URL" action.
+#[component]
+fn IconGlobe() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round",
+            circle { cx: "12", cy: "12", r: "8.5" }
+            path { d: "M3.5 12h17M12 3.5c2.6 2.3 4 5.2 4 8.5s-1.4 6.2-4 8.5c-2.6-2.3-4-5.2-4-8.5s1.4-6.2 4-8.5z" }
         }
     }
 }
@@ -392,7 +405,16 @@ fn Recipes() -> Element {
             }
             div { class: "fab-stack",
                 button { class: "fab small", title: "Search", IconSearch {} }
-                button { class: "fab small", title: "Filter", IconList {} }
+                button {
+                    id: "fab-import-recipe",
+                    class: "fab small",
+                    title: "Import from URL",
+                    onclick: move |_| {
+                        tracing::info!("import FAB clicked, opening the import form");
+                        navigator.push(Route::ImportRecipe {});
+                    },
+                    IconGlobe {}
+                }
                 button {
                     id: "fab-add-recipe",
                     class: "fab",
@@ -580,6 +602,192 @@ fn AddRecipe() -> Element {
 fn EditRecipe(id: i64) -> Element {
     rsx! {
         RecipeForm { editing: Some(id) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page: Import recipe from a URL
+// ---------------------------------------------------------------------------
+
+/// Mirror of the backend's `RecipePreview` (kept local: importer-specific
+/// API types do not belong in `shared` until another client needs them).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ImportPreview {
+    recipe: RecipeInput,
+    method: String,
+    confidence: f32,
+    warnings: Vec<String>,
+}
+
+/// URL → fetch preview → review/edit in the existing recipe form → save.
+/// The imported recipe is never saved without an explicit user action.
+#[component]
+fn ImportRecipe() -> Element {
+    let mut url = use_signal(String::new);
+    let mut loading = use_signal(|| false);
+    let mut error = use_signal(|| String::new());
+    let mut preview = use_signal(|| None::<ImportPreview>);
+    let mut show_warnings = use_signal(|| true);
+
+    let mut import = move |_| {
+        let target = url.read().trim().to_string();
+        if target.is_empty() || *loading.read() {
+            return;
+        }
+        loading.set(true);
+        error.set(String::new());
+        let target = target.clone();
+        spawn(async move {
+            let client = reqwest::Client::new();
+            let endpoint = format!("{}/api/recipes/import", api_base());
+            tracing::info!("importing recipe from {target}");
+            let result = client
+                .post(endpoint)
+                .json(&serde_json::json!({ "url": target }))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => match resp.json::<ImportPreview>().await {
+                    Ok(p) => {
+                        tracing::info!(
+                            "import preview: {} (method {}, confidence {:.2})",
+                            p.recipe.name, p.method, p.confidence
+                        );
+                        show_warnings.set(true);
+                        preview.set(Some(p));
+                    }
+                    Err(err) => {
+                        tracing::error!("import response unreadable: {err:#}");
+                        error.set("The server returned an unreadable preview.".into());
+                    }
+                },
+                Ok(resp) => {
+                    let status = resp.status();
+                    let message = resp.text().await.unwrap_or_default();
+                    tracing::error!("import failed: {status} {message}");
+                    let message = serde_json::from_str::<serde_json::Value>(&message)
+                        .ok()
+                        .and_then(|v| v["error"].as_str().map(str::to_string))
+                        .unwrap_or(message);
+                    error.set(message);
+                }
+                Err(err) => {
+                    tracing::error!("import request failed: {err:#}");
+                    error.set("Could not reach the server.".into());
+                }
+            }
+            loading.set(false);
+        });
+    };
+
+    let preview_snapshot = preview.read().clone();
+    let confidence_pct = preview_snapshot
+        .as_ref()
+        .map(|p| (p.confidence * 100.0) as u64)
+        .unwrap_or(0);
+    match preview_snapshot {
+        None => rsx! {
+            div { class: "page",
+                div { class: "card import-card",
+                    h1 { "Import recipe" }
+                    p { class: "muted",
+                        "Paste the web address of a recipe page. Bouedig reads the \
+                         page, extracts the recipe and lets you review it before saving."
+                    }
+                    div { class: "import-row",
+                        input {
+                            id: "import-url",
+                            r#type: "url",
+                            placeholder: "https://…",
+                            value: "{url}",
+                            autocomplete: "off",
+                            oninput: move |e: FormEvent| url.set(e.value()),
+                            onkeydown: move |e: KeyboardEvent| {
+                                if e.key() == Key::Enter {
+                                    import(());
+                                }
+                            },
+                        }
+                        button {
+                            id: "import-fetch",
+                            class: "btn-primary",
+                            r#type: "button",
+                            disabled: *loading.read(),
+                            onclick: move |_| import(()),
+                            if *loading.read() { "Fetching…" } else { "Import" }
+                        }
+                    }
+                    if !error.read().is_empty() {
+                        p { class: "status-error", "{error}" }
+                    }
+                    if *loading.read() {
+                        p { class: "muted", "Fetching the recipe page…" }
+                    }
+                }
+            }
+        },
+        Some(p) => rsx! {
+            div { class: "page",
+                div { class: "card import-summary", id: "import-summary",
+                    div { class: "import-summary-head",
+                        span { class: "import-badge", "{p.method}" }
+                        span { class: "muted", "confidence {confidence_pct}%" }
+                    }
+                    if show_warnings() && !p.warnings.is_empty() {
+                        div { class: "import-warnings",
+                            button {
+                                id: "import-warnings-dismiss",
+                                class: "warnings-dismiss",
+                                r#type: "button",
+                                title: "Dismiss",
+                                onclick: move |_| show_warnings.set(false),
+                                IconX {}
+                            }
+                            p { "The extraction was incomplete — please review:" }
+                            ul {
+                                for warning in &p.warnings {
+                                    li { "{warning}" }
+                                }
+                            }
+                        }
+                    }
+                    button {
+                        id: "import-restart",
+                        class: "btn-ghost",
+                        r#type: "button",
+                        onclick: move |_| {
+                            preview.set(None);
+                            url.set(String::new());
+                        },
+                        "Import a different URL"
+                    }
+                }
+                // Review/edit in the existing editor, then save explicitly.
+                RecipeFormFields {
+                    initial: import_preview_to_detail(&p),
+                    editing_id: None,
+                }
+            }
+        },
+    }
+}
+
+/// Adapt the imported `RecipeInput` into the editor's `initial` value (the
+/// editor consumes the detail shape; ids/photos are meaningless here).
+fn import_preview_to_detail(preview: &ImportPreview) -> RecipeDetailModel {
+    let recipe = &preview.recipe;
+    RecipeDetailModel {
+        id: 0,
+        name: recipe.name.clone(),
+        sections: recipe.sections.clone(),
+        ingredients: recipe.ingredients.clone(),
+        instructions: recipe.instructions.clone(),
+        instruction_sections: recipe.instruction_sections.clone(),
+        notes: recipe.notes.clone(),
+        yield_amount: recipe.yield_amount.clone(),
+        source: recipe.source.clone(),
+        image: None,
+        thumb: None,
     }
 }
 
@@ -2010,12 +2218,55 @@ fn DeleteDialog(
 // Tab: Shopping (grouped grocery list)
 // ---------------------------------------------------------------------------
 
+/// Compute Levenshtein distance between two strings, comparing per character
+/// (so multi-byte input like "é" counts as one character, not two bytes).
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut v0: Vec<usize> = (0..=b.len()).collect();
+    let mut v1 = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        v1[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            v1[j + 1] = std::cmp::min(std::cmp::min(v1[j] + 1, v0[j + 1] + 1), v0[j] + cost);
+        }
+        std::mem::swap(&mut v0, &mut v1);
+    }
+    v0[b.len()]
+}
+
+/// Rank past item names by how closely they match the typed text using
+/// Levenshtein distance (max 3 edits), closest match first. Empty input
+/// yields no suggestions — the dropdown only opens for typed text.
+fn rank_suggestions(input: &str, past: &[String]) -> Vec<(String, usize)> {
+    let needle = input.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(String, usize)> = past
+        .iter()
+        .filter_map(|name| {
+            let hay = name.to_lowercase();
+            // Prefix matches rank first even when the name is long.
+            let dist = if hay.starts_with(&needle) {
+                0
+            } else {
+                levenshtein_distance(&needle, &hay)
+            };
+            (dist <= 3).then_some((name.clone(), dist))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.cmp(&b.1));
+    scored
+}
+
 #[component]
 fn Grocery() -> Element {
     let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut new_category = use_signal(String::new);
     let mut error = use_signal(|| String::new());
+    let mut focused = use_signal(|| false);
     let collapsed = use_signal(|| HashSet::<String>::new());
     let mut loaded = use_signal(|| false);
 
@@ -2037,6 +2288,16 @@ fn Grocery() -> Element {
             None => groups.push((item.category.clone(), vec![item.clone()])),
         }
     }
+
+    // Past entries = unique names of items that have ever been added.
+    let mut past_names: Vec<String> = Vec::new();
+    for item in &list {
+        if !past_names.contains(&item.name) {
+            past_names.push(item.name.clone());
+        }
+    }
+
+    let suggestions = rank_suggestions(&new_item.read(), &past_names);
 
     rsx! {
         div { class: "page",
@@ -2244,55 +2505,13 @@ fn GroceryRow(
                         }
                     });
                 },
-/// Compute Levenshtein distance between two strings, comparing per character
-/// (so multi-byte input like "é" counts as one character, not two bytes).
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut v0: Vec<usize> = (0..=b.len()).collect();
-    let mut v1 = vec![0; b.len() + 1];
-    for (i, ca) in a.chars().enumerate() {
-        v1[0] = i + 1;
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
-            v1[j + 1] = std::cmp::min(std::cmp::min(v1[j] + 1, v0[j + 1] + 1), v0[j] + cost);
-        }
-        std::mem::swap(&mut v0, &mut v1);
-    }
-    v0[b.len()]
-}
-
-/// Rank past item names by how closely they match the typed text using
-/// Levenshtein distance (max 3 edits), closest match first. Empty input
-/// yields no suggestions — the dropdown only opens for typed text.
-fn rank_suggestions(input: &str, past: &[String]) -> Vec<(String, usize)> {
-    let needle = input.trim().to_lowercase();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let mut scored: Vec<(String, usize)> = past
-        .iter()
-        .filter_map(|name| {
-            let hay = name.to_lowercase();
-            // Prefix matches rank first even when the name is long.
-            let dist = if hay.starts_with(&needle) {
-                0
-            } else {
-                levenshtein_distance(&needle, &hay)
-            };
-            (dist <= 3).then_some((name.clone(), dist))
-        })
-        .collect();
-    scored.sort_by(|a, b| a.1.cmp(&b.1));
-    scored
-}
-
+                IconX {}
             }
             span { "{item.name}" }
         }
     }
 }
 
-    let mut focused = use_signal(|| false);
 /// Re-fetch the grocery list from the backend.
 async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>) {
     match api_get::<Vec<GroceryItem>>("/api/grocery").await {
@@ -2315,16 +2534,6 @@ async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>)
 #[component]
 fn MealPlan() -> Element {
     rsx! {
-    // Past entries = unique names of items that have ever been added.
-    let mut past_names: Vec<String> = Vec::new();
-    for item in &list {
-        if !past_names.contains(&item.name) {
-            past_names.push(item.name.clone());
-        }
-    }
-
-    let suggestions = rank_suggestions(&new_item.read(), &past_names);
-
         PlaceholderPage {
             title: "Meal plan",
             text: "Plan your week — coming soon.",
@@ -2353,7 +2562,6 @@ fn PlaceholderPage(title: String, text: String) -> Element {
         }
     }
 }
-                IconX {}
 
 #[cfg(test)]
 mod tests {
