@@ -672,23 +672,6 @@ ol.instruction-list li {
     margin-top: 4px;
 }
 
-.ingredient-row {
-    display: grid;
-    grid-template-columns: 64px 72px 1fr 1fr 30px;
-    gap: 6px;
-    align-items: center;
-}
-
-.ingredient-row input {
-    background: #101512;
-    border: 1px solid var(--divider);
-    color: var(--text);
-    border-radius: 8px;
-    padding: 8px 8px;
-    font: inherit;
-    min-width: 0;
-}
-
 .ing-remove {
     width: 30px;
     height: 34px;
@@ -796,13 +779,18 @@ ol.instruction-list li {
     flex-shrink: 0;
 }
 
+/* auto basis: shrink cost is shared with prep; without it a long prep text
+   (min-width forced) starves the zero-basis name down to ~2 chars/line. */
 .ing-name {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
     overflow-wrap: anywhere;
 }
 
 .ing-prep-text {
     color: var(--muted);
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .row-actions {

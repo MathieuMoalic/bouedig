@@ -611,4 +611,109 @@ mod tests {
         assert!(joined.contains("recipe has no instructions"));
         assert!(extraction_score.confidence < 0.5);
     }
+
+    // -------------------------------------------------------------------
+    // Captured real-world WPRM/MV-Create pages (trimmed). These lock the
+    // importer to the exact structures the live sites emit — see
+    // `tests/live_import.rs` for the always-live counterparts.
+    // -------------------------------------------------------------------
+
+    fn balanced(ingredient: &shared::Ingredient) {
+        let check = |text: &str, what: &str| {
+            let mut depth: i32 = 0;
+            for c in text.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "unbalanced ')' in {what}: {text:?}");
+            }
+            assert_eq!(depth, 0, "unbalanced '(' in {what}: {text:?}");
+        };
+        check(&ingredient.name, "name");
+        if let Some(prep) = &ingredient.prep {
+            check(prep, "prep");
+        }
+    }
+
+    #[test]
+    fn fixture_wprm_metric_parens_rainbowplantlife() {
+        let (recipe, method) = extract_fixture("wprm_metric_parens.html");
+        assert_eq!(method, ExtractionMethod::JsonLd);
+        assert_eq!(recipe.name, "Gambian Peanut Stew");
+        assert_eq!(recipe.yield_amount, "6");
+        assert!(recipe.ingredients.len() >= 15);
+        // Verbatim site strings, parsed conservatively.
+        assert_eq!(recipe.ingredients[0].name, "unrefined coconut oil (use refined for a neutral flavor)");
+        assert_eq!(recipe.ingredients[0].quantity, Some(1.5));
+        assert_eq!(recipe.ingredients[1].name, "large yellow onion");
+        assert_eq!(recipe.ingredients[1].prep.as_deref(), Some("diced"));
+        // "1-2 jalapeño peppers, (diced (see Note 1) )"
+        assert_eq!(recipe.ingredients[4].quantity, Some(1.0), "range lower bound");
+        assert_eq!(recipe.ingredients[4].name, "jalapeño peppers");
+        // "4 cups (945 mL) low-sodium vegetable broth"
+        assert_eq!(recipe.ingredients[12].unit.as_deref(), Some("cups"));
+        assert_eq!(
+            recipe.ingredients[12].name,
+            "(945 mL) low-sodium vegetable broth"
+        );
+        // "½ cup (128g) creamy peanut butter ((no sugar added) )"
+        assert_eq!(recipe.ingredients[15].name, "(128g) creamy peanut butter");
+        assert_eq!(recipe.ingredients[15].prep.as_deref(), Some("no sugar added"));
+        // "1 (15-ounce/425g)  can cannellini beans, (drained and rinsed)"
+        assert_eq!(recipe.ingredients[16].unit.as_deref(), Some("can"));
+        assert_eq!(recipe.ingredients[16].name, "(15-ounce/425g) cannellini beans");
+        assert_eq!(recipe.ingredients[16].prep.as_deref(), Some("drained and rinsed"));
+        for ingredient in &recipe.ingredients {
+            balanced(ingredient);
+        }
+        // JSON-LD entities are decoded in instruction text.
+        assert!(recipe.instructions.iter().all(|s| !s.text.contains("&#")));
+    }
+
+    #[test]
+    fn fixture_wprm_doubled_parens_minimalistbaker() {
+        let (recipe, _) = extract_fixture("wprm_doubled_parens.html");
+        assert_eq!(recipe.name, "1-Pot Lentil Green Curry");
+        assert_eq!(recipe.yield_amount, "4");
+        // "2 1/4 cups light coconut milk*  ((canned is best))"
+        assert_eq!(recipe.ingredients[6].quantity, Some(2.25));
+        assert_eq!(recipe.ingredients[6].unit.as_deref(), Some("cups"));
+        assert_eq!(recipe.ingredients[6].name, "light coconut milk*");
+        assert_eq!(recipe.ingredients[6].prep.as_deref(), Some("canned is best"));
+        // "1 cup green lentils* ((well rinsed and drained))"
+        assert_eq!(recipe.ingredients[10].name, "green lentils*");
+        assert_eq!(recipe.ingredients[10].prep.as_deref(), Some("well rinsed and drained"));
+        for ingredient in &recipe.ingredients {
+            balanced(ingredient);
+        }
+        assert!(recipe.instructions.iter().all(|s| !s.text.contains("&#")));
+    }
+
+    #[test]
+    fn fixture_wprm_comma_parens_veganhuggs() {
+        let (recipe, _) = extract_fixture("wprm_comma_parens.html");
+        assert_eq!(recipe.name, "Vegan Lasagna");
+        assert_eq!(recipe.yield_amount, "10");
+        // "1 large  onion (, finely diced)" — WPRM comma style.
+        assert_eq!(recipe.ingredients[2].name, "large onion");
+        assert_eq!(recipe.ingredients[2].prep.as_deref(), Some("finely diced"));
+        // "Salt (, to taste)"
+        assert_eq!(recipe.ingredients[9].name, "Salt");
+        assert_eq!(recipe.ingredients[9].prep.as_deref(), Some("to taste"));
+        // "12 cups fresh spinach ((loosely packed) rough chopped (about 14 oz))"
+        assert_eq!(recipe.ingredients[8].quantity, Some(12.0));
+        assert_eq!(
+            recipe.ingredients[8].name,
+            "fresh spinach (loosely packed) rough chopped"
+        );
+        assert_eq!(recipe.ingredients[8].prep.as_deref(), Some("about 14 oz"));
+        // "15  lasagna noodles ((*see note))"
+        assert_eq!(recipe.ingredients[12].name, "lasagna noodles");
+        assert_eq!(recipe.ingredients[12].prep.as_deref(), Some("*see note"));
+        for ingredient in &recipe.ingredients {
+            balanced(ingredient);
+        }
+    }
 }

@@ -1166,7 +1166,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                 span { class: "ing-amount", "{amount}" }
                                 span { class: "ing-name", "{row.name}" }
                                 if !row.prep.trim().is_empty() {
-                                    span { class: "ing-prep-text", ", {row.prep}" }
+                                    span { class: "ing-prep-text", "{row.prep}" }
                                 }
                                 div { class: "row-actions", onclick: move |e: MouseEvent| e.stop_propagation(),
                                     button {

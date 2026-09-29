@@ -227,7 +227,7 @@ const PREP_PHRASES: &[&str] = &[
 /// Parse one raw ingredient line into the structured model. When anything is
 /// uncertain the whole (cleaned) line is kept as `name` — nothing invented.
 pub fn parse_ingredient_line(line: &str) -> Ingredient {
-    let line = clean_text(line);
+    let line = normalize_parens(&clean_text(line));
     if line.is_empty() {
         return Ingredient {
             quantity: None,
@@ -241,7 +241,7 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
     // Split off the preparation suffix at the first comma (…, finely chopped).
     let (main, prep) = match line.split_once(',') {
         Some((main, rest)) => {
-            let rest = rest.trim();
+            let rest = strip_outer_parens(rest.trim());
             if rest.split_whitespace().count() <= 4 && looks_like_prep(rest) {
                 (main.trim(), Some(rest.to_string()))
             } else {
@@ -257,23 +257,289 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
     // Eat the whitespace between the quantity and the unit ("1.5 l stock").
     let remainder_trimmed = remainder.trim_start().to_string();
 
-    let unit = if let Some((u, rest)) = split_leading_unit(&remainder_trimmed) {
-        remainder = rest.to_string();
-        Some(u)
+    // A leading metric parenthetical ("(454g) sweet potatoes") must not block
+    // unit detection: skip over it, keep it in the name.
+    let (unit, remainder) = if remainder_trimmed.starts_with('(') {
+        match leading_group(&remainder_trimmed) {
+            Some((group, after_group)) if group_content_has_digit(group) => {
+                let after_group_trim = after_group.trim_start();
+                match split_leading_unit(after_group_trim) {
+                    Some((u, rest)) => (Some(u), format!("{group} {}", rest.trim_start())),
+                    None => (None, remainder_trimmed.clone()),
+                }
+            }
+            _ => match split_leading_unit(&remainder_trimmed) {
+                Some((u, rest)) => (Some(u), rest.to_string()),
+                None => (None, remainder_trimmed.clone()),
+            },
+        }
     } else {
-        remainder = remainder_trimmed;
-        None
+        match split_leading_unit(&remainder_trimmed) {
+            Some((u, rest)) => (Some(u), rest.to_string()),
+            None => (None, remainder_trimmed.clone()),
+        }
     };
 
-    let name = remainder.trim().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+    let mut name = strip_unbalanced_parens(remainder.trim());
+    let mut prep = prep;
+    // A short trailing parenthetical note ("oil (divided)", "noodles (*see
+    // note)") is preparation information, not part of the name.
+    if let Some((group, start)) = trailing_group(&name) {
+        let content = strip_outer_parens(group);
+        if prep.is_none() && content.split_whitespace().count() <= 4 {
+            let cut = name[..start].trim_end().to_string();
+            let note = content.to_string();
+            name = cut;
+            prep = Some(note);
+        }
+    }
+    let name = name.trim_matches(|c: char| matches!(c, ',' | ';' | '/')).to_string();
     let name = if name.is_empty() { main.trim().to_string() } else { name };
 
     Ingredient {
         quantity,
         unit,
         name,
-        prep,
+        prep: prep.map(|p| strip_unbalanced_parens(&p)),
         section: None,
+    }
+}
+
+/// Normalize the parenthesis conventions recipe sites emit before parsing:
+/// * doubled author-note wrappers `((…))` lose one layer
+/// * WP Recipe Maker's comma style `(, finely diced)` becomes `, finely diced`
+/// * stray spaces inside groups `( text )` are trimmed, double spaces collapse
+///
+/// Matching is stack-based, so nested groups (`(diced (see Note 1))`) and
+/// unbalanced strays are handled without ever leaving a dangling paren.
+pub fn normalize_parens(input: &str) -> String {
+    let text = clean_text(input);
+    if text.is_empty() {
+        return text;
+    }
+    let chars: Vec<char> = text.chars().collect();
+
+    // Match every paren with its partner; unmatched ones are dropped.
+    let mut match_of = vec![None; chars.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '(' {
+            stack.push(i);
+        } else if *c == ')' {
+            if let Some(open) = stack.pop() {
+                match_of[open] = Some(i);
+            }
+        }
+    }
+    let unmatched_opens: Vec<usize> = stack;
+
+    // Recursively render the segment [from..to) (to exclusive, or end).
+    fn render(
+        chars: &[char],
+        match_of: &[Option<usize>],
+        unmatched: &[usize],
+        from: usize,
+        to: usize,
+    ) -> String {
+        let mut out = String::new();
+        let mut i = from;
+        while i < to {
+            if unmatched.contains(&i) || chars[i] == ')' && !within_paired(i, match_of, from, to) {
+                i += 1;
+                continue;
+            }
+            if chars[i] == '(' {
+                let close = match_of[i].map(|c| c as usize);
+                let Some(close) = close else { i += 1; continue };
+                if close >= to {
+                    i += 1;
+                    continue;
+                }
+                let content: String = render(chars, match_of, unmatched, i + 1, close);
+                let trimmed = content.trim();
+                // `((note))`: two adjacent opens mean the author doubled the
+                // parens around a note — emit the content, dropping exactly
+                // one layer. Non-adjacent nesting (`(diced (see Note 1))`)
+                // is kept as-is.
+                if chars.get(i + 1) == Some(&'(') {
+                    out.push_str(trimmed);
+                } else if let Some(rest) = trimmed.strip_prefix(',') {
+                    // `(, finely diced)` — a comma separator wrapped in parens.
+                    out.push(',');
+                    let rest = rest.trim_start();
+                    if !rest.is_empty() {
+                        out.push(' ');
+                        out.push_str(rest);
+                    }
+                } else {
+                    out.push('(');
+                    out.push_str(trimmed);
+                    out.push(')');
+                }
+                i = close + 1;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        clean_text(&out)
+    }
+
+    let rendered = render(&chars, &match_of, &unmatched_opens, 0, chars.len());
+    // A group left over right before a comma reads better merged into it:
+    // handled downstream; here just normalize spaces around commas.
+    rendered.replace(" ,", ",")
+}
+
+/// Whether the paren at `i` participates in a pair fully inside [from, to).
+fn within_paired(i: usize, match_of: &[Option<usize>], from: usize, to: usize) -> bool {
+    match match_of.get(i).copied().flatten() {
+        Some(close) => close < to && i >= from,
+        None => false,
+    }
+}
+
+/// Does `text` consist of exactly one balanced group (plus surrounding spaces)?
+fn is_single_group(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.first() != Some(&'(') || chars.last() != Some(&')') || chars.len() < 2 {
+        return false;
+    }
+    let mut depth = 0i32;
+    for (i, c) in chars.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                // The outer group must close exactly at the last char.
+                if depth == 0 && i != chars.len() - 1 {
+                    return false;
+                }
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// If `text` contains a balanced group at its first '(', return the group and
+/// everything after it.
+fn leading_group(text: &str) -> Option<(&str, &str)> {
+    let start = text.find('(')?;
+    let rest = &text[start..];
+    let mut depth = 0i32;
+    for (byte_idx, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = byte_idx + c.len_utf8();
+                    return Some((&rest[..end], &rest[end..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// If `text` ends with a balanced single group (ignoring trailing spaces),
+/// return the group text and the byte offset where it starts.
+fn trailing_group(text: &str) -> Option<(&str, usize)> {
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (byte_idx, c) in trimmed.char_indices().rev() {
+        match c {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    let group = &trimmed[byte_idx..];
+                    return if is_single_group(group) {
+                        Some((group, byte_idx))
+                    } else {
+                        None
+                    };
+                }
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn group_content_has_digit(group: &str) -> bool {
+    strip_outer_parens(group).chars().any(|c| c.is_ascii_digit())
+}
+
+/// Remove one outer paren pair when the text is wrapped in a single group.
+fn strip_outer_parens(text: &str) -> &str {
+    let trimmed = text.trim();
+    if is_single_group(trimmed) {
+        trimmed
+            .strip_prefix('(')
+            .and_then(|t| t.strip_suffix(')'))
+            .unwrap_or(trimmed)
+            .trim()
+    } else {
+        trimmed
+    }
+}
+
+/// Drop paren characters that never find a partner, so no mangled fragment
+/// (e.g. `454g)` or `(see note`) can ever reach the stored recipe.
+fn strip_unbalanced_parens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0i32;
+    for c in text.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // Any still-open groups: remove their dangling '(' characters.
+    if depth > 0 {
+        let mut result = String::with_capacity(out.len());
+        let mut open = 0i32;
+        for c in out.chars().rev() {
+            match c {
+                ')' => {
+                    open += 1;
+                    result.push(c);
+                }
+                '(' => {
+                    if open > 0 {
+                        open -= 1;
+                    } else {
+                        continue;
+                    }
+                    result.push(c);
+                }
+                _ => result.push(c),
+            }
+        }
+        result.chars().rev().collect()
+    } else {
+        out
     }
 }
 
@@ -299,7 +565,14 @@ fn parse_leading_quantity(remainder: &mut String) -> Option<f64> {
 }
 
 /// Scan a quantity at the very start of `text`; return it plus the rest.
+/// Range upper bounds (`½–1 tsp`, `1-2`, `¼–⅓`) are consumed so they never
+/// leak into the ingredient name; the quantity is the lower bound.
 fn scan_quantity(text: &str) -> Option<(f64, &str)> {
+    let (value, rest) = scan_quantity_base(text)?;
+    Some(consume_range(value, rest))
+}
+
+fn scan_quantity_base(text: &str) -> Option<(f64, &str)> {
     // Leading unicode fraction (¼ cup …): value stands alone.
     if let Some((value, rest)) = leading_unicode_fraction(text) {
         return Some((value, rest));
@@ -385,25 +658,64 @@ fn scan_quantity(text: &str) -> Option<(f64, &str)> {
         return Some((first + value, rest));
     }
 
-    // Range: "1-2", "1 – 2", "1 to 2" → lower bound. The separators are
-    // matched on the whitespace-trimmed remainder, so "to 2" works for
-    // "1 to 2 onions". A following number is required, so "1 tomato" is
-    // never mistaken for a range.
+    Some((first, after_first))
+}
+
+/// Eat a range separator plus upper bound (`-2`, `–1`, `–⅓`, `to 2`,
+/// `–1/3`) after a quantity. Requires a number to follow, so "1-ounce can"
+/// is untouched. A "fraction" upper bound smaller than the first value
+/// ("2-1/2 cups") is the classic two-and-a-half shorthand, not a range —
+/// that becomes a mixed number instead.
+fn consume_range<'a>(value: f64, rest: &'a str) -> (f64, &'a str) {
+    let trimmed = rest.trim_start();
     for separator in ["-", "–", "—", "to "] {
         if let Some(after_sep) = trimmed.strip_prefix(separator) {
             let after_sep = after_sep.trim_start();
-            let upper: String = after_sep
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if parse_number_token(&upper).is_some() {
-                let consumed = &after_sep[upper.len()..];
-                return Some((first, consumed));
+            if let Some((upper_total, consumed_len)) = parse_upper_bound(after_sep) {
+                if upper_total < value {
+                    // "2-1/2" → two and a half, not a range.
+                    return (value + upper_total, &after_sep[consumed_len..]);
+                }
+                return (value, &after_sep[consumed_len..]);
+            }
+            // Unicode upper bound ("¼–⅓ tsp").
+            if let Some((_, upper_rest)) = leading_unicode_fraction(after_sep) {
+                return (value, upper_rest);
             }
         }
     }
+    (value, rest)
+}
 
-    Some((first, after_first))
+/// Parse an ASCII upper bound at the start of `text`: an integer/decimal,
+/// optionally followed by a fraction (`1/3`). Returns its value and the
+/// consumed byte length.
+fn parse_upper_bound(text: &str) -> Option<(f64, usize)> {
+    let digits: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if parse_number_token(&digits).is_none() {
+        return None;
+    }
+    let mut consumed = digits.len();
+    let mut total: f64 = digits.parse().unwrap_or(0.0);
+    if let Some(after_slash) = text[consumed..].strip_prefix('/') {
+        let denominator: String = after_slash
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let denominator_len = denominator.len();
+        if let Ok(denominator) = denominator.parse::<f64>() {
+            if denominator != 0.0 {
+                if let Ok(numerator) = digits.parse::<f64>() {
+                    total = numerator / denominator;
+                }
+                consumed += 1 + denominator_len;
+            }
+        }
+    }
+    Some((total, consumed))
 }
 
 /// Unicode fraction at the very start of the text, plus the rest after it.
@@ -652,5 +964,230 @@ mod tests {
         assert_eq!(strip_leading_number("Step stays"), "Step stays");
         // A number with nothing after it is not a marker.
         assert_eq!(strip_leading_number("350"), "350");
+    }
+
+    // -------------------------------------------------------------------
+    // Real-world ingredient lines captured verbatim from recipe sites
+    // (WP Recipe Maker / Mediavine Create JSON-LD). These lock in the
+    // paren/range/entity handling against regressions.
+    // -------------------------------------------------------------------
+
+    /// Assert name and prep have balanced parens (the core regression check
+    /// shared with the live suite).
+    fn assert_balanced(ingredient: &Ingredient) {
+        let balance = |text: &str| {
+            let mut depth: i32 = 0;
+            for c in text.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "unbalanced ')' in {text:?}");
+            }
+            assert_eq!(depth, 0, "unbalanced '(' in {text:?}");
+        };
+        balance(&ingredient.name);
+        if let Some(prep) = &ingredient.prep {
+            balance(prep);
+        }
+    }
+
+    #[test]
+    fn doubled_note_wrapper_from_mediavine_create() {
+        // minimalistbaker.com, verbatim.
+        let i = parse_ingredient_line("1 small green chili ((optional // I used a serrano pepper // omit for less heat))");
+        assert_eq!(i.quantity, Some(1.0));
+        assert_eq!(i.unit, None);
+        assert_eq!(
+            i.name,
+            "small green chili (optional // I used a serrano pepper // omit for less heat)"
+        );
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn doubled_wrapper_becomes_prep() {
+        // minimalistbaker.com, verbatim.
+        let i = parse_ingredient_line("2 1/4 cups light coconut milk* ((canned is best))");
+        assert_eq!(i.quantity, Some(2.25));
+        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.name, "light coconut milk*");
+        assert_eq!(i.prep.as_deref(), Some("canned is best"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn metric_parens_stay_balanced_in_name() {
+        // rainbowplantlife.com, verbatim.
+        let i = parse_ingredient_line("1 pound (454g) sweet potatoes, (peeled and finely diced (see Note 3) )");
+        assert_eq!(i.quantity, Some(1.0));
+        assert_eq!(i.unit.as_deref(), Some("pound"));
+        assert_eq!(
+            i.name,
+            "(454g) sweet potatoes, (peeled and finely diced (see Note 3))"
+        );
+        assert_eq!(i.prep, None, "long note stays in the name, conservatively");
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn metric_paren_before_name_with_unit_after() {
+        // rainbowplantlife.com, verbatim: "1 (15-ounce/425g) can cannellini beans, (drained and rinsed)".
+        let i = parse_ingredient_line("1 (15-ounce/425g) can cannellini beans, (drained and rinsed)");
+        assert_eq!(i.quantity, Some(1.0));
+        assert_eq!(i.unit.as_deref(), Some("can"));
+        assert_eq!(i.name, "(15-ounce/425g) cannellini beans");
+        assert_eq!(i.prep.as_deref(), Some("drained and rinsed"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn unicode_fraction_quantity_with_metric_paren() {
+        // rainbowplantlife.com, verbatim.
+        let i = parse_ingredient_line("½ cup (128g) creamy peanut butter ((no sugar added) )");
+        assert_eq!(i.quantity, Some(0.5));
+        assert_eq!(i.unit.as_deref(), Some("cup"));
+        assert_eq!(i.name, "(128g) creamy peanut butter");
+        assert_eq!(i.prep.as_deref(), Some("no sugar added"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn wprm_comma_inside_parens_becomes_prep() {
+        // veganhuggs.com, verbatim: WP Recipe Maker writes "(, finely diced)".
+        let i = parse_ingredient_line("1 large onion (, finely diced)");
+        assert_eq!(i.quantity, Some(1.0));
+        assert_eq!(i.name, "large onion");
+        assert_eq!(i.prep.as_deref(), Some("finely diced"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn doubled_parens_with_nested_groups_stay_balanced() {
+        // veganhuggs.com, verbatim.
+        let i = parse_ingredient_line("12 cups fresh spinach ((loosely packed) rough chopped (about 14 oz))");
+        assert_eq!(i.quantity, Some(12.0));
+        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.name, "fresh spinach (loosely packed) rough chopped");
+        assert_eq!(i.prep.as_deref(), Some("about 14 oz"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn wprm_see_note_wrapper() {
+        // veganhuggs.com, verbatim.
+        let i = parse_ingredient_line("15 lasagna noodles ((*see note))");
+        assert_eq!(i.quantity, Some(15.0));
+        assert_eq!(i.name, "lasagna noodles");
+        assert_eq!(i.prep.as_deref(), Some("*see note"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn jar_size_stays_in_name() {
+        // veganhuggs.com, verbatim.
+        let i = parse_ingredient_line("2 25 ounce jars of marinara sauce (, a thicker variety (*see note))");
+        assert_eq!(i.quantity, Some(2.0));
+        assert_eq!(
+            i.name,
+            "25 ounce jars of marinara sauce, a thicker variety"
+        );
+        assert_eq!(i.prep.as_deref(), Some("*see note"));
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn unicode_range_consumes_upper_bound() {
+        // veganricha.com: "½–1 tsp" must not leave "1 tsp" in the name.
+        let i = parse_ingredient_line("½–1 tsp ground cumin");
+        assert_eq!(i.quantity, Some(0.5));
+        assert_eq!(i.unit.as_deref(), Some("tsp"));
+        assert_eq!(i.name, "ground cumin");
+    }
+
+    #[test]
+    fn unicode_range_with_fraction_upper_bound() {
+        // veganricha.com: "¼–⅓ tsp".
+        let i = parse_ingredient_line("¼–⅓ tsp cayenne (or Indian red chili powder)");
+        assert_eq!(i.quantity, Some(0.25));
+        assert_eq!(i.unit.as_deref(), Some("tsp"));
+        assert_eq!(i.name, "cayenne (or Indian red chili powder)");
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn ascii_fraction_upper_bound_is_fully_consumed() {
+        // The live veganricha.com line uses ASCII "1/3": consuming only the
+        // "1" used to leave "3 tsp cayenne" in the name.
+        let i = parse_ingredient_line("¼–1/3  tsp cayenne (or Indian red chili powder)");
+        assert_eq!(i.quantity, Some(0.25));
+        assert_eq!(i.unit.as_deref(), Some("tsp"));
+        assert_eq!(i.name, "cayenne (or Indian red chili powder)");
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn dash_fraction_shorthand_is_a_mixed_number() {
+        // "2-1/2 cups" conventionally means two and a half cups.
+        let i = parse_ingredient_line("2-1/2 cups flour");
+        assert_eq!(i.quantity, Some(2.5));
+        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.name, "flour");
+    }
+
+    #[test]
+    fn trailing_note_moves_to_prep() {
+        // veganricha.com: "2 tsp oil (divided)".
+        let i = parse_ingredient_line("2 tsp oil (divided)");
+        assert_eq!(i.quantity, Some(2.0));
+        assert_eq!(i.unit.as_deref(), Some("tsp"));
+        assert_eq!(i.name, "oil");
+        assert_eq!(i.prep.as_deref(), Some("divided"));
+    }
+
+    #[test]
+    fn can_size_parenthetical_after_unit() {
+        // forksoverknives.com, verbatim.
+        let i = parse_ingredient_line("1 can (6 ounces) tomato paste");
+        assert_eq!(i.quantity, Some(1.0));
+        assert_eq!(i.unit.as_deref(), Some("can"));
+        assert_eq!(i.name, "(6 ounces) tomato paste");
+        assert_balanced(&i);
+    }
+
+    #[test]
+    fn unbalanced_strays_are_dropped() {
+        // Safety net: any leftover fragment can never leak into the recipe.
+        let i = parse_ingredient_line("2 cups 454g) chopped tomatoes (see note");
+        assert_balanced(&i);
+        assert!(!i.name.contains(')') || i.name.contains('('));
+        assert!(!i.name.ends_with('('));
+    }
+
+    #[test]
+    fn normalize_parens_variants() {
+        assert_eq!(
+            normalize_parens("oil ((use refined))"),
+            "oil (use refined)"
+        );
+        assert_eq!(
+            normalize_parens("onion (, finely diced)"),
+            "onion, finely diced"
+        );
+        assert_eq!(
+            normalize_parens("salt ( to taste )"),
+            "salt (to taste)"
+        );
+        // Legit nesting survives.
+        assert_eq!(
+            normalize_parens("peppers, (diced (see Note 1) )"),
+            "peppers, (diced (see Note 1))"
+        );
+        // Doubled wrapper around multiple groups keeps one layer.
+        assert_eq!(
+            normalize_parens("spinach ((loosely packed) rough chopped)"),
+            "spinach (loosely packed) rough chopped"
+        );
     }
 }

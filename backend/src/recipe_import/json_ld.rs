@@ -125,7 +125,10 @@ fn parse_recipe(map: &serde_json::Map<String, Value>) -> SchemaRecipe {
         image: image_url(map.get("image")),
         author: author_name(map.get("author")),
         ingredients: string_list(map.get("recipeIngredient")),
-        instructions_raw: map.get("recipeInstructions").cloned(),
+        instructions_raw: map
+            .get("recipeInstructions")
+            .cloned()
+            .map(decode_entities_in_value),
         recipe_yield: value_to_joined_string(map.get("recipeYield")),
         prep_time: value_to_string(map.get("prepTime")),
         cook_time: value_to_string(map.get("cookTime")),
@@ -135,10 +138,90 @@ fn parse_recipe(map: &serde_json::Map<String, Value>) -> SchemaRecipe {
     }
 }
 
+/// Decode HTML entities (`&#39;`, `&amp;`, …) in every string of a JSON
+/// value. Recipe sites routinely leave them encoded inside JSON-LD text.
+fn decode_entities_in_value(value: Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(decode_html_entities(&s)),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(decode_entities_in_value).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, decode_entities_in_value(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Minimal HTML entity decoder: the common named entities plus decimal and
+/// hex numeric references. Unknown entities pass through untouched.
+pub fn decode_html_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if bytes[i] != b'&' {
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let Some(semi) = input[i..].find(';').map(|offset| i + offset) else {
+            out.push('&');
+            i += 1;
+            continue;
+        };
+        let entity = &input[i + 1..semi];
+        // Bound the reference length to something a real entity could have.
+        if entity.is_empty() || entity.len() > 10 {
+            out.push('&');
+            i += 1;
+            continue;
+        }
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some('\u{00a0}'),
+            _ => {
+                if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
+                    u32::from_str_radix(hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                } else if let Some(dec) = entity.strip_prefix('#') {
+                    dec.parse::<u32>()
+                        .ok()
+                        .and_then(char::from_u32)
+                } else {
+                    None
+                }
+            }
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                i = semi + 1;
+            }
+            None => {
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// String, array of strings or `{ "name": … }` → first meaningful string.
 pub(super) fn value_to_string(value: Option<&Value>) -> Option<String> {
     match value? {
-        Value::String(s) => non_empty(s.trim()),
+        Value::String(s) => non_empty(s.trim()).map(|s| decode_html_entities(&s)),
         Value::Array(items) => items.iter().find_map(|item| value_to_string(Some(item))),
         Value::Object(map) => ["name", "text", "url", "@id"]
             .iter()

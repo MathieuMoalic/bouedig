@@ -42,6 +42,11 @@ check:
     cargo check -p shared -p backend -p e2e-tests
     cargo check -p frontend-web --target wasm32-unknown-unknown
 
+# Run the live-URL recipe-import regression suite (network required).
+# The URL set lives in backend/tests/live_import.rs (LIVE_URLS).
+test-import-live:
+    cargo test -p backend --test live_import -- --ignored --test-threads=1 --nocapture
+
 # Build a release web bundle (used for production / reverse-proxy deploys).
 build-web:
     #!/usr/bin/env bash

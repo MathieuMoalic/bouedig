@@ -7,3 +7,4 @@
 result
 .env
 /.direnv/flake-inputs
+.zcode/

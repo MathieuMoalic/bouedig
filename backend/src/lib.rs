@@ -24,7 +24,10 @@ use sqlx::SqlitePool;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
-mod recipe_import;
+/// The web-recipe importer: fetch + JSON-LD/HTML extraction + normalization.
+/// Used by `POST /api/recipes/import`, the `import_check` bin and the live
+/// regression suite (`backend/tests/live_import.rs`).
+pub mod recipe_import;
 
 use recipe_import::{ImportError, RecipePreview};
 
@@ -1542,6 +1545,31 @@ pub(crate) mod tests {
         // 4. The grocery list is untouched by the import and the save.
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         assert_eq!(body.trim(), "[]", "grocery list must stay empty: {body}");
+    }
+
+    /// A dead recipe URL (noracooks.com/vegan-enchiladas returns exactly this
+    /// from its origin) fails with a clean client error, never a 500.
+    #[tokio::test]
+    async fn import_of_dead_url_is_a_clean_404_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let app = test_router_import().await;
+        let payload = serde_json::json!({ "url": format!("http://{addr}/vegan-enchiladas") }).to_string();
+        let (status, body) =
+            json_response(app, "POST", "/api/recipes/import", Some(&payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("404"), "{body}");
     }
 
     /// Redirect hops are followed to the final recipe page.
