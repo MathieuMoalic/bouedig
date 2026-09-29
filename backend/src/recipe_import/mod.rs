@@ -657,18 +657,22 @@ mod tests {
         // "1-2 jalapeño peppers, (diced (see Note 1) )"
         assert_eq!(recipe.ingredients[4].quantity, Some(1.0), "range lower bound");
         assert_eq!(recipe.ingredients[4].name, "jalapeño peppers");
-        // "4 cups (945 mL) low-sodium vegetable broth"
-        assert_eq!(recipe.ingredients[12].unit.as_deref(), Some("cup"));
+        // "4 cups (945 mL) low-sodium vegetable broth" — metric wins.
+        assert_eq!(recipe.ingredients[12].quantity, Some(945.0));
+        assert_eq!(recipe.ingredients[12].unit.as_deref(), Some("ml"));
         assert_eq!(
             recipe.ingredients[12].name,
-            "(945 mL) low-sodium vegetable broth"
+            "low-sodium vegetable broth"
         );
-        // "½ cup (128g) creamy peanut butter ((no sugar added) )"
-        assert_eq!(recipe.ingredients[15].name, "(128g) creamy peanut butter");
+        // "½ cup (128g) creamy peanut butter  ((no sugar added) )" — the
+        // exact metric alternate wins over converting the imperial primary.
+        assert_eq!(recipe.ingredients[15].quantity, Some(128.0));
+        assert_eq!(recipe.ingredients[15].unit.as_deref(), Some("g"));
+        assert_eq!(recipe.ingredients[15].name, "creamy peanut butter");
         assert_eq!(recipe.ingredients[15].prep.as_deref(), Some("no sugar added"));
         // "1 (15-ounce/425g)  can cannellini beans, (drained and rinsed)"
         assert_eq!(recipe.ingredients[16].unit.as_deref(), Some("can"));
-        assert_eq!(recipe.ingredients[16].name, "(15-ounce/425g) cannellini beans");
+        assert_eq!(recipe.ingredients[16].name, "(425g) cannellini beans");
         assert_eq!(recipe.ingredients[16].prep.as_deref(), Some("drained and rinsed"));
         for ingredient in &recipe.ingredients {
             balanced(ingredient);
@@ -682,9 +686,9 @@ mod tests {
         let (recipe, _) = extract_fixture("wprm_doubled_parens.html");
         assert_eq!(recipe.name, "1-Pot Lentil Green Curry");
         assert_eq!(recipe.yield_amount, "4");
-        // "2 1/4 cups light coconut milk*  ((canned is best))"
-        assert_eq!(recipe.ingredients[6].quantity, Some(2.25));
-        assert_eq!(recipe.ingredients[6].unit.as_deref(), Some("cup"));
+        // "2 1/4 cups light coconut milk*  ((canned is best))" → 540 ml.
+        assert_eq!(recipe.ingredients[6].quantity, Some(540.0));
+        assert_eq!(recipe.ingredients[6].unit.as_deref(), Some("ml"));
         assert_eq!(recipe.ingredients[6].name, "light coconut milk*");
         assert_eq!(recipe.ingredients[6].prep.as_deref(), Some("canned is best"));
         // "1 cup green lentils* ((well rinsed and drained))"
@@ -708,7 +712,9 @@ mod tests {
         assert_eq!(recipe.ingredients[9].name, "Salt");
         assert_eq!(recipe.ingredients[9].prep.as_deref(), Some("to taste"));
         // "12 cups fresh spinach ((loosely packed) rough chopped (about 14 oz))"
-        assert_eq!(recipe.ingredients[8].quantity, Some(12.0));
+        // → 12 cups convert to 2.9 l.
+        assert_eq!(recipe.ingredients[8].quantity, Some(2.9));
+        assert_eq!(recipe.ingredients[8].unit.as_deref(), Some("l"));
         assert_eq!(
             recipe.ingredients[8].name,
             "fresh spinach (loosely packed) rough chopped"

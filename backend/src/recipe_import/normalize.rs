@@ -170,7 +170,7 @@ const UNITS: &[&str] = &[
     "g", "gram", "grams", "kg", "kilogram", "kilograms",
     // metric volume
     "ml", "milliliter", "milliliters", "millilitre", "millilitres", "l", "liter",
-    "liters", "litre", "litres", "dl", "cl",
+    "litres", "dl", "cl",
     // imperial weight
     "oz", "ounce", "ounces", "lb", "lbs", "pound", "pounds",
     // us volume
@@ -226,6 +226,10 @@ const PREP_PHRASES: &[&str] = &[
 
 /// Parse one raw ingredient line into the structured model. When anything is
 /// uncertain the whole (cleaned) line is kept as `name` — nothing invented.
+///
+/// Metric preference: when a line carries both systems ("1 lb (454g)
+/// potatoes", "4 cups (945 mL) broth", "1 can (15-ounce/425g) beans") the
+/// metric reading wins and the imperial text is dropped or converted.
 pub fn parse_ingredient_line(line: &str) -> Ingredient {
     let line = normalize_parens(&clean_text(line));
     if line.is_empty() {
@@ -253,13 +257,13 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
     };
 
     let mut remainder = main.trim().to_string();
-    let quantity = parse_leading_quantity(&mut remainder);
+    let mut quantity = parse_leading_quantity(&mut remainder);
     // Eat the whitespace between the quantity and the unit ("1.5 l stock").
     let remainder_trimmed = remainder.trim_start().to_string();
 
-    // A leading metric parenthetical ("(454g) sweet potatoes") must not block
-    // unit detection: skip over it, keep it in the name.
-    let (unit, remainder) = if remainder_trimmed.starts_with('(') {
+    // A leading parenthetical with a digit ("(454g) sweet potatoes") must not
+    // block unit detection: skip over it, keep it in the name.
+    let (mut unit, mut remainder) = if remainder_trimmed.starts_with('(') {
         match leading_group(&remainder_trimmed) {
             Some((group, after_group)) if group_content_has_digit(group) => {
                 let after_group_trim = after_group.trim_start();
@@ -279,6 +283,48 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
             None => (None, remainder_trimmed.clone()),
         }
     };
+
+    let mut remainder = remainder.trim_start().to_string();
+    // Metric preference (1): an imperial main unit with a metric alternate
+    // group ("1 pound (454g) sweet potatoes") becomes 454 g — the group and
+    // the imperial unit disappear.
+    let imperial_main = unit.as_deref().is_some_and(is_imperial_unit) && quantity.is_some();
+    if imperial_main && remainder.starts_with('(') {
+        if let Some((group, after_group)) = leading_group(&remainder) {
+            if let Some((alt_qty, alt_unit)) =
+                parse_alt_metric_quantity(strip_outer_parens(group))
+            {
+                quantity = Some(alt_qty);
+                unit = Some(alt_unit);
+                remainder = after_group.trim_start().to_string();
+            }
+        }
+    }
+
+    // Metric preference (2): an imperial main unit with no alternate converts
+    // directly ("2 lb potatoes" → 907 g). tsp/tbsp stay — even metric
+    // cookbooks measure small volumes that way.
+    if unit.as_deref().is_some_and(is_imperial_unit) {
+        if let (Some(q), Some(u)) = (quantity, unit.clone()) {
+            if let Some((metric_qty, metric_unit)) = to_metric(q, &u) {
+                quantity = Some(metric_qty);
+                unit = Some(metric_unit);
+            }
+        }
+    }
+
+    // Metric preference (3): imperial fragments inside a kept group
+    // ("(15-ounce/425g)" → "(425g)", "(6 ounces)" → "(170g)") are stripped or
+    // converted so stored names never show them.
+    if let Some((group, _)) = leading_group(&remainder) {
+        if group_content_has_digit(group) {
+            let content = strip_outer_parens(group);
+            let cleaned = strip_imperial_in_group(content);
+            if cleaned != content {
+                remainder = remainder.replacen(group, &format!("({cleaned})"), 1);
+            }
+        }
+    }
 
     let mut name = strip_unbalanced_parens(remainder.trim());
     let mut prep = prep;
@@ -804,6 +850,126 @@ fn canonical_unit(unit: &str) -> String {
 /// Whether a raw line reads like it was meant to carry a quantity (a leading
 /// number, fraction or "a/an <unit>"). Used to distinguish "salt, to taste"
 /// (fine without a quantity) from "1.2.3 potatoes" (a failed parse).
+/// Imperial units the metric preference applies to. tsp/tbsp deliberately
+/// stay — small volumes are measured that way in metric kitchens too.
+fn is_imperial_unit(unit: &str) -> bool {
+    matches!(
+        unit,
+        "cup" | "lb" | "oz" | "pint" | "quart" | "gallon" | "fl oz" | "floz" | "inch"
+    )
+}
+
+/// Convert an imperial quantity to metric (grams or millilitres), rounded
+/// for display: whole numbers at 10+, one decimal below.
+fn to_metric(quantity: f64, unit: &str) -> Option<(f64, String)> {
+    let (converted, metric_unit): (f64, &str) = match canonical_unit(unit).as_str() {
+        "lb" => (quantity * 453.592, "g"),
+        "oz" => (quantity * 28.3495, "g"),
+        "cup" => (quantity * 240.0, "ml"),
+        "pint" => (quantity * 473.176, "ml"),
+        "quart" => (quantity * 946.353, "ml"),
+        "gallon" => (quantity * 3785.41, "ml"),
+        "fl oz" | "floz" => (quantity * 29.5735, "ml"),
+        "inch" => (quantity * 2.54, "cm"),
+        _ => return None,
+    };
+    // Large millilitre volumes read better in litres (2880 ml → 2.9 l).
+    let (value, metric_unit) = if metric_unit == "ml" && converted >= 1000.0 {
+        (converted / 1000.0, "l")
+    } else {
+        (converted, metric_unit)
+    };
+    Some((round_metric(value), metric_unit.to_string()))
+}
+
+fn round_metric(value: f64) -> f64 {
+    if value >= 20.0 {
+        value.round()
+    } else if value >= 1.0 {
+        (value * 10.0).round() / 10.0
+    } else {
+        (value * 100.0).round() / 100.0
+    }
+}
+
+/// Parse a group content that is entirely a metric alternate quantity —
+/// "454g", "945 mL", "90-100g", "1 1/2 kg" — into (quantity, unit) with the
+/// unit normalized to g/ml. Mixed or imperial content ("15-ounce/425g",
+/// "6 ounces") does not qualify.
+fn parse_alt_metric_quantity(content: &str) -> Option<(f64, String)> {
+    let trimmed = content.trim();
+    let lowered = trimmed.to_lowercase();
+    // Longest suffix first so "kg" wins over "g".
+    for unit in ["kg", "ml", "cl", "dl", "g", "l"] {
+        let Some(prefix) = lowered.strip_suffix(unit) else {
+            continue;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.is_empty() || !prefix.ends_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        // The whole prefix must be a quantity (number/fraction/range).
+        let (value, rest) = scan_quantity(prefix)?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        let (factor, canonical): (f64, &str) = match unit {
+            "kg" => (1000.0, "g"),
+            "cl" => (10.0, "ml"),
+            "dl" => (100.0, "ml"),
+            "l" => (1000.0, "ml"),
+            _ => (1.0, unit),
+        };
+        return Some((round_metric(value * factor), canonical.to_string()));
+    }
+    None
+}
+
+/// Remove (or convert) imperial fragments from a parenthetical that stays in
+/// the name: "15-ounce/425g" → "425g", "6 ounces" → "170g".
+fn strip_imperial_in_group(content: &str) -> String {
+    let imperial_word =
+        |part: &str| matches!(part, p if p.to_lowercase().split(|c: char| !c.is_ascii_alphabetic()).any(|word| matches!(word, "oz" | "ounce" | "ounces" | "lb" | "lbs" | "pound" | "pounds" | "cup" | "cups" | "pint" | "quart" | "gallon" | "inch" | "floz" | "fl")));
+    let parts: Vec<&str> = content.split('/').collect();
+    let metric_parts: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|part| !imperial_word(part))
+        .collect();
+    if metric_parts.len() < parts.len() && !metric_parts.is_empty() {
+        // Some parts were imperial: keep the metric remainder.
+        return metric_parts.join("/");
+    }
+    if parts.len() == 1 && imperial_word(content) {
+        // Pure imperial ("6 ounces"): convert to metric grams.
+        if let Some((value, rest)) = scan_quantity(content.trim()) {
+            if rest.trim().is_empty() || rest.trim().len() <= 8 {
+                if let Some((metric_qty, metric_unit)) =
+                    to_metric(value, unit_word(rest))
+                {
+                    return format!("{}{}", round_metric(metric_qty), metric_unit);
+                }
+            }
+        }
+    }
+    content.to_string()
+}
+
+/// The unit word inside a leftover fragment (" ounces" → "oz"…), if any.
+fn unit_word(rest: &str) -> &str {
+    let lowered = rest.trim().to_lowercase();
+    for candidate in [
+        "fl oz", "floz", "ounce", "ounces", "oz", "pound", "pounds", "lb",
+        "lbs", "cup", "cups", "pint", "pints", "quart", "quarts", "gallon",
+        "gallons", "inch", "inches",
+    ] {
+        if lowered.contains(candidate) {
+            return candidate;
+        }
+    }
+    ""
+}
+
 pub fn looks_quantified(line: &str) -> bool {
     let line = line.trim_start();
     let Some(first) = line.chars().next() else {
@@ -825,15 +991,14 @@ mod tests {
 
     #[test]
     fn units_are_canonicalized() {
-        // Spelled-out and plural forms fold onto the short canonical unit.
+        // Spelled-out forms fold onto the short canonical unit. Imperial
+        // units (cup/lb/oz) convert to metric instead — see
+        // imperial_units_convert_to_metric below.
         for (line, expected) in [
             ("2 tablespoons olive oil", "tbsp"),
             ("2 tablespoon olive oil", "tbsp"),
             ("1 teaspoon salt", "tsp"),
-            ("4 ounces chocolate", "oz"),
-            ("8 cups water", "cup"),
             ("200 grams flour", "g"),
-            ("1 pound butter", "lb"),
             ("500 milliliters milk", "ml"),
         ] {
             let parsed = parse_ingredient_line(line);
@@ -851,10 +1016,12 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn unicode_fraction() {
+        // ½ cup converts to 120 ml.
         let i = parse_ingredient_line("½ cup milk");
-        assert_eq!(i.quantity, Some(0.5));
-        assert_eq!(i.unit.as_deref(), Some("cup"));
+        assert_eq!(i.quantity, Some(120.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
         assert_eq!(i.name, "milk");
 
         let i = parse_ingredient_line("¾ tsp salt");
@@ -862,29 +1029,34 @@ mod tests {
         assert_eq!(i.unit.as_deref(), Some("tsp"));
 
         let i = parse_ingredient_line("¼ cup sugar");
-        assert_eq!(i.quantity, Some(0.25));
+        assert_eq!(i.quantity, Some(60.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
     }
 
     #[test]
     fn ascii_and_mixed_fractions() {
         let i = parse_ingredient_line("1/2 cup butter");
-        assert_eq!(i.quantity, Some(0.5));
+        assert_eq!(i.quantity, Some(120.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
         assert_eq!(i.name, "butter");
 
         let i = parse_ingredient_line("1 1/2 cups all-purpose flour");
-        assert_eq!(i.quantity, Some(1.5));
-        assert_eq!(i.unit.as_deref(), Some("cup"));
+        assert_eq!(i.quantity, Some(360.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
         assert_eq!(i.name, "all-purpose flour");
 
         let i = parse_ingredient_line("1½ cups sugar");
-        assert_eq!(i.quantity, Some(1.5));
+        assert_eq!(i.quantity, Some(360.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
     }
 
     #[test]
     fn decimals_and_european_separators() {
         let i = parse_ingredient_line("1.5 cups water");
-        assert_eq!(i.quantity, Some(1.5));
+        assert_eq!(i.quantity, Some(360.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
         let i = parse_ingredient_line("1,5 l stock");
+        // Litres are already metric: no conversion.
         assert_eq!(i.quantity, Some(1.5));
         assert_eq!(i.unit.as_deref(), Some("l"));
     }
@@ -1081,8 +1253,8 @@ mod tests {
     fn doubled_wrapper_becomes_prep() {
         // minimalistbaker.com, verbatim.
         let i = parse_ingredient_line("2 1/4 cups light coconut milk* ((canned is best))");
-        assert_eq!(i.quantity, Some(2.25));
-        assert_eq!(i.unit.as_deref(), Some("cup"));
+        assert_eq!(i.quantity, Some(540.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
         assert_eq!(i.name, "light coconut milk*");
         assert_eq!(i.prep.as_deref(), Some("canned is best"));
         assert_balanced(&i);
@@ -1090,13 +1262,14 @@ mod tests {
 
     #[test]
     fn metric_parens_stay_balanced_in_name() {
-        // rainbowplantlife.com, verbatim.
+        // rainbowplantlife.com, verbatim: imperial main + metric alternate —
+        // the metric value wins and the imperial text disappears.
         let i = parse_ingredient_line("1 pound (454g) sweet potatoes, (peeled and finely diced (see Note 3) )");
-        assert_eq!(i.quantity, Some(1.0));
-        assert_eq!(i.unit.as_deref(), Some("lb"));
+        assert_eq!(i.quantity, Some(454.0));
+        assert_eq!(i.unit.as_deref(), Some("g"));
         assert_eq!(
             i.name,
-            "(454g) sweet potatoes, (peeled and finely diced (see Note 3))"
+            "sweet potatoes, (peeled and finely diced (see Note 3))"
         );
         assert_eq!(i.prep, None, "long note stays in the name, conservatively");
         assert_balanced(&i);
@@ -1104,22 +1277,25 @@ mod tests {
 
     #[test]
     fn metric_paren_before_name_with_unit_after() {
-        // rainbowplantlife.com, verbatim: "1 (15-ounce/425g) can cannellini beans, (drained and rinsed)".
+        // rainbowplantlife.com, verbatim: "1 (15-ounce/425g) can cannellini
+        // beans, (drained and rinsed)". The can count stays; the imperial
+        // fragment inside the group is stripped.
         let i = parse_ingredient_line("1 (15-ounce/425g) can cannellini beans, (drained and rinsed)");
         assert_eq!(i.quantity, Some(1.0));
         assert_eq!(i.unit.as_deref(), Some("can"));
-        assert_eq!(i.name, "(15-ounce/425g) cannellini beans");
+        assert_eq!(i.name, "(425g) cannellini beans");
         assert_eq!(i.prep.as_deref(), Some("drained and rinsed"));
         assert_balanced(&i);
     }
-
     #[test]
     fn unicode_fraction_quantity_with_metric_paren() {
-        // rainbowplantlife.com, verbatim.
+        // rainbowplantlife.com, verbatim: an exact metric alternate wins over
+        // converting the imperial primary (128 g is the author's precise
+        // value).
         let i = parse_ingredient_line("½ cup (128g) creamy peanut butter ((no sugar added) )");
-        assert_eq!(i.quantity, Some(0.5));
-        assert_eq!(i.unit.as_deref(), Some("cup"));
-        assert_eq!(i.name, "(128g) creamy peanut butter");
+        assert_eq!(i.quantity, Some(128.0));
+        assert_eq!(i.unit.as_deref(), Some("g"));
+        assert_eq!(i.name, "creamy peanut butter");
         assert_eq!(i.prep.as_deref(), Some("no sugar added"));
         assert_balanced(&i);
     }
@@ -1136,10 +1312,10 @@ mod tests {
 
     #[test]
     fn doubled_parens_with_nested_groups_stay_balanced() {
-        // veganhuggs.com, verbatim.
+        // veganhuggs.com, verbatim: 12 cups → 2.9 l.
         let i = parse_ingredient_line("12 cups fresh spinach ((loosely packed) rough chopped (about 14 oz))");
-        assert_eq!(i.quantity, Some(12.0));
-        assert_eq!(i.unit.as_deref(), Some("cup"));
+        assert_eq!(i.quantity, Some(2.9));
+        assert_eq!(i.unit.as_deref(), Some("l"));
         assert_eq!(i.name, "fresh spinach (loosely packed) rough chopped");
         assert_eq!(i.prep.as_deref(), Some("about 14 oz"));
         assert_balanced(&i);
@@ -1200,10 +1376,10 @@ mod tests {
 
     #[test]
     fn dash_fraction_shorthand_is_a_mixed_number() {
-        // "2-1/2 cups" conventionally means two and a half cups.
+        // "2-1/2 cups" conventionally means two and a half cups (2.5 → 600 ml).
         let i = parse_ingredient_line("2-1/2 cups flour");
-        assert_eq!(i.quantity, Some(2.5));
-        assert_eq!(i.unit.as_deref(), Some("cup"));
+        assert_eq!(i.quantity, Some(600.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
         assert_eq!(i.name, "flour");
     }
 
@@ -1219,13 +1395,34 @@ mod tests {
 
     #[test]
     fn can_size_parenthetical_after_unit() {
-        // forksoverknives.com, verbatim.
+        // forksoverknives.com, verbatim: pure-imperial group converts.
         let i = parse_ingredient_line("1 can (6 ounces) tomato paste");
         assert_eq!(i.quantity, Some(1.0));
         assert_eq!(i.unit.as_deref(), Some("can"));
-        assert_eq!(i.name, "(6 ounces) tomato paste");
+        assert_eq!(i.name, "(170g) tomato paste");
         assert_balanced(&i);
     }
+
+    #[test]
+    #[test]
+    fn imperial_units_convert_to_metric() {
+        let i = parse_ingredient_line("2 lb potatoes");
+        assert_eq!(i.quantity, Some(907.0));
+        assert_eq!(i.unit.as_deref(), Some("g"));
+        assert_eq!(i.name, "potatoes");
+
+        let i = parse_ingredient_line("4 cups water");
+        assert_eq!(i.quantity, Some(960.0));
+        assert_eq!(i.unit.as_deref(), Some("ml"));
+
+        // tsp/tbsp stay — small volumes are measured that way everywhere.
+        let i = parse_ingredient_line("2 tbsp olive oil");
+        assert_eq!(i.unit.as_deref(), Some("tbsp"));
+        let i = parse_ingredient_line("1 tsp salt");
+        assert_eq!(i.unit.as_deref(), Some("tsp"));
+    }
+
+
 
     #[test]
     fn unbalanced_strays_are_dropped() {

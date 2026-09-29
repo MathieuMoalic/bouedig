@@ -780,17 +780,22 @@ ol.instruction-list li {
     flex-shrink: 0;
 }
 
-/* auto basis: shrink cost is shared with prep; without it a long prep text
-   (min-width forced) starves the zero-basis name down to ~2 chars/line. */
-.ing-name {
+/* Name and prep stack in one column so rows stay compact. */
+.ing-main {
     flex: 1 1 auto;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.ing-name {
     overflow-wrap: anywhere;
 }
 
 .ing-prep-text {
     color: var(--muted);
-    min-width: 0;
+    font-size: 13px;
     overflow-wrap: anywhere;
 }
 
