@@ -19,8 +19,8 @@ pub struct ScoreInput<'a> {
     pub html_ingredient_count: Option<usize>,
     /// The page provided no structured data at all.
     pub html_only: bool,
-    /// How many ingredient lines carried no parsable quantity.
-    pub ingredients_without_quantity: usize,
+    /// Names of the ingredient lines whose quantity could not be parsed.
+    pub ingredients_without_quantity: Vec<String>,
 }
 
 pub fn score(input: &ScoreInput<'_>) -> ExtractionScore {
@@ -50,13 +50,26 @@ pub fn score(input: &ScoreInput<'_>) -> ExtractionScore {
                 "unusual ingredient count ({ingredient_count}) — please review"
             ));
         }
-        if input.ingredients_without_quantity > 0 {
-            warnings.push(format!(
-                "{} ingredient quantities could not be parsed",
-                input.ingredients_without_quantity
-            ));
-        } else {
+        if input.ingredients_without_quantity.is_empty() {
             confidence += 0.05;
+        } else {
+            // Name the offending lines so the user can fix them directly.
+            let names = &input.ingredients_without_quantity;
+            let mut message = if names.len() == 1 {
+                "ingredient quantity could not be parsed".to_string()
+            } else {
+                format!(
+                    "{} ingredient quantities could not be parsed",
+                    names.len()
+                )
+            };
+            let shown: Vec<String> = names.iter().take(3).map(|n| format!("\"{n}\"")).collect();
+            message.push_str(": ");
+            message.push_str(&shown.join(", "));
+            if names.len() > 3 {
+                message.push_str(&format!(" and {} more", names.len() - 3));
+            }
+            warnings.push(message);
         }
     }
 
@@ -132,7 +145,7 @@ mod tests {
             from_json_ld: true,
             html_ingredient_count: Some(5),
             html_only: false,
-            ingredients_without_quantity: 0,
+            ingredients_without_quantity: Vec::new(),
         });
         assert!(result.confidence >= 0.9, "confidence {}", result.confidence);
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
@@ -155,7 +168,7 @@ mod tests {
             from_json_ld: false,
             html_ingredient_count: None,
             html_only: true,
-            ingredients_without_quantity: 0,
+            ingredients_without_quantity: Vec::new(),
         });
         assert!(result.confidence < 0.3);
         let joined = result.warnings.join("; ");
@@ -179,12 +192,36 @@ mod tests {
             from_json_ld: true,
             html_ingredient_count: None,
             html_only: false,
-            ingredients_without_quantity: 2,
+            ingredients_without_quantity: vec!["salt".into(), "pepper".into()],
         });
         let joined = result.warnings.join("; ");
         assert!(
             joined.contains("2 ingredient quantities could not be parsed"),
             "{joined}"
         );
+        assert!(joined.contains("\"salt\""), "{joined}");
+        assert!(joined.contains("\"pepper\""), "{joined}");
+    }
+
+    #[test]
+    fn unparsed_quantities_name_the_lines() {
+        let mut recipe = base_recipe();
+        for ingredient in recipe.ingredients.iter_mut().take(5) {
+            ingredient.quantity = None;
+        }
+        let result = score(&ScoreInput {
+            recipe: &recipe,
+            from_json_ld: true,
+            html_ingredient_count: None,
+            html_only: false,
+            ingredients_without_quantity: (0..5).map(|i| format!("line {i}")).collect(),
+        });
+        let joined = result.warnings.join("; ");
+        assert!(
+            joined.contains("5 ingredient quantities could not be parsed"),
+            "{joined}"
+        );
+        assert!(joined.contains("\"line 2\""), "{joined}");
+        assert!(joined.contains("and 2 more"), "{joined}");
     }
 }

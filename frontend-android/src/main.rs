@@ -2390,7 +2390,8 @@ mod tests {
         assert_eq!(levenshtein_distance("é", ""), 1);
         assert_eq!(levenshtein_distance("", "é"), 1);
         assert_eq!(levenshtein_distance("éé", "ée"), 1);
-        assert_eq!(levenshtein_distance("œuf", "oeuf"), 1);
+        // œ -> o,e is a substitution plus an insertion: true distance 2.
+        assert_eq!(levenshtein_distance("œuf", "oeuf"), 2);
     }
 
     #[test]

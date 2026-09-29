@@ -1109,6 +1109,51 @@ ol.instruction-list li {
 .import-warnings ul {
     margin: 0;
     padding-left: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.warning-jump {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    text-decoration: underline dotted rgba(229, 115, 115, 0.6);
+    text-underline-offset: 3px;
+}
+
+.warning-jump:hover {
+    text-decoration-style: solid;
+}
+
+.warning-jump .warning-arrow {
+    margin-left: auto;
+    opacity: 0.7;
+}
+
+/* Warnings flash what they refer to; the animation runs once per click
+   (do_jump forces a reflow so re-clicking restarts it). */
+@keyframes row-flash {
+    0%, 30% {
+        background: rgba(230, 178, 90, 0.3);
+        box-shadow: inset 3px 0 0 #e6b25a;
+    }
+    100% {
+        background: transparent;
+        box-shadow: inset 3px 0 0 transparent;
+    }
+}
+
+.row-flash {
+    animation: row-flash 1.8s ease 1;
 }
 
 .warnings-dismiss {

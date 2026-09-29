@@ -66,11 +66,12 @@ pub async fn import(raw_url: &str, allow_private: bool) -> Result<RecipePreview,
         ));
     }
 
-    let ingredients_without_quantity = recipe
+    let ingredients_without_quantity: Vec<String> = recipe
         .ingredients
         .iter()
         .filter(|i| i.quantity.is_none())
-        .count();
+        .map(|i| i.name.clone())
+        .collect();
 
     let extraction_score = score::score(&score::ScoreInput {
         recipe: &recipe,
@@ -604,7 +605,7 @@ mod tests {
             from_json_ld: true,
             html_ingredient_count: None,
             html_only: false,
-            ingredients_without_quantity: 0,
+            ingredients_without_quantity: Vec::new(),
         });
         let joined = extraction_score.warnings.join("; ");
         assert!(joined.contains("recipe has no ingredients"));

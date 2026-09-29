@@ -619,6 +619,103 @@ struct ImportPreview {
     warnings: Vec<String>,
 }
 
+/// Where a warning can take the user in the form below.
+#[derive(Clone, Debug, PartialEq)]
+enum JumpTarget {
+    /// The ingredient rows whose text contains each name.
+    IngredientRows(Vec<String>),
+    /// A form element by id.
+    Field(&'static str),
+}
+
+/// Map a warning to the form element(s) that let the user fix it.
+/// `None` = informational only (nothing to jump to).
+fn jump_target_for(warning: &str, ingredients: &[Ingredient]) -> Option<JumpTarget> {
+    if warning.contains("could not be parsed") {
+        // Exactly the lines the backend counted: no parsed quantity.
+        let names: Vec<String> = ingredients
+            .iter()
+            .filter(|i| i.quantity.is_none())
+            .map(|i| i.name.clone())
+            .collect();
+        return (!names.is_empty()).then_some(JumpTarget::IngredientRows(names));
+    }
+    if warning.contains("no yield") {
+        return Some(JumpTarget::Field("recipe-yield"));
+    }
+    if warning.contains("no instructions") {
+        return Some(JumpTarget::Field("step-rows"));
+    }
+    if warning.contains("no ingredients") {
+        return Some(JumpTarget::Field("ingredient-rows"));
+    }
+    if warning.contains("no name") {
+        return Some(JumpTarget::Field("recipe-name"));
+    }
+    None
+}
+
+/// Scroll to and flash whatever the warning points at. The flash is a CSS
+/// animation (no timer needed); rewriting the class attribute after a reflow
+/// makes repeated clicks restart it.
+fn do_jump(target: &JumpTarget) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let flash = |element: &web_sys::Element| {
+        let existing = element.get_attribute("class").unwrap_or_default();
+        let stripped = existing
+            .split_whitespace()
+            .filter(|class| *class != "row-flash")
+            .collect::<Vec<_>>()
+            .join(" ");
+        element
+            .set_attribute("class", &stripped)
+            .expect("class attribute");
+        if let Ok(html) = element.clone().dyn_into::<web_sys::HtmlElement>() {
+            // Reading a layout property forces the reflow.
+            let _ = html.offset_width();
+        }
+        let updated = if stripped.is_empty() {
+            "row-flash".to_string()
+        } else {
+            format!("{stripped} row-flash")
+        };
+        element
+            .set_attribute("class", &updated)
+            .expect("class attribute");
+    };
+    match target {
+        JumpTarget::Field(id) => {
+            if let Some(element) = document.get_element_by_id(id) {
+                flash(&element);
+                element.scroll_into_view();
+            }
+        }
+        JumpTarget::IngredientRows(names) => {
+            let Ok(rows) = document.query_selector_all(".ingredient-row") else {
+                return;
+            };
+            let mut first: Option<web_sys::Element> = None;
+            for i in 0..rows.length() {
+                let Some(Ok(row)) =
+                    rows.get(i).map(|node| node.dyn_into::<web_sys::Element>())
+                else {
+                    continue;
+                };
+                let text = row.text_content().unwrap_or_default();
+                if names.iter().any(|name| text.contains(name)) {
+                    flash(&row);
+                    first.get_or_insert(row);
+                }
+            }
+            if let Some(row) = first {
+                row.scroll_into_view();
+            }
+        }
+    }
+}
+
 /// URL → fetch preview → review/edit in the existing recipe form → save.
 /// The imported recipe is never saved without an explicit user action.
 #[component]
@@ -726,7 +823,13 @@ fn ImportRecipe() -> Element {
                 }
             }
         },
-        Some(p) => rsx! {
+        Some(p) => {
+            let warning_items: Vec<(&String, Option<JumpTarget>)> = p
+                .warnings
+                .iter()
+                .map(|warning| (warning, jump_target_for(warning, &p.recipe.ingredients)))
+                .collect();
+            rsx! {
             div { class: "page",
                 div { class: "card import-summary", id: "import-summary",
                     div { class: "import-summary-head",
@@ -743,10 +846,23 @@ fn ImportRecipe() -> Element {
                                 onclick: move |_| show_warnings.set(false),
                                 IconX {}
                             }
-                            p { "The extraction was incomplete — please review:" }
-                            ul {
-                                for warning in &p.warnings {
-                                    li { "{warning}" }
+                            p { "The extraction was incomplete — tap a warning to jump to it:" }
+                            ul { class: "warning-list",
+                                for (warning, target) in warning_items {
+                                    li {
+                                        if let Some(target) = target {
+                                            button {
+                                                class: "warning-jump",
+                                                r#type: "button",
+                                                title: "Show it in the form",
+                                                onclick: move |_| do_jump(&target),
+                                                span { class: "warning-text", "{warning}" }
+                                                span { class: "warning-arrow", "↓" }
+                                            }
+                                        } else {
+                                            span { class: "warning-text", "{warning}" }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -767,6 +883,7 @@ fn ImportRecipe() -> Element {
                     initial: import_preview_to_detail(&p),
                     editing_id: None,
                 }
+            }
             }
         },
     }
@@ -2588,7 +2705,8 @@ mod tests {
         assert_eq!(levenshtein_distance("é", ""), 1);
         assert_eq!(levenshtein_distance("", "é"), 1);
         assert_eq!(levenshtein_distance("éé", "ée"), 1);
-        assert_eq!(levenshtein_distance("œuf", "oeuf"), 1);
+        // œ -> o,e is a substitution plus an insertion: true distance 2.
+        assert_eq!(levenshtein_distance("œuf", "oeuf"), 2);
         // Same byte length but different characters.
         assert_eq!(levenshtein_distance(" café", " café"), 0);
     }
@@ -2643,9 +2761,60 @@ mod tests {
     fn test_rank_suggestions_unicode_needle() {
         let past = vec!["café".to_string(), "thé".to_string()];
         let result = rank_suggestions("cafe", &past);
-        // "café" is 1 edit away from "cafe", "thé" is 3 from "cafe".
-        assert_eq!(result.len(), 2);
+        // "café" is 1 edit away from "cafe"; "thé" is 4 edits away and is
+        // correctly filtered out by the max-3 bound.
+        assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "café");
         assert_eq!(result[0].1, 1);
+    }
+
+    #[test]
+    fn test_jump_target_for_maps_warnings_to_form_elements() {
+        let no_qty = Ingredient {
+            quantity: None,
+            unit: None,
+            name: "salt".into(),
+            prep: None,
+            section: None,
+        };
+        let with_qty = Ingredient {
+            quantity: Some(1.0),
+            unit: None,
+            name: "eggs".into(),
+            prep: None,
+            section: None,
+        };
+        let ingredients = vec![with_qty, no_qty];
+
+        // A quantity warning targets the ingredient rows that lack one.
+        match jump_target_for(
+            "2 ingredient quantities could not be parsed: \"salt\"",
+            &ingredients,
+        ) {
+            Some(JumpTarget::IngredientRows(names)) => {
+                assert_eq!(names, vec!["salt".to_string()]);
+            }
+            other => panic!("expected ingredient rows, got {other:?}"),
+        }
+        // Field warnings target their inputs/lists.
+        assert_eq!(
+            jump_target_for("recipe has no yield", &ingredients),
+            Some(JumpTarget::Field("recipe-yield"))
+        );
+        assert_eq!(
+            jump_target_for("recipe has no instructions", &ingredients),
+            Some(JumpTarget::Field("step-rows"))
+        );
+        assert_eq!(
+            jump_target_for("recipe has no ingredients", &ingredients),
+            Some(JumpTarget::Field("ingredient-rows"))
+        );
+        // Informational warnings have no jump target.
+        assert_eq!(
+            jump_target_for("recipe was recovered from HTML instead of structured data", &ingredients),
+            None
+        );
+        // A quantity warning with nothing left unmatched has no target.
+        assert_eq!(jump_target_for("could not be parsed", &[]), None);
     }
 }
