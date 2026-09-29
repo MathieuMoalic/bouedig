@@ -759,16 +759,87 @@ fn split_leading_unit(text: &str) -> Option<(String, &str)> {
             let after = after.strip_prefix('.').unwrap_or(after);
             // Must be followed by whitespace/end: "cups" yes, "cupcake" no.
             if after.is_empty() || after.starts_with(char::is_whitespace) {
-                return Some((unit.to_string(), after));
+                return Some((canonical_unit(unit), after));
             }
         }
     }
     None
 }
 
+/// Fold unit spelling variants onto one short canonical form
+/// ("Tablespoons"/"tablespoon"/"tbsp." → "tbsp", "ounces" → "oz", …).
+fn canonical_unit(unit: &str) -> String {
+    match unit {
+        "gram" | "grams" => "g",
+        "kilogram" | "kilograms" => "kg",
+        "milliliter" | "milliliters" | "millilitre" | "millilitres" => "ml",
+        "liter" | "liters" | "litre" | "litres" => "l",
+        "ounce" | "ounces" => "oz",
+        "pound" | "pounds" | "lbs" => "lb",
+        "teaspoon" | "teaspoons" => "tsp",
+        "tablespoon" | "tablespoons" => "tbsp",
+        "cups" => "cup",
+        "pints" => "pint",
+        "quarts" => "quart",
+        "gallons" => "gallon",
+        "inches" => "inch",
+        "pinches" => "pinch",
+        "dashes" => "dash",
+        "sprigs" => "sprig",
+        "cloves" => "clove",
+        "cans" => "can",
+        "packet" | "packets" | "packs" | "pack" => "pack",
+        "bunch" | "bunches" => "bunch",
+        "slices" => "slice",
+        "sticks" => "stick",
+        "sheets" => "sheet",
+        "leaves" => "leaf",
+        "splashes" => "splash",
+        "handful" | "handfuls" => "handful",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Whether a raw line reads like it was meant to carry a quantity (a leading
+/// number, fraction or "a/an <unit>"). Used to distinguish "salt, to taste"
+/// (fine without a quantity) from "1.2.3 potatoes" (a failed parse).
+pub fn looks_quantified(line: &str) -> bool {
+    let line = line.trim_start();
+    let Some(first) = line.chars().next() else {
+        return false;
+    };
+    if first.is_ascii_digit() || FRACTIONS.iter().any(|(c, _)| *c == first) {
+        return true;
+    }
+    let lowered = line.to_lowercase();
+    ["a ", "an "].iter().any(|article| {
+        lowered.starts_with(article)
+            && split_leading_unit(&line[article.len()..]).is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn units_are_canonicalized() {
+        // Spelled-out and plural forms fold onto the short canonical unit.
+        for (line, expected) in [
+            ("2 tablespoons olive oil", "tbsp"),
+            ("2 tablespoon olive oil", "tbsp"),
+            ("1 teaspoon salt", "tsp"),
+            ("4 ounces chocolate", "oz"),
+            ("8 cups water", "cup"),
+            ("200 grams flour", "g"),
+            ("1 pound butter", "lb"),
+            ("500 milliliters milk", "ml"),
+        ] {
+            let parsed = parse_ingredient_line(line);
+            assert_eq!(parsed.unit.as_deref(), Some(expected), "unit of {line:?}");
+        }
+    }
 
     #[test]
     fn plain_number_and_unit() {
@@ -802,7 +873,7 @@ mod tests {
 
         let i = parse_ingredient_line("1 1/2 cups all-purpose flour");
         assert_eq!(i.quantity, Some(1.5));
-        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.unit.as_deref(), Some("cup"));
         assert_eq!(i.name, "all-purpose flour");
 
         let i = parse_ingredient_line("1½ cups sugar");
@@ -1011,7 +1082,7 @@ mod tests {
         // minimalistbaker.com, verbatim.
         let i = parse_ingredient_line("2 1/4 cups light coconut milk* ((canned is best))");
         assert_eq!(i.quantity, Some(2.25));
-        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.unit.as_deref(), Some("cup"));
         assert_eq!(i.name, "light coconut milk*");
         assert_eq!(i.prep.as_deref(), Some("canned is best"));
         assert_balanced(&i);
@@ -1022,7 +1093,7 @@ mod tests {
         // rainbowplantlife.com, verbatim.
         let i = parse_ingredient_line("1 pound (454g) sweet potatoes, (peeled and finely diced (see Note 3) )");
         assert_eq!(i.quantity, Some(1.0));
-        assert_eq!(i.unit.as_deref(), Some("pound"));
+        assert_eq!(i.unit.as_deref(), Some("lb"));
         assert_eq!(
             i.name,
             "(454g) sweet potatoes, (peeled and finely diced (see Note 3))"
@@ -1068,7 +1139,7 @@ mod tests {
         // veganhuggs.com, verbatim.
         let i = parse_ingredient_line("12 cups fresh spinach ((loosely packed) rough chopped (about 14 oz))");
         assert_eq!(i.quantity, Some(12.0));
-        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.unit.as_deref(), Some("cup"));
         assert_eq!(i.name, "fresh spinach (loosely packed) rough chopped");
         assert_eq!(i.prep.as_deref(), Some("about 14 oz"));
         assert_balanced(&i);
@@ -1132,7 +1203,7 @@ mod tests {
         // "2-1/2 cups" conventionally means two and a half cups.
         let i = parse_ingredient_line("2-1/2 cups flour");
         assert_eq!(i.quantity, Some(2.5));
-        assert_eq!(i.unit.as_deref(), Some("cups"));
+        assert_eq!(i.unit.as_deref(), Some("cup"));
         assert_eq!(i.name, "flour");
     }
 

@@ -628,16 +628,26 @@ enum JumpTarget {
     Field(&'static str),
 }
 
+/// The ingredient names a warning quotes ("…parsed: \"salt\", \"pepper\"").
+fn quoted_names(warning: &str) -> Vec<String> {
+    warning.split('"').skip(1).step_by(2).map(str::to_string).collect()
+}
+
 /// Map a warning to the form element(s) that let the user fix it.
 /// `None` = informational only (nothing to jump to).
 fn jump_target_for(warning: &str, ingredients: &[Ingredient]) -> Option<JumpTarget> {
     if warning.contains("could not be parsed") {
-        // Exactly the lines the backend counted: no parsed quantity.
-        let names: Vec<String> = ingredients
-            .iter()
-            .filter(|i| i.quantity.is_none())
-            .map(|i| i.name.clone())
-            .collect();
+        // The warning names the lines it could not parse; those are the rows
+        // to highlight. Fall back to every quantity-less row if extraction
+        // ever comes up empty.
+        let mut names = quoted_names(warning);
+        if names.is_empty() {
+            names = ingredients
+                .iter()
+                .filter(|i| i.quantity.is_none())
+                .map(|i| i.name.clone())
+                .collect();
+        }
         return (!names.is_empty()).then_some(JumpTarget::IngredientRows(names));
     }
     if warning.contains("no yield") {
@@ -2786,13 +2796,13 @@ mod tests {
         };
         let ingredients = vec![with_qty, no_qty];
 
-        // A quantity warning targets the ingredient rows that lack one.
+        // A quantity warning targets the rows named in the warning text.
         match jump_target_for(
-            "2 ingredient quantities could not be parsed: \"salt\"",
+            "1 ingredient quantity could not be parsed: \"pepper\"",
             &ingredients,
         ) {
             Some(JumpTarget::IngredientRows(names)) => {
-                assert_eq!(names, vec!["salt".to_string()]);
+                assert_eq!(names, vec!["pepper".to_string()]);
             }
             other => panic!("expected ingredient rows, got {other:?}"),
         }

@@ -66,11 +66,15 @@ pub async fn import(raw_url: &str, allow_private: bool) -> Result<RecipePreview,
         ));
     }
 
+    // Only lines that read like they were meant to carry a quantity (a
+    // leading number the parser could not consume) count as failures —
+    // "salt, to taste" legitimately has none and must not warn.
     let ingredients_without_quantity: Vec<String> = recipe
         .ingredients
         .iter()
         .filter(|i| i.quantity.is_none())
         .map(|i| i.name.clone())
+        .filter(|name| normalize::looks_quantified(name))
         .collect();
 
     let extraction_score = score::score(&score::ScoreInput {
@@ -654,7 +658,7 @@ mod tests {
         assert_eq!(recipe.ingredients[4].quantity, Some(1.0), "range lower bound");
         assert_eq!(recipe.ingredients[4].name, "jalapeño peppers");
         // "4 cups (945 mL) low-sodium vegetable broth"
-        assert_eq!(recipe.ingredients[12].unit.as_deref(), Some("cups"));
+        assert_eq!(recipe.ingredients[12].unit.as_deref(), Some("cup"));
         assert_eq!(
             recipe.ingredients[12].name,
             "(945 mL) low-sodium vegetable broth"
@@ -680,7 +684,7 @@ mod tests {
         assert_eq!(recipe.yield_amount, "4");
         // "2 1/4 cups light coconut milk*  ((canned is best))"
         assert_eq!(recipe.ingredients[6].quantity, Some(2.25));
-        assert_eq!(recipe.ingredients[6].unit.as_deref(), Some("cups"));
+        assert_eq!(recipe.ingredients[6].unit.as_deref(), Some("cup"));
         assert_eq!(recipe.ingredients[6].name, "light coconut milk*");
         assert_eq!(recipe.ingredients[6].prep.as_deref(), Some("canned is best"));
         // "1 cup green lentils* ((well rinsed and drained))"

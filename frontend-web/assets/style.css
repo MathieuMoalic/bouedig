@@ -23,6 +23,7 @@ body {
     background: var(--bg);
     color: var(--text);
     font-family: Roboto, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
     /* Discrete dark scrollbars (Firefox + WebKit/Android webview). */
     scrollbar-width: thin;
     scrollbar-color: #2c3531 transparent;
@@ -70,7 +71,7 @@ body {
        column so the web view mirrors the mobile experience. */
     max-width: 440px;
     margin: 0 auto;
-    padding: 16px 16px 130px;
+    padding: 12px 12px 118px;
     /* Discrete dark scrollbar for the content scroller. */
     scrollbar-width: thin;
     scrollbar-color: #2c3531 transparent;
@@ -89,7 +90,7 @@ body {
     display: flex;
     justify-content: space-around;
     align-items: center;
-    height: 76px;
+    height: 62px;
     flex-shrink: 0;
     background: rgba(14, 19, 16, 0.94);
     backdrop-filter: blur(10px);
@@ -105,14 +106,14 @@ body {
     text-decoration: none;
     font-size: 12px;
     font-weight: 600;
-    padding: 4px 10px;
+    padding: 4px 8px;
 }
 
 .nav-tab .tab-icon {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 58px;
+    width: 48px;
     height: 30px;
     border-radius: 999px;
     transition: background 0.2s;
@@ -335,28 +336,28 @@ button.grocery-remove:focus {
 /* ------------------------------------------------------------------ */
 
 h1 {
-    margin-top: 8px;
-    font-size: 24px;
+    margin-top: 4px;
+    font-size: 21px;
 }
 
 .card {
     background: var(--surface);
     border-radius: 16px;
-    padding: 20px;
-    margin-bottom: 1rem;
+    padding: 14px;
+    margin-bottom: 0.75rem;
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
 }
 
 label {
     display: block;
     font-weight: 600;
-    margin: 0.75rem 0 0.25rem;
+    margin: 0.6rem 0 0.2rem;
 }
 
 input[type="text"],
 textarea {
     width: 100%;
-    padding: 10px 12px;
+    padding: 8px 10px;
     border: 1px solid var(--divider);
     border-radius: 10px;
     font: inherit;
@@ -408,7 +409,7 @@ button[type="submit"]:hover {
 
 .add-row {
     display: flex;
-    gap: 8px;
+    gap: 6px;
     margin: 8px 0 12px;
 }
 
@@ -462,12 +463,12 @@ button[type="submit"]:hover {
 .suggestion {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     background: none;
     border: none;
     color: var(--text);
     font: inherit;
-    padding: 10px 12px;
+    padding: 8px 10px;
     cursor: pointer;
     text-align: left;
     width: 100%;
@@ -493,7 +494,7 @@ button[type="submit"]:hover {
     color: #fff;
     font: inherit;
     font-weight: 700;
-    padding: 0 18px;
+    padding: 0 14px;
     border-radius: 12px;
     cursor: pointer;
 }
@@ -567,8 +568,8 @@ button[type="submit"]:hover {
 }
 
 .detail-name {
-    font-size: 26px;
-    margin: 4px 0 12px;
+    font-size: 21px;
+    margin: 2px 0 8px;
 }
 
 .detail-photo {
@@ -582,13 +583,13 @@ button[type="submit"]:hover {
 .detail-photo img {
     display: block;
     width: 100%;
-    max-height: 420px;
+    max-height: 320px;
     object-fit: cover;
 }
 
 .detail-page .card h2 {
     margin: 0 0 10px;
-    font-size: 17px;
+    font-size: 15px;
 }
 
 ul.ingredient-list,
@@ -598,7 +599,7 @@ ol.instruction-list {
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
 }
 
 ol.instruction-list li {
@@ -623,7 +624,7 @@ ol.instruction-list li {
 .dialog {
     background: var(--surface-solid);
     border-radius: 20px;
-    padding: 22px 24px;
+    padding: 18px 20px;
     min-width: 260px;
     max-width: 340px;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
@@ -668,7 +669,7 @@ ol.instruction-list li {
 .ingredient-rows {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
     margin-top: 4px;
 }
 
@@ -736,7 +737,7 @@ ol.instruction-list li {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 10px 10px 4px;
+    padding: 7px 6px 3px;
     margin-top: 6px;
 }
 
@@ -880,7 +881,7 @@ ol.instruction-list li {
 /* Modal text inputs */
 .modal-row {
     display: flex;
-    gap: 8px;
+    gap: 6px;
 }
 
 .modal-row input {
@@ -896,7 +897,7 @@ ol.instruction-list li {
     border: 1px solid var(--divider);
     color: var(--text);
     border-radius: 10px;
-    padding: 10px 12px;
+    padding: 8px 10px;
     font: inherit;
 }
 
@@ -918,7 +919,7 @@ ol.instruction-list li {
     border: 1px solid var(--divider);
     color: var(--text);
     border-radius: 10px;
-    padding: 10px 12px;
+    padding: 8px 10px;
     font: inherit;
     margin-bottom: 4px;
 }
@@ -1024,7 +1025,7 @@ ol.instruction-list li {
 
 .import-row {
     display: flex;
-    gap: 8px;
+    gap: 6px;
     margin: 12px 0 4px;
 }
 
@@ -1045,7 +1046,7 @@ ol.instruction-list li {
     color: #fff;
     font: inherit;
     font-weight: 700;
-    padding: 0 18px;
+    padding: 0 14px;
     border-radius: 12px;
     cursor: pointer;
 }
@@ -1094,7 +1095,7 @@ ol.instruction-list li {
 .import-warnings {
     position: relative;
     margin-top: 10px;
-    padding: 10px 12px;
+    padding: 8px 10px;
     border: 1px solid rgba(229, 115, 115, 0.4);
     border-radius: 12px;
     color: var(--error);
@@ -1117,7 +1118,7 @@ ol.instruction-list li {
 .warning-jump {
     display: flex;
     align-items: baseline;
-    gap: 8px;
+    gap: 6px;
     width: 100%;
     background: none;
     border: none;
