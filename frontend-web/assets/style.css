@@ -308,11 +308,26 @@ li.grocery-item.bought span {
     color: var(--muted);
 }
 
-input.grocery-check {
-    width: 20px;
-    height: 20px;
-    accent-color: var(--accent);
+button.grocery-remove {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
     flex-shrink: 0;
+    border: none;
+    border-radius: 50%;
+    background: var(--pill);
+    color: var(--muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+button.grocery-remove:hover,
+button.grocery-remove:focus {
+    background: var(--error);
+    color: #fff;
 }
 
 /* ------------------------------------------------------------------ */
@@ -406,16 +421,73 @@ button[type="submit"]:hover {
     font: inherit;
 }
 
-.add-row input:first-child {
+.add-row input:first-child,
+.add-row .input-wrap {
     flex: 2;
 }
 
-.add-row input:nth-child(2) {
+.add-row input:nth-child(2),
+.add-row .input-wrap + input {
     flex: 1;
     min-width: 0;
 }
 
-.add-row button {
+.input-wrap {
+    position: relative;
+    flex: 2;
+    min-width: 0;
+}
+
+.input-wrap input {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.suggestions {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    margin-top: 4px;
+    background: var(--surface);
+    border: 1px solid var(--divider);
+    border-radius: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.suggestion {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: none;
+    border: none;
+    color: var(--text);
+    font: inherit;
+    padding: 10px 12px;
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.suggestion:hover,
+.suggestion:focus {
+    background: var(--divider);
+}
+
+.suggestion-text {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Only the direct Add button — nested buttons (suggestions) keep their own
+   styling, which a bare `.add-row button` would override. */
+.add-row > button {
     background: var(--accent);
     border: none;
     color: #fff;
@@ -426,7 +498,7 @@ button[type="submit"]:hover {
     cursor: pointer;
 }
 
-.add-row button:hover {
+.add-row > button:hover {
     background: var(--accent-bright);
 }
 

@@ -557,7 +557,7 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
         .status();
     assert_eq!(status, 404);
 
-    // Grocery manual add + bought toggle still behave.
+    // Grocery manual add still works; the bought toggle deletes the item.
     let item: GroceryItem = http
         .post(format!("{base}/api/grocery"))
         .json(&NewGroceryItem { name: "Potatoes".into(), category: None })
@@ -566,15 +566,35 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
         .json()
         .await?;
     assert_eq!(item.category, shared::DEFAULT_CATEGORY);
-    let updated_item: GroceryItem = http
+    let status = http
         .patch(format!("{base}/api/grocery/{}", item.id))
         .json(&shared::GroceryUpdate { bought: true })
         .send()
         .await?
         .json()
         .await?;
-    assert!(updated_item.bought, "PATCH must flip the bought flag");
-    poll_grocery(&http, &base, "Potatoes", Some(true)).await?;
+        .status();
+    assert_eq!(status, 204, "toggling to bought must delete the item");
+    for _ in 0..50 {
+        let grocery: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if grocery.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let grocery: Vec<GroceryItem> = http
+        .get(format!("{base}/api/grocery"))
+        .send()
+        .await?
+    anyhow::ensure!(
+        grocery.is_empty(),
+        "toggled item must be gone from the database: {grocery:?}"
+    );
 
     // Invalid payloads are rejected with 4xx, not 5xx.
     let status = http
@@ -774,6 +794,144 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------------------
 // Shared UI assertions & helpers
+/// Shopping-list UX: the suggestions dropdown only opens for typed text while
+/// the input is focused, "appel" fuzzy-matches the past entry "apple", the ×
+/// button removes an item, and a removed item never comes back when another
+/// one is added afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        driver
+            .find(By::Id("grocery-input"))
+            .await
+            .context("grocery input missing")?;
+
+        // Empty input: the dropdown stays closed even while focused.
+        driver.find(By::Id("grocery-input")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        anyhow::ensure!(
+            driver
+                .find_all(By::Css(".suggestions .suggestion"))
+                .await?
+                .is_empty(),
+            "dropdown must stay closed without typed text"
+        );
+
+        // Add "apple" so there is a past entry to suggest. The Add click
+        // clears the input (controlled input — send_keys alone would append).
+        driver.find(By::Id("grocery-input")).await?.send_keys("apple").await?;
+        driver.find(By::Id("grocery-add")).await?.click().await?;
+        driver
+            .find(By::XPath("//li[contains(., 'apple')]"))
+            .await
+            .context("added item did not appear in the UI")?;
+        poll_grocery(&http, &base, "apple", None).await?;
+
+        // Typing a fuzzy typo opens the dropdown with the close match.
+        let input = driver.find(By::Id("grocery-input")).await?;
+        input.clear().await?;
+        input.send_keys("appel").await?;
+        let suggestion = driver
+            .find(By::Css(".suggestions .suggestion"))
+            .await
+            .context("fuzzy suggestion for 'appel' did not appear");
+        let suggestion = match suggestion {
+            Ok(s) => s,
+            Err(err) => {
+                let src = driver.source().await.unwrap_or_default();
+                anyhow::bail!("{err}; page source:\n{src}");
+            }
+        };
+        suggestion.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let value = driver
+            .find(By::Id("grocery-input"))
+            .await?
+            .value()
+            .await?
+            .unwrap_or_default();
+        anyhow::ensure!(
+            value == "apple",
+            "suggestion click should fill 'apple', got '{value}'"
+        );
+        // Accepting the suggestion and adding creates a second "apple" row
+        // (and clears the input again).
+        driver.find(By::Id("grocery-add")).await?.click().await?;
+        poll_grocery_count(&http, &base, "apple", 2).await?;
+
+        // A second, different item in the same group. The input is empty
+        // after Add, so send_keys types from scratch.
+        driver.find(By::Id("grocery-input")).await?.send_keys("Milk").await?;
+        driver.find(By::Id("grocery-add")).await?.click().await?;
+        poll_grocery(&http, &base, "Milk", None).await?;
+        let texts = grocery_item_texts(&driver).await?;
+        anyhow::ensure!(
+            texts.iter().any(|t| t.contains("apple")) && texts.iter().any(|t| t.contains("Milk")),
+            "expected 'apple' and 'Milk' rows, got {texts:?}"
+        );
+
+        // The × button removes every "apple" row from the UI and the database.
+        for _ in 0..10 {
+            let apple_rows = driver
+                .find_all(By::XPath(
+                    "//li[contains(@class, 'grocery-item') and contains(., 'apple')]",
+                ))
+                .await?;
+            if apple_rows.is_empty() {
+                break;
+            }
+            apple_rows[0]
+                .find(By::Css(".grocery-remove"))
+                .await
+                .context("× remove button missing on the item row")?
+                .click()
+                .await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        anyhow::ensure!(
+            !grocery_item_texts(&driver).await?.iter().any(|t| t.contains("apple")),
+            "removed item still visible in the UI"
+        );
+        poll_grocery_gone(&http, &base, "apple").await?;
+
+        // Adding another item must NOT resurrect "apple".
+        let bread_input = driver.find(By::Id("grocery-input")).await?;
+        bread_input.clear().await?;
+        bread_input.send_keys("Bread").await?;
+        driver.find(By::Id("grocery-add")).await?.click().await?;
+        poll_grocery(&http, &base, "Bread", None).await?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let texts = grocery_item_texts(&driver).await?;
+        anyhow::ensure!(
+            !texts.iter().any(|t| t.contains("apple")),
+            "'apple' came back after adding a new item: {texts:?}"
+        );
+        let grocery: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            !grocery.iter().any(|i| i.name == "apple"),
+            "'apple' back in the database: {grocery:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 // ---------------------------------------------------------------------------
 
 /// Scroll a form element into view before clicking it (fixed bottom nav
@@ -1142,3 +1300,54 @@ fn tiny_png() -> Vec<u8> {
     }
     b64_decode(B64)
 }
+/// Poll `GET /api/grocery` until `name` appears at least `expected` times.
+async fn poll_grocery_count(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+    expected: usize,
+) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if items.iter().filter(|i| i.name == name).count() >= expected {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("grocery item '{name}' never appeared {expected} times")
+}
+
+/// Poll `GET /api/grocery` until `name` is gone from the database.
+async fn poll_grocery_gone(http: &reqwest::Client, base: &str, name: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !items.iter().any(|i| i.name == name) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("grocery item '{name}' never disappeared from the database")
+}
+
+/// Texts of the grocery rows currently rendered in the shopping tab.
+async fn grocery_item_texts(driver: &WebDriver) -> anyhow::Result<Vec<String>> {
+    let rows = driver
+        .find_all(By::Css("#grocery-list li.grocery-item"))
+        .await?;
+    let mut texts = Vec::new();
+    for row in rows {
+        texts.push(row.text().await?.replace('\n', " "));
+    }
+    Ok(texts)
+}
+

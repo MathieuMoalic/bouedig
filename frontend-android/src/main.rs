@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
 use shared::{
-    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, NewGroceryItem, Recipe,
+    GroceryItem, Ingredient, InstructionStep, NewGroceryItem, Recipe,
     RecipeDetail as RecipeDetailModel, RecipeInput,
 };
 
@@ -2029,12 +2029,55 @@ fn DeleteDialog(
 // Tab: Shopping (grouped grocery list)
 // ---------------------------------------------------------------------------
 
+/// Compute Levenshtein distance between two strings, comparing per character
+/// (so multi-byte input like "é" counts as one character, not two bytes).
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut v0: Vec<usize> = (0..=b.len()).collect();
+    let mut v1 = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        v1[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            v1[j + 1] = std::cmp::min(std::cmp::min(v1[j] + 1, v0[j + 1] + 1), v0[j] + cost);
+        }
+        std::mem::swap(&mut v0, &mut v1);
+    }
+    v0[b.len()]
+}
+
+/// Rank past item names by how closely they match the typed text using
+/// Levenshtein distance (max 3 edits), closest match first. Empty input
+/// yields no suggestions — the dropdown only opens for typed text.
+fn rank_suggestions(input: &str, past: &[String]) -> Vec<(String, usize)> {
+    let needle = input.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(String, usize)> = past
+        .iter()
+        .filter_map(|name| {
+            let hay = name.to_lowercase();
+            // Prefix matches rank first even when the name is long.
+            let dist = if hay.starts_with(&needle) {
+                0
+            } else {
+                levenshtein_distance(&needle, &hay)
+            };
+            (dist <= 3).then_some((name.clone(), dist))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.cmp(&b.1));
+    scored
+}
+
 #[component]
 fn Grocery() -> Element {
-    let items = use_signal(Vec::<GroceryItem>::new);
+    let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut new_category = use_signal(String::new);
     let mut error = use_signal(|| String::new());
+    let mut focused = use_signal(|| false);
     let collapsed = use_signal(|| HashSet::<String>::new());
     let mut loaded = use_signal(|| false);
 
@@ -2050,22 +2093,54 @@ fn Grocery() -> Element {
     let list = items.read().clone();
     // Unique categories in list order.
     let mut groups: Vec<(String, Vec<GroceryItem>)> = Vec::new();
-    for item in list {
+    for item in &list {
         match groups.iter_mut().find(|(c, _)| *c == item.category) {
-            Some((_, v)) => v.push(item),
-            None => groups.push((item.category.clone(), vec![item])),
+            Some((_, v)) => v.push(item.clone()),
+            None => groups.push((item.category.clone(), vec![item.clone()])),
         }
     }
+
+    // Past entries = unique names of items that have ever been added.
+    let mut past_names: Vec<String> = Vec::new();
+    for item in &list {
+        if !past_names.contains(&item.name) {
+            past_names.push(item.name.clone());
+        }
+    }
+
+    let suggestions = rank_suggestions(&new_item.read(), &past_names);
 
     rsx! {
         div { class: "page",
             div { class: "add-row",
-                input {
-                    id: "grocery-input",
-                    r#type: "text",
-                    value: "{new_item}",
-                    placeholder: "Add an item manually…",
-                    oninput: move |e: FormEvent| new_item.set(e.value()),
+                div { class: "input-wrap",
+                    input {
+                        id: "grocery-input",
+                        r#type: "text",
+                        value: "{new_item}",
+                        placeholder: "Add an item manually…",
+                        oninput: move |e: FormEvent| new_item.set(e.value()),
+                        onfocus: move |_| focused.set(true),
+                        onblur: move |_| focused.set(false),
+                        autocomplete: "off",
+                    }
+                    if focused() && !new_item.read().trim().is_empty() && !suggestions.is_empty() {
+                        div { class: "suggestions",
+                            for (name, _) in suggestions {
+                                button {
+                                    class: "suggestion",
+                                    r#type: "button",
+                                    // mousedown, not click: the input's blur
+                                    // (fired on mousedown) unmounts this
+                                    // dropdown before a click could land.
+                                    onmousedown: move |_| {
+                                        new_item.set(name.clone());
+                                    },
+                                    span { class: "suggestion-text", "{name}" }
+                                }
+                            }
+                        }
+                    }
                 }
                 input {
                     id: "grocery-category",
@@ -2098,18 +2173,26 @@ fn Grocery() -> Element {
                             let client = reqwest::Client::new();
                             let url = format!("{}/api/grocery", api_base());
                             tracing::info!("Grocery Add button: POST {url} (name={:?}, category={:?})", item.name, item.category);
-                            let resp = client.post(url).json(&item).send().await;
-                            match &resp {
-                                Ok(r) if r.status().is_success() => {
-                                    tracing::info!("POST /api/grocery succeeded ({})", r.status());
+                            match client.post(url).json(&item).send().await {
+                                Ok(r) if r.status().is_success() => match r.json::<GroceryItem>().await {
+                                    // Append the created item to the local
+                                    // state instead of re-fetching: the list
+                                    // keeps whatever the user just removed.
+                                    Ok(created) => items.with_mut(|v| v.push(created)),
+                                    Err(err) => {
+                                        tracing::error!("POST /api/grocery returned an unreadable body: {err:#}");
+                                        refresh(items, error).await;
+                                    }
+                                },
+                                Ok(r) => {
+                                    tracing::error!("POST /api/grocery failed: {}", r.status());
+                                    error.set("Failed to add item.".into());
                                 }
-                                Ok(r) => tracing::error!("POST /api/grocery failed: {}", r.status()),
                                 Err(err) => {
                                     tracing::error!("POST /api/grocery request failed: {err:#}");
                                     error.set("Failed to add item.".into());
                                 }
                             }
-                            refresh(items, error).await;
                         });
                     },
                     "Add"
@@ -2196,40 +2279,37 @@ fn GroceryRow(
     rsx! {
         li {
             id: "grocery-item-{item.id}",
-            class: if item.bought { "grocery-item bought" } else { "grocery-item" },
-            input {
-                r#type: "checkbox",
-                class: "grocery-check",
-                id: "grocery-check-{item.id}",
-                checked: item.bought,
+            class: "grocery-item",
+            button {
+                class: "grocery-remove",
+                r#type: "button",
+                title: "Remove item",
                 onclick: move |_| {
                     let id = item.id;
-                    let update = GroceryUpdate { bought: !item.bought };
                     spawn(async move {
                         let client = reqwest::Client::new();
                         let url = format!("{}/api/grocery/{id}", api_base());
-                        tracing::info!("Grocery checkbox: PATCH {url} (bought={})", update.bought);
-                        let resp = client.patch(url).json(&update).send().await;
+                        tracing::info!("Grocery remove: DELETE {url}");
+                        let resp = client.delete(&url).send().await;
                         match resp {
                             Ok(r) if r.status().is_success() => {
-                                tracing::info!("PATCH /api/grocery/{id} succeeded ({})", r.status());
+                                tracing::info!("DELETE /api/grocery/{id} succeeded ({})", r.status());
                                 items_sig.with_mut(|v| {
-                                    if let Some(it) = v.iter_mut().find(|i| i.id == id) {
-                                        it.bought = update.bought;
-                                    }
+                                    v.retain(|i| i.id != id);
                                 });
                             }
                             Ok(r) => {
-                                tracing::error!("PATCH /api/grocery/{id} failed: {}", r.status());
-                                error.set("Failed to update item.".into());
+                                tracing::error!("DELETE /api/grocery/{id} failed: {}", r.status());
+                                error.set("Failed to remove item.".into());
                             }
                             Err(err) => {
-                                tracing::error!("PATCH /api/grocery/{id} request failed: {err:#}");
-                                error.set("Failed to update item.".into());
+                                tracing::error!("DELETE /api/grocery/{id} request failed: {err:#}");
+                                error.set("Failed to remove item.".into());
                             }
                         }
                     });
                 },
+                IconX {}
             }
             span { "{item.name}" }
         }
@@ -2284,5 +2364,70 @@ fn PlaceholderPage(title: String, text: String) -> Element {
                 p { "{text}" }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance("", ""), 0);
+        assert_eq!(levenshtein_distance("abc", ""), 3);
+        assert_eq!(levenshtein_distance("", "abc"), 3);
+        assert_eq!(levenshtein_distance("abc", "abc"), 0);
+        assert_eq!(levenshtein_distance("abc", "abcd"), 1);
+        assert_eq!(levenshtein_distance("abc", "abd"), 1);
+        assert_eq!(levenshtein_distance("abc", "axc"), 1);
+        assert_eq!(levenshtein_distance("abc", "a"), 2);
+        assert_eq!(levenshtein_distance("intention", "execution"), 5);
+    }
+
+    #[test]
+    fn test_levenshtein_distance_unicode() {
+        assert_eq!(levenshtein_distance("café", "cafe"), 1);
+        assert_eq!(levenshtein_distance("é", ""), 1);
+        assert_eq!(levenshtein_distance("", "é"), 1);
+        assert_eq!(levenshtein_distance("éé", "ée"), 1);
+        assert_eq!(levenshtein_distance("œuf", "oeuf"), 1);
+    }
+
+    #[test]
+    fn test_rank_suggestions_empty_input() {
+        let past = vec!["apple".to_string(), "banana".to_string()];
+        // No typed text -> no suggestions (dropdown must stay closed).
+        assert!(rank_suggestions("", &past).is_empty());
+        assert!(rank_suggestions("   ", &past).is_empty());
+    }
+
+    #[test]
+    fn test_rank_suggestions_fuzzy_matching() {
+        let past = vec!["apple".to_string(), "appel".to_string(), "banana".to_string()];
+        let result = rank_suggestions("apple", &past);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("apple".to_string(), 0));
+        assert_eq!(result[1], ("appel".to_string(), 2));
+    }
+
+    #[test]
+    fn test_rank_suggestions_prefix_match() {
+        let past = vec!["raspberry".to_string(), "apple".to_string()];
+        let result = rank_suggestions("app", &past);
+        assert_eq!(result, vec![("apple".to_string(), 0)]);
+    }
+
+    #[test]
+    fn test_rank_suggestions_case_insensitive() {
+        let past = vec!["Banana".to_string()];
+        let result = rank_suggestions("bananna", &past);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "Banana");
+    }
+
+    #[test]
+    fn test_rank_suggestions_no_match() {
+        let past = vec!["xyz".to_string(), "qwert".to_string()];
+        assert!(rank_suggestions("apple", &past).is_empty());
     }
 }

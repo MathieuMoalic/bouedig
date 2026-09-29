@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, delete, post};
 use axum::{Json, Router};
 use shared::{
     GroceryItem, GroceryUpdate, Ingredient, InstructionStep, NewGroceryItem, Recipe, RecipeDetail,
@@ -109,7 +109,10 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
             "/grocery",
             get(list_grocery).post(add_grocery_item),
         )
-        .route("/grocery/{id}", patch(update_grocery_item))
+        .route(
+            "/grocery/{id}",
+            delete(delete_grocery_item).patch(update_grocery_item),
+        )
         .route("/images/{*path}", get(serve_image))
         // Photo uploads can be several megabytes.
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
@@ -898,17 +901,43 @@ async fn update_grocery_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
     Json(update): Json<GroceryUpdate>,
-) -> Result<Json<GroceryItem>, ApiError> {
-    let row = sqlx::query(
-        "UPDATE grocery_items SET bought = ? WHERE id = ? \
-         RETURNING id, name, bought, category",
-    )
-        .bind(update.bought as i64)
+) -> Result<StatusCode, ApiError> {
+    if update.bought {
+        let rows = sqlx::query("DELETE FROM grocery_items WHERE id = ?")
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        if rows.rows_affected() == 0 {
+            return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
+        }
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        let _row = sqlx::query(
+            "UPDATE grocery_items SET bought = 0 WHERE id = ? \
+             RETURNING id, name, bought, category",
+        )
         .bind(id)
         .fetch_optional(&state.db)
-        .await?
-        .context("no such grocery item")?;
-    Ok(Json(row_to_item(&row)))
+        .await?;
+        if _row.is_none() {
+            return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
+        }
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+async fn delete_grocery_item(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let rows = sqlx::query("DELETE FROM grocery_items WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    if rows.rows_affected() == 0 {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,11 +1166,84 @@ pub(crate) mod tests {
             Some(r#"{"bought":true}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("\"bought\":true"), "{body}");
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
-        assert!(body.contains("\"name\":\"Rice\"") && body.contains("\"bought\":true"), "{body}");
+        assert_eq!(body.trim(), "[]", "grocery list must be empty after toggle: {body}");
+    }
+
+    #[tokio::test]
+    async fn grocery_delete_removes_only_the_target_item() {
+        let app = test_router(None).await;
+        let mut ids = Vec::new();
+        for name in ["Rice", "Tofu", "Soy sauce"] {
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/grocery", Some(&format!(r#"{{"name":"{name}"}}"#)))
+                    .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let item: GroceryItem = serde_json::from_str(&body).unwrap();
+            ids.push(item.id);
+        }
+
+        // DELETE the middle item.
+        let (status, body) = json_response(app.clone(), "DELETE", &format!("/api/grocery/{}", ids[1]), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+        let items: Vec<GroceryItem> = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["Rice", "Soy sauce"],
+            "only the deleted item must disappear: {body}"
+        );
+
+        // Deleting again (or an unknown id) is a 404, not a 500.
+        let (status, _) = json_response(app.clone(), "DELETE", &format!("/api/grocery/{}", ids[1]), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // PATCH to bought=false unmarks without deleting.
+        let (status, _) = json_response(
+            app.clone(),
+            "PATCH",
+            &format!("/api/grocery/{}", ids[0]),
+            Some(r#"{"bought":false}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let items: Vec<GroceryItem> = serde_json::from_str(&body).unwrap();
+        assert_eq!(items.len(), 2, "bought=false must not delete: {body}");
+        assert!(!items[0].bought);
+    }
+
+    #[tokio::test]
+    async fn grocery_patch_unknown_id_is_404() {
+        let app = test_router(None).await;
+        for payload in [r#"{"bought":true}"#, r#"{"bought":false}"#] {
+            let (status, _) = json_response(app.clone(), "PATCH", "/api/grocery/9999", Some(payload)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "payload {payload}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grocery_add_after_removal_keeps_the_list_consistent() {
+        // Simulates the client flow behind the "removed items come back" bug:
+        // remove an item, then add another; the removed one must stay gone.
+        let app = test_router(None).await;
+        let (status, body) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Bananas"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let item: GroceryItem = serde_json::from_str(&body).unwrap();
+
+        let (status, _) = json_response(app.clone(), "DELETE", &format!("/api/grocery/{}", item.id), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Flour"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let items: Vec<GroceryItem> = serde_json::from_str(&body).unwrap();
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Flour"], "removed item must not come back: {body}");
     }
 
     #[tokio::test]
@@ -1159,7 +1261,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn meta_fields_round_trip() {
         let app = test_router(None).await;
-        let (status, body) = json_response(
+        // Toggle to bought -> item should be deleted
+        let (status, _) = json_response(
             app.clone(),
             "POST",
             "/api/recipes",
@@ -1232,6 +1335,7 @@ mod photo_tests {
         assert_eq!(std::fs::read(dir.join(&image_path)).unwrap(), png);
         let thumb = image::open(dir.join(&thumb_path)).unwrap();
         assert!(thumb.width() <= 480);
+        // Item should no longer be in the list
         assert!(thumb_path.ends_with(".jpg"));
     }
 
