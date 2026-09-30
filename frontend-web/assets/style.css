@@ -663,6 +663,127 @@ ol.instruction-list li {
 }
 
 /* ------------------------------------------------------------------ */
+/* Add-to-shopping-list bottom sheet                                   */
+/* ------------------------------------------------------------------ */
+
+.sheet-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+}
+
+.sheet {
+    background: var(--surface-solid);
+    border-radius: 20px 20px 0 0;
+    width: 100%;
+    max-width: 440px;
+    /* Clear the fixed-height bottom nav so the nav stays visible (and
+       clickable) below the sheet, like blaz. */
+    margin-bottom: 62px;
+    padding: 16px 18px 14px;
+    box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.55);
+    /* Fade only — a sliding transform would move the hit targets while the
+       sheet animates in (flaky taps during entry). */
+    animation: sheet-in 180ms ease-out;
+    display: flex;
+    flex-direction: column;
+    max-height: 78vh;
+}
+
+@keyframes sheet-in {
+    from {
+        opacity: 0.4;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+.sheet-title {
+    margin: 0;
+    font-size: 17px;
+}
+
+.sheet-subtitle {
+    margin: 2px 0 10px;
+    font-size: 13px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+}
+
+.sheet-all {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 8px 10px;
+    border-radius: 10px;
+    background: var(--pill);
+    cursor: pointer;
+    user-select: none;
+}
+
+.sheet-list {
+    overflow-y: auto;
+    margin-top: 8px;
+    flex: 1;
+    min-height: 0;
+}
+
+.sheet-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    cursor: pointer;
+    user-select: none;
+}
+
+.sheet-row:last-child {
+    border-bottom: none;
+}
+
+.sheet-check,
+.sheet-all input {
+    accent-color: var(--accent-bright);
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    margin: 0;
+}
+
+.sheet-line {
+    font-size: 14px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+.sheet-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.sheet-actions .dialog-btn[disabled] {
+    opacity: 0.45;
+    cursor: default;
+}
+
+/* Confirmation shown under the detail header after a successful add. */
+.added-note {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--accent-bright);
+}
+
+/* ------------------------------------------------------------------ */
 /* Structured ingredient editor                                        */
 /* ------------------------------------------------------------------ */
 

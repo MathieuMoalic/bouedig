@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
 use shared::{
-    GroceryItem, Ingredient, InstructionStep, MealPlanEntry, NewGroceryItem, Recipe,
-    RecipeDetail as RecipeDetailModel, RecipeInput,
+    GroceryItem, Ingredient, InstructionStep, MealPlanEntry, NewGroceryBatch, NewGroceryItem,
+    Recipe, RecipeDetail as RecipeDetailModel, RecipeInput,
 };
 
 // A phone or emulator has no same-origin, so the backend address is absolute.
@@ -1739,6 +1739,8 @@ fn RecipeDetail(id: i64) -> Element {
     let mut error = use_signal(|| String::new());
     let mut confirm_delete = use_signal(|| false);
     let mut scale_text = use_signal(|| String::from("1"));
+    let mut cart_sheet = use_signal(|| false);
+    let mut added_note = use_signal(|| String::new());
     let navigator = use_navigator();
 
     use_effect(move || {
@@ -1789,6 +1791,21 @@ fn RecipeDetail(id: i64) -> Element {
                 ));
             }
             groups
+        })
+        .unwrap_or_default();
+
+    let has_ingredients = loaded
+        .as_ref()
+        .is_some_and(|d| !d.ingredients.is_empty());
+
+    // Shopping-list sheet lines: base quantities (scale ignored on purpose).
+    let cart_lines: Vec<String> = loaded
+        .as_ref()
+        .map(|d| {
+            d.ingredients
+                .iter()
+                .map(|ingredient| ingredient_line(ingredient, 1.0))
+                .collect()
         })
         .unwrap_or_default();
 
@@ -1848,7 +1865,18 @@ fn RecipeDetail(id: i64) -> Element {
                 button { class: "hdr-btn ph", title: "Timer", IconTimer {} }
                 button { class: "hdr-btn ph", title: "Share", IconShare {} }
                 button { class: "hdr-btn ph", title: "Add to meal plan", IconCalendar {} }
-                button { class: "hdr-btn ph", title: "Add to shopping list", IconCart {} }
+                button {
+                    id: "hdr-cart",
+                    class: if has_ingredients { "hdr-btn" } else { "hdr-btn ph" },
+                    title: "Add to shopping list",
+                    onclick: move |_| {
+                        if has_ingredients {
+                            added_note.set(String::new());
+                            cart_sheet.set(true);
+                        }
+                    },
+                    IconCart {}
+                }
                 button {
                     id: "hdr-edit",
                     class: "hdr-btn",
@@ -1866,6 +1894,10 @@ fn RecipeDetail(id: i64) -> Element {
                     },
                     IconTrash {}
                 }
+            }
+
+            if !added_note.read().is_empty() {
+                p { class: "added-note", "{added_note}" }
             }
 
             match loaded.as_ref() {
@@ -2002,6 +2034,54 @@ fn RecipeDetail(id: i64) -> Element {
                     },
                 }
             }
+
+            if cart_sheet() && !cart_lines.is_empty() {
+                CartSheet {
+                    recipe_name: loaded
+                        .as_ref()
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default(),
+                    lines: cart_lines.clone(),
+                    on_add: move |selected: Vec<String>| {
+                        cart_sheet.set(false);
+                        let count = selected.len();
+                        if count == 0 {
+                            return;
+                        }
+                        let payload = NewGroceryBatch {
+                            items: selected
+                                .into_iter()
+                                .map(|name| NewGroceryItem { name, category: None })
+                                .collect(),
+                        };
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/grocery/batch", api_base());
+                            match client.post(&url).json(&payload).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    tracing::info!("added {count} items to shopping list");
+                                    added_note.set(format!(
+                                        "Added {count} item{} to shopping list",
+                                        if count == 1 { "" } else { "s" }
+                                    ));
+                                }
+                                Ok(r) => {
+                                    tracing::error!("grocery batch failed: {}", r.status());
+                                    error.set(format!(
+                                        "Could not add to shopping list: {}",
+                                        r.status()
+                                    ));
+                                }
+                                Err(err) => {
+                                    tracing::error!("grocery batch request failed: {err:#}");
+                                    error.set(format!("Could not add to shopping list: {err}"));
+                                }
+                            }
+                        });
+                    },
+                    on_cancel: move |_| cart_sheet.set(false),
+                }
+            }
         }
     }
 }
@@ -2039,6 +2119,79 @@ fn DeleteDialog(
                 div { class: "dialog-actions",
                     button { id: "cancel-delete", class: "dialog-btn", onclick: on_cancel, "Cancel" }
                     button { id: "confirm-delete", class: "dialog-btn danger", onclick: on_confirm, "Delete" }
+                }
+            }
+        }
+    }
+}
+
+/// Bottom sheet for pushing recipe ingredients to the shopping list (blaz
+/// style): one checkbox per line, all unchecked at first, an All toggle to
+/// select everything at once, and Cancel/Add.
+#[component]
+fn CartSheet(
+    recipe_name: String,
+    lines: Vec<String>,
+    on_add: EventHandler<Vec<String>>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    let mut selected = use_signal(Vec::<bool>::new);
+    // Seed per open: the sheet unmounts when closed, so the first render of
+    // each open resets to all-unchecked.
+    if selected.read().len() != lines.len() {
+        selected.set(vec![false; lines.len()]);
+    }
+    let selected_snapshot = selected.read().clone();
+    let all_checked = !selected_snapshot.is_empty() && selected_snapshot.iter().all(|&b| b);
+    let any_checked = selected_snapshot.iter().any(|&b| b);
+    let line_count = lines.len();
+
+    rsx! {
+        div { class: "sheet-backdrop",
+            onclick: move |_| on_cancel.call(()),
+            div { class: "sheet", role: "dialog",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
+                h2 { class: "sheet-title", "Add to shopping list" }
+                p { class: "sheet-subtitle", "{recipe_name}" }
+                label { class: "sheet-all",
+                    input {
+                        id: "sheet-all",
+                        r#type: "checkbox",
+                        checked: all_checked,
+                        onchange: move |_| selected.set(vec![!all_checked; line_count]),
+                    }
+                    "All"
+                }
+                div { class: "sheet-list",
+                    for (index, line) in lines.iter().enumerate() {
+                        label { class: "sheet-row", key: "{index}",
+                            input {
+                                r#type: "checkbox",
+                                class: "sheet-check",
+                                checked: selected_snapshot[index],
+                                onchange: move |_| selected.with_mut(|v| v[index] = !v[index]),
+                            }
+                            span { class: "sheet-line", "{line}" }
+                        }
+                    }
+                }
+                div { class: "sheet-actions",
+                    button { id: "sheet-cancel", class: "dialog-btn", onclick: move |_| on_cancel.call(()), "Cancel" }
+                    button {
+                        id: "sheet-add",
+                        class: "dialog-btn primary",
+                        disabled: !any_checked,
+                        onclick: move |_| {
+                            let chosen: Vec<String> = lines
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, _)| selected_snapshot[*index])
+                                .map(|(_, line)| line.clone())
+                                .collect();
+                            on_add.call(chosen);
+                        },
+                        "Add"
+                    }
                 }
             }
         }

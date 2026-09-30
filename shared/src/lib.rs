@@ -113,6 +113,13 @@ pub struct GroceryUpdate {
     pub bought: bool,
 }
 
+/// Payload for adding several grocery items at once (e.g. the ingredients
+/// picked from a recipe's "add to shopping list" sheet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewGroceryBatch {
+    pub items: Vec<NewGroceryItem>,
+}
+
 /// One recipe scheduled on one day of the meal plan. The recipe summary is
 /// embedded so clients need no second request to render the plan.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

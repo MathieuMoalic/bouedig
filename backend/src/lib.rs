@@ -16,8 +16,8 @@ use axum::routing::{get, delete, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use shared::{
-    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry, NewGroceryItem,
-    Recipe, RecipeDetail, RecipeInput,
+    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry, NewGroceryBatch,
+    NewGroceryItem, Recipe, RecipeDetail, RecipeInput,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -128,6 +128,7 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
             "/grocery",
             get(list_grocery).post(add_grocery_item),
         )
+        .route("/grocery/batch", post(add_grocery_batch))
         .route(
             "/grocery/{id}",
             delete(delete_grocery_item).patch(update_grocery_item),
@@ -985,6 +986,52 @@ async fn add_grocery_item(
     Ok((StatusCode::CREATED, Json(row_to_item(&row))))
 }
 
+/// Adds several grocery items in one call. Each becomes its own line —
+/// duplicates are intentional (the caller picked them). The whole batch is
+/// rejected (and nothing inserted) if it is empty or any name is blank.
+async fn add_grocery_batch(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(batch): Json<NewGroceryBatch>,
+) -> Result<(StatusCode, Json<Vec<GroceryItem>>), ApiError> {
+    if batch.items.is_empty() {
+        return Err(ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "batch must contain at least one item")
+                .into_response(),
+        ));
+    }
+    let mut prepared = Vec::with_capacity(batch.items.len());
+    for item in &batch.items {
+        let name = item.name.trim();
+        if name.is_empty() {
+            return Err(ApiError(
+                (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
+            ));
+        }
+        let category = item
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or(shared::DEFAULT_CATEGORY);
+        prepared.push((name, category));
+    }
+    let mut tx = state.db.begin().await?;
+    let mut created = Vec::with_capacity(prepared.len());
+    for (name, category) in prepared {
+        let row = sqlx::query(
+            "INSERT INTO grocery_items (name, category) VALUES (?, ?) \
+             RETURNING id, name, bought, category",
+        )
+        .bind(name)
+        .bind(category)
+        .fetch_one(&mut *tx)
+        .await?;
+        created.push(row_to_item(&row));
+    }
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
 async fn update_grocery_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -1383,6 +1430,98 @@ pub(crate) mod tests {
         // Item should no longer be in the list
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         assert_eq!(body.trim(), "[]", "grocery list must be empty after toggle: {body}");
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_add_creates_every_line_in_order() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(
+                r#"{"items":[{"name":"2 tbsp soy sauce"},{"name":"1 onion, thinly sliced"},{"name":"  Salt  "}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created.as_array().unwrap().len(), 3, "{body}");
+        assert_eq!(created[2]["name"], "Salt", "names must be trimmed: {body}");
+        assert_eq!(created[0]["category"], "Groceries", "default category: {body}");
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["2 tbsp soy sauce", "1 onion, thinly sliced", "Salt"],
+            "batch order must be preserved: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_add_supports_explicit_categories() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(r#"{"items":[{"name":"Basil","category":"Fresh"},{"name":"Pasta"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["category"], "Fresh", "{body}");
+        assert_eq!(list[1]["category"], "Groceries", "{body}");
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_add_rejects_empty_batch() {
+        let app = test_router(None).await;
+        let (status, body) =
+            json_response(app, "POST", "/api/grocery/batch", Some(r#"{"items":[]}"#)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_add_rejects_blank_name_without_partial_inserts() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(r#"{"items":[{"name":"Milk"},{"name":"   "},{"name":"Eggs"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        assert_eq!(
+            body.trim(),
+            "[]",
+            "a rejected batch must not leave partial rows: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_add_keeps_order_over_many_lines() {
+        let app = test_router(None).await;
+        let items: Vec<String> = (0..20).map(|i| format!(r#"{{"name":"item {i}"}}"#)).collect();
+        let payload = format!(r#"{{"items":[{}]}}"#, items.join(","));
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/grocery/batch", Some(&payload)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for (i, item) in list.as_array().unwrap().iter().enumerate() {
+            assert_eq!(item["name"], format!("item {i}"), "order broken at {i}: {body}");
+        }
     }
 
     #[tokio::test]

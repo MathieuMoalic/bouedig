@@ -794,6 +794,163 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
     result
 }
 
+/// Recipe → shopping list: the header cart button opens a bottom sheet with
+/// one unchecked checkbox per ingredient, the All toggle selects everything,
+/// unchecking one excludes just that line, Add pushes the selected lines as
+/// separate grocery items with their base quantities (scale ignored), and
+/// Cancel leaves the list untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn recipe_add_to_shopping_list_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Sheet Cake".into(),
+            sections: vec![],
+            ingredients: vec![
+                Ingredient {
+                    quantity: Some(200.0),
+                    unit: Some("g".into()),
+                    name: "Flour".into(),
+                    prep: None,
+                    section: None,
+                },
+                Ingredient {
+                    quantity: Some(2.0),
+                    unit: Some("tbsp".into()),
+                    name: "Soy sauce".into(),
+                    prep: None,
+                    section: None,
+                },
+                Ingredient {
+                    quantity: None,
+                    unit: None,
+                    name: "Salt".into(),
+                    prep: None,
+                    section: None,
+                },
+            ],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        let recipes: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let id = recipes[0].id;
+        driver.goto(format!("{base}/recipe/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/recipe/{id}")).await?;
+        driver.find(By::Id("ingredient-list")).await?;
+
+        // Set a 2x scale first: the sheet must still offer base quantities.
+        driver.find(By::Id("scale-input")).await?.send_keys("2").await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Open the sheet.
+        driver.find(By::Id("hdr-cart")).await?.click().await?;
+        let sheet = driver.find(By::Css(".sheet")).await.context("sheet missing")?;
+        let rows = driver.find_all(By::Css(".sheet .sheet-row")).await?;
+        anyhow::ensure!(rows.len() == 3, "expected 3 sheet rows, got {}", rows.len());
+        let texts = sheet.text().await?;
+        for expected in ["200 g Flour", "2 tbsp Soy sauce", "Salt"] {
+            anyhow::ensure!(texts.contains(expected), "sheet missing '{expected}': {texts}");
+        }
+        anyhow::ensure!(
+            !texts.contains("400 g Flour"),
+            "sheet must show base quantities, not scaled: {texts}"
+        );
+        for row in &rows {
+            let checkbox = row.find(By::Css("input[type=checkbox]")).await?;
+            anyhow::ensure!(
+                !checkbox.is_selected().await?,
+                "sheet lines must start unchecked"
+            );
+        }
+
+        // Add is disabled while nothing is selected.
+        let add = driver.find(By::Id("sheet-add")).await?;
+        anyhow::ensure!(!add.is_enabled().await?, "Add must be disabled with no selection");
+
+        // All selects everything, unchecking the flour excludes only it.
+        driver.find(By::Id("sheet-all")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rows = driver.find_all(By::Css(".sheet .sheet-row")).await?;
+        rows[0].find(By::Css("input[type=checkbox]")).await?.click().await?;
+        driver.find(By::Id("sheet-add")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
+
+        // Exactly the two selected lines landed on the list, in order.
+        poll_grocery(&http, &base, "2 tbsp Soy sauce", None).await?;
+        poll_grocery(&http, &base, "Salt", None).await?;
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        anyhow::ensure!(
+            names == ["2 tbsp Soy sauce", "Salt"],
+            "unexpected grocery contents: {names:?}"
+        );
+        anyhow::ensure!(
+            driver.find(By::Css(".added-note")).await?.text().await?.contains("Added 2 items"),
+            "confirmation note missing"
+        );
+
+        // Cancel leaves the list untouched, and the next open starts fresh.
+        driver.find(By::Id("hdr-cart")).await?.click().await?;
+        let rows = driver.find_all(By::Css(".sheet .sheet-row")).await?;
+        anyhow::ensure!(rows.len() == 3, "sheet must reopen with all rows");
+        for row in &rows {
+            anyhow::ensure!(
+                !row.find(By::Css("input[type=checkbox]")).await?.is_selected().await?,
+                "reopened sheet must start unchecked again"
+            );
+        }
+        driver.find(By::Id("sheet-cancel")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(items.len() == 2, "Cancel must not change the list");
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Poll until no element matches `selector` (e.g. a dialog has closed).
+async fn wait_for_gone(driver: &WebDriver, selector: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        if driver.find_all(By::Css(selector)).await?.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("'{selector}' never disappeared")
+}
+
 /// Shopping-list UX: the suggestions dropdown only opens for typed text while
 /// the input is focused, "appel" fuzzy-matches the past entry "apple", the ×
 /// button removes an item, and a removed item never comes back when another
