@@ -2651,7 +2651,17 @@ fn Grocery() -> Element {
     let today_value = today_iso();
     let plan_list = plan_entries.read().clone();
     let plan_map = planned_dates(&plan_list, &today_value);
-    let group_names: Vec<String> = groups.iter().map(|(c, _)| c.clone()).collect();
+    // Category dropdown options: the preset list first, then any group the
+    // user has invented that isn't already covered.
+    let mut category_options: Vec<String> = shared::GROCERY_CATEGORIES
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    for (category, _) in &groups {
+        if !category_options.contains(category) {
+            category_options.push(category.clone());
+        }
+    }
 
     let edited_item = edit_item.read().clone();
     let edited_id = edited_item.as_ref().map(|item| item.id);
@@ -2708,8 +2718,8 @@ fn Grocery() -> Element {
                     oninput: move |e: FormEvent| new_category.set(e.value()),
                 }
                 datalist { id: "category-options",
-                    for (category, _) in groups.clone() {
-                        option { value: "{category}" }
+                    for option in category_options.clone() {
+                        option { value: "{option}" }
                     }
                 }
                 button {
@@ -2781,7 +2791,7 @@ fn Grocery() -> Element {
                     key: "edit-{item.id}",
                     item,
                     source: edit_source,
-                    groups: group_names.clone(),
+                    groups: category_options.clone(),
                     on_save: move |(name, category): (String, String)| {
                         edit_item.set(None);
                         let id = edited_id.unwrap_or_default();
@@ -2942,38 +2952,6 @@ fn GroceryRow(
                 },
             }
             span { "{item.name}" }
-            button {
-                class: "grocery-remove",
-                r#type: "button",
-                title: "Remove item",
-                onclick: move |e: MouseEvent| {
-                    e.stop_propagation();
-                    let id = item_id;
-                    spawn(async move {
-                        let client = reqwest::Client::new();
-                        let url = format!("{}/api/grocery/{id}", api_base());
-                        tracing::info!("Grocery remove: DELETE {url}");
-                        let resp = client.delete(&url).send().await;
-                        match resp {
-                            Ok(r) if r.status().is_success() => {
-                                tracing::info!("DELETE /api/grocery/{id} succeeded ({})", r.status());
-                                items_sig.with_mut(|v| {
-                                    v.retain(|i| i.id != id);
-                                });
-                            }
-                            Ok(r) => {
-                                tracing::error!("DELETE /api/grocery/{id} failed: {}", r.status());
-                                error.set("Failed to remove item.".into());
-                            }
-                            Err(err) => {
-                                tracing::error!("DELETE /api/grocery/{id} request failed: {err:#}");
-                                error.set("Failed to remove item.".into());
-                            }
-                        }
-                    });
-                },
-                IconX {}
-            }
         }
     }
 }

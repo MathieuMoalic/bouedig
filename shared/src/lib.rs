@@ -5,6 +5,24 @@ use serde::{Deserialize, Serialize};
 /// Default grocery category for items added without an explicit group.
 pub const DEFAULT_CATEGORY: &str = "Groceries";
 
+/// Preset group suggestions offered in the grocery category dropdowns.
+pub const GROCERY_CATEGORIES: &[&str] = &[
+    "Other",
+    "Fruits",
+    "Vegetables",
+    "Bakery",
+    "Vegan",
+    "Drinks",
+    "Alcohol",
+    "Seasoning",
+    "Canned",
+    "Pantry",
+    "Non-Food",
+    "Pharmacy",
+    "Online",
+    "Online Alcohol",
+];
+
 /// A recipe as shown in the grid (summary; no ingredients/instructions).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Recipe {

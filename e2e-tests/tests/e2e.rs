@@ -1183,7 +1183,8 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             "expected 'apple' and 'Milk' rows, got {texts:?}"
         );
 
-        // The × button removes every "apple" row from the UI and the database.
+        // Checking the box (bought) removes every "apple" row from the UI
+        // and the database.
         for _ in 0..10 {
             let apple_rows = driver
                 .find_all(By::XPath(
@@ -1194,9 +1195,9 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
                 break;
             }
             apple_rows[0]
-                .find(By::Css(".grocery-remove"))
+                .find(By::Css("input[type=checkbox]"))
                 .await
-                .context("× remove button missing on the item row")?
+                .context("bought checkbox missing on the item row")?
                 .click()
                 .await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
