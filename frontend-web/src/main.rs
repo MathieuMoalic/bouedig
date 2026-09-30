@@ -2720,16 +2720,19 @@ fn today_iso() -> String {
     )
 }
 
-/// `YYYY-MM-DD` shifted by `days` (negative goes back).
+/// `YYYY-MM-DD` shifted by `days` (negative goes back). Pure UTC millisecond
+/// arithmetic: date-only strings parse as UTC midnight, so adding whole days
+/// is exact in every timezone — a negative `days` must never wrap (the u32
+/// cast in the old set_date version rolled negative sums into garbage dates,
+/// duplicating whole day sections).
 fn shift_iso(date: &str, days: i64) -> String {
     let millis = js_sys::Date::parse(date);
-    let d = js_sys::Date::new(&millis.into());
-    d.set_date((d.get_date() as f64 + days as f64) as u32);
+    let d = js_sys::Date::new(&((millis + (days as f64) * 86_400_000.0).into()));
     format!(
         "{:04}-{:02}-{:02}",
-        d.get_full_year(),
-        d.get_month() + 1,
-        d.get_date()
+        d.get_utc_full_year(),
+        d.get_utc_month() + 1,
+        d.get_utc_date()
     )
 }
 

@@ -1188,6 +1188,31 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
             "scrolling to the bottom must extend the range: {day_count} -> {extended}"
         );
 
+        // Every rendered day must be unique — duplicated sections were the
+        // symptom of broken negative date math in the old range code.
+        let unique_labels = driver
+            .execute(
+                "return Array.from(document.querySelectorAll('.plan-day-label')).filter(l => l.textContent !== 'Today' && l.textContent !== 'Tomorrow').length;",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_i64()
+            .context("label count missing")?;
+        let unique_days = driver
+            .execute(
+                "var texts = Array.from(document.querySelectorAll('.plan-day-label')).filter(l => l.textContent !== 'Today' && l.textContent !== 'Tomorrow').map(l => l.textContent); return new Set(texts).size;",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_i64()
+            .context("unique label count missing")?;
+        anyhow::ensure!(
+            unique_days == unique_labels,
+            "duplicate day sections rendered: {unique_days} unique of {unique_labels}"
+        );
+
         // Today's section: open its picker via the labeled section.
         driver
             .find(By::XPath(
