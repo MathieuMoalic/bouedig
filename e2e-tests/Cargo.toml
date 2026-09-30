@@ -14,6 +14,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 [dev-dependencies]
 tokio.workspace = true
 thirtyfour = "0.37"
+chrono.workspace = true
 backend = { path = "../backend" }
 shared = { path = "../shared" }
 tracing-subscriber = { workspace = true }

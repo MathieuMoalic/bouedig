@@ -1,12 +1,12 @@
 //! Bouedig mobile client (Dioxus on Android).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
 use shared::{
-    GroceryItem, Ingredient, InstructionStep, MealPlanEntry, NewGroceryBatch, NewGroceryItem,
-    Recipe, RecipeDetail as RecipeDetailModel, RecipeInput,
+    GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry,
+    NewGroceryBatch, NewGroceryItem, Recipe, RecipeDetail as RecipeDetailModel, RecipeInput,
 };
 
 // A phone or emulator has no same-origin, so the backend address is absolute.
@@ -2053,6 +2053,7 @@ fn RecipeDetail(id: i64) -> Element {
                                 .into_iter()
                                 .map(|name| NewGroceryItem { name, category: None })
                                 .collect(),
+                            recipe_id: Some(id),
                         };
                         spawn(async move {
                             let client = reqwest::Client::new();
@@ -2253,12 +2254,29 @@ fn Grocery() -> Element {
     let mut focused = use_signal(|| false);
     let collapsed = use_signal(|| HashSet::<String>::new());
     let mut loaded = use_signal(|| false);
+    let mut plan_loaded = use_signal(|| false);
+    let mut plan_entries = use_signal(Vec::<MealPlanEntry>::new);
+    let mut edit_item = use_signal(|| None::<GroceryItem>);
 
     use_effect(move || {
         if !loaded() {
             loaded.set(true);
             spawn(async move {
                 refresh(items, error).await;
+            });
+        }
+    });
+
+    // Plan dates feed the provenance line ("Lentil Loaf in 4 days"): one
+    // fetch, mapped against the device's local today.
+    use_effect(move || {
+        if !plan_loaded() {
+            plan_loaded.set(true);
+            spawn(async move {
+                match api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                    Ok(list) => plan_entries.set(list),
+                    Err(err) => tracing::error!("meal-plan fetch for provenance failed: {err:#}"),
+                }
             });
         }
     });
@@ -2282,6 +2300,25 @@ fn Grocery() -> Element {
     }
 
     let suggestions = rank_suggestions(&new_item.read(), &past_names);
+
+    let today_value = today_local_iso();
+    let plan_list = plan_entries.read().clone();
+    let plan_map = planned_dates(&plan_list, &today_value);
+    let group_names: Vec<String> = groups.iter().map(|(c, _)| c.clone()).collect();
+
+    let edited_item = edit_item.read().clone();
+    let edited_id = edited_item.as_ref().map(|item| item.id);
+    let edit_source = edited_item
+        .as_ref()
+        .and_then(|item| item.recipe.as_ref())
+        .map(|recipe| match plan_map.get(&recipe.id) {
+            Some(date) => match plan_relative_label(date, &today_value) {
+                Some(rel) => format!("{} {rel}", recipe.name),
+                None => recipe.name.clone(),
+            },
+            None => recipe.name.clone(),
+        })
+        .unwrap_or_default();
 
     rsx! {
         div { class: "page",
@@ -2386,8 +2423,60 @@ fn Grocery() -> Element {
                             collapsed: collapsed,
                             items_sig: items,
                             error: error,
+                            on_edit: move |item: GroceryItem| edit_item.set(Some(item)),
                         }
                     }
+                }
+            }
+
+            if let Some(item) = edited_item {
+                GroceryEditSheet {
+                    key: "edit-{item.id}",
+                    item,
+                    source: edit_source,
+                    groups: group_names.clone(),
+                    on_save: move |(name, category): (String, String)| {
+                        edit_item.set(None);
+                        let id = edited_id.unwrap_or_default();
+                        let payload = GroceryPatch {
+                            name,
+                            category: Some(category),
+                        };
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/grocery/{id}", api_base());
+                            match client.put(&url).json(&payload).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    match r.json::<GroceryItem>().await {
+                                        Ok(updated) => {
+                                            items.with_mut(|v| {
+                                                if let Some(slot) =
+                                                    v.iter_mut().find(|i| i.id == id)
+                                                {
+                                                    *slot = updated;
+                                                }
+                                            });
+                                        }
+                                        Err(err) => {
+                                            tracing::error!(
+                                                "PUT /api/grocery unreadable body: {err:#}"
+                                            );
+                                            refresh(items, error).await;
+                                        }
+                                    }
+                                }
+                                Ok(r) => {
+                                    tracing::error!("PUT /api/grocery failed: {}", r.status());
+                                    error.set("Failed to update item.".into());
+                                }
+                                Err(err) => {
+                                    tracing::error!("PUT /api/grocery request failed: {err:#}");
+                                    error.set("Failed to update item.".into());
+                                }
+                            }
+                        });
+                    },
+                    on_cancel: move |_| edit_item.set(None),
                 }
             }
             div { class: "fab-stack",
@@ -2412,31 +2501,40 @@ fn GroupSection(
     mut collapsed: Signal<HashSet<String>>,
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
+    on_edit: EventHandler<GroceryItem>,
 ) -> Element {
     let is_collapsed = collapsed.read().contains(&name);
     let key = name.clone();
 
     rsx! {
-        button {
-            key: "group-{key}",
-            class: "grocery-group",
-            onclick: move |_| {
-                let name = name.clone();
-                tracing::debug!("toggling grocery group {name:?}");
-                collapsed.with_mut(|s| {
-                    if !s.remove(&name) {
-                        s.insert(name);
+        div { class: "grocery-card",
+            button {
+                key: "group-{key}",
+                class: "grocery-group",
+                onclick: move |_| {
+                    let name = name.clone();
+                    tracing::debug!("toggling grocery group {name:?}");
+                    collapsed.with_mut(|s| {
+                        if !s.remove(&name) {
+                            s.insert(name);
+                        }
+                    });
+                },
+                span { class: "group-icon", IconMenu {} }
+                span { class: "group-chevron", IconChevron { down: !is_collapsed } }
+                span { class: "group-name", "{name}" }
+            }
+            if !is_collapsed {
+                ul { class: "grocery-list",
+                    for item in items.iter().cloned() {
+                        GroceryRow {
+                            key: "{item.id}",
+                            item: item,
+                            items_sig: items_sig,
+                            error: error,
+                            on_edit: on_edit.clone(),
+                        }
                     }
-                });
-            },
-            span { class: "group-icon", IconMenu {} }
-            span { class: "group-chevron", IconChevron { down: !is_collapsed } }
-            span { class: "group-name", "{name}" }
-        }
-        if !is_collapsed {
-            ul { class: "grocery-list",
-                for item in items.iter().cloned() {
-                    GroceryRow { key: "{item.id}", item: item, items_sig: items_sig, error: error }
                 }
             }
         }
@@ -2448,17 +2546,55 @@ fn GroceryRow(
     item: GroceryItem,
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
+    on_edit: EventHandler<GroceryItem>,
 ) -> Element {
+    let item_id = item.id;
     rsx! {
         li {
             id: "grocery-item-{item.id}",
             class: "grocery-item",
+            onclick: move |_| on_edit.call(item.clone()),
+            // Checking the box marks the item bought — today's toggle
+            // semantics remove it from the list.
+            input {
+                r#type: "checkbox",
+                class: "grocery-check",
+                title: "Mark bought",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
+                onchange: move |_| {
+                    let id = item_id;
+                    spawn(async move {
+                        let client = reqwest::Client::new();
+                        let url = format!("{}/api/grocery/{id}", api_base());
+                        match client
+                            .patch(&url)
+                            .json(&GroceryUpdate { bought: true })
+                            .send()
+                            .await
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                items_sig.with_mut(|v| v.retain(|i| i.id != id));
+                            }
+                            Ok(r) => {
+                                tracing::error!("PATCH /api/grocery/{id} failed: {}", r.status());
+                                error.set("Failed to mark item bought.".into());
+                            }
+                            Err(err) => {
+                                tracing::error!("PATCH /api/grocery/{id} request failed: {err:#}");
+                                error.set("Failed to mark item bought.".into());
+                            }
+                        }
+                    });
+                },
+            }
+            span { "{item.name}" }
             button {
                 class: "grocery-remove",
                 r#type: "button",
                 title: "Remove item",
-                onclick: move |_| {
-                    let id = item.id;
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    let id = item_id;
                     spawn(async move {
                         let client = reqwest::Client::new();
                         let url = format!("{}/api/grocery/{id}", api_base());
@@ -2484,7 +2620,77 @@ fn GroceryRow(
                 },
                 IconX {}
             }
-            span { "{item.name}" }
+        }
+    }
+}
+
+/// Bottom sheet for editing one grocery item: name and group are editable,
+/// the provenance recipe ("Lentil Loaf in 4 days") is read-only.
+#[component]
+fn GroceryEditSheet(
+    item: GroceryItem,
+    source: String,
+    groups: Vec<String>,
+    on_save: EventHandler<(String, String)>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    let mut name = use_signal(|| item.name.clone());
+    let mut group = use_signal(|| item.category.clone());
+    let name_value = name.read().trim().to_string();
+
+    rsx! {
+        div { class: "sheet-backdrop",
+            onclick: move |_| on_cancel.call(()),
+            div { class: "sheet", role: "dialog",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
+                h2 { class: "sheet-title", "Edit item" }
+                if !source.is_empty() {
+                    p { class: "sheet-subtitle", id: "sheet-item-source", "{source}" }
+                }
+                div { class: "sheet-form",
+                    label { class: "sheet-field",
+                        span { "Name" }
+                        input {
+                            id: "sheet-item-name",
+                            r#type: "text",
+                            value: "{name}",
+                            oninput: move |e: FormEvent| name.set(e.value()),
+                        }
+                    }
+                    label { class: "sheet-field",
+                        span { "Group" }
+                        input {
+                            id: "sheet-item-group",
+                            r#type: "text",
+                            value: "{group}",
+                            list: "edit-group-options",
+                            oninput: move |e: FormEvent| group.set(e.value()),
+                        }
+                        datalist { id: "edit-group-options",
+                            for group_name in groups {
+                                option { value: "{group_name}" }
+                            }
+                        }
+                    }
+                }
+                div { class: "sheet-actions",
+                    button {
+                        id: "sheet-item-cancel",
+                        class: "dialog-btn",
+                        onclick: move |_| on_cancel.call(()),
+                        "Cancel"
+                    }
+                    button {
+                        id: "sheet-item-save",
+                        class: "dialog-btn primary",
+                        disabled: name_value.is_empty(),
+                        onclick: move |_| {
+                            on_save.call((name.read().trim().to_string(), group.read().trim().to_string()));
+                        },
+                        "Save"
+                    }
+                }
+            }
         }
     }
 }
@@ -2674,6 +2880,54 @@ fn shift_local_iso(date: &str, days: i64) -> String {
             .to_string(),
         Err(_) => date.to_string(),
     }
+}
+
+/// Days from `today` to `date` (positive = future); `None` on a bad date.
+fn days_from_today(date: &str, today: &str) -> Option<i64> {
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let today = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+    Some((date - today).num_days())
+}
+
+/// Relative label for a plan date: today / tomorrow / in N days / N days ago.
+fn plan_relative_label(date: &str, today: &str) -> Option<String> {
+    if date.is_empty() {
+        return None;
+    }
+    Some(match days_from_today(date, today)? {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        n if n > 1 => format!("in {n} days"),
+        -1 => "1 day ago".to_string(),
+        n => format!("{} days ago", -n),
+    })
+}
+
+/// One plan date per recipe id: the earliest upcoming date wins; if a recipe
+/// is only planned in the past, its most recent past date is kept.
+fn planned_dates(entries: &[MealPlanEntry], today: &str) -> HashMap<i64, String> {
+    let mut map: HashMap<i64, String> = HashMap::new();
+    for entry in entries {
+        let candidate = entry.date.as_str();
+        match map.get(&entry.recipe.id) {
+            Some(current) => {
+                let current = current.as_str();
+                let keep_candidate = match (candidate >= today, current >= today) {
+                    (true, true) => candidate < current,
+                    (true, false) => true,
+                    (false, true) => false,
+                    (false, false) => candidate > current,
+                };
+                if keep_candidate {
+                    map.insert(entry.recipe.id, candidate.to_string());
+                }
+            }
+            None => {
+                map.insert(entry.recipe.id, candidate.to_string());
+            }
+        }
+    }
+    map
 }
 
 /// Human label for a plan day: Today / Tomorrow / "Thu, Oct 1".

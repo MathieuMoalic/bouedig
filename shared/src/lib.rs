@@ -97,6 +97,10 @@ pub struct GroceryItem {
     pub bought: bool,
     /// Group the item belongs to (collapsible header in the UI).
     pub category: String,
+    /// Recipe the item was added from, if any (cleared when the recipe is
+    /// deleted; `None` for manually added items).
+    #[serde(default)]
+    pub recipe: Option<Recipe>,
 }
 
 /// Payload used to add a grocery item manually.
@@ -113,11 +117,23 @@ pub struct GroceryUpdate {
     pub bought: bool,
 }
 
+/// Payload for renaming / regrouping a grocery item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroceryPatch {
+    pub name: String,
+    /// `None` or blank resets the item to the default group.
+    #[serde(default)]
+    pub category: Option<String>,
+}
+
 /// Payload for adding several grocery items at once (e.g. the ingredients
-/// picked from a recipe's "add to shopping list" sheet).
+/// picked from a recipe's "add to shopping list" sheet). Every item in the
+/// batch is stamped with `recipe_id` as its provenance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewGroceryBatch {
     pub items: Vec<NewGroceryItem>,
+    #[serde(default)]
+    pub recipe_id: Option<i64>,
 }
 
 /// One recipe scheduled on one day of the meal plan. The recipe summary is

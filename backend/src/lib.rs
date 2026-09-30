@@ -16,8 +16,8 @@ use axum::routing::{get, delete, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use shared::{
-    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry, NewGroceryBatch,
-    NewGroceryItem, Recipe, RecipeDetail, RecipeInput,
+    GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry,
+    NewGroceryBatch, NewGroceryItem, Recipe, RecipeDetail, RecipeInput,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -131,7 +131,9 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
         .route("/grocery/batch", post(add_grocery_batch))
         .route(
             "/grocery/{id}",
-            delete(delete_grocery_item).patch(update_grocery_item),
+            delete(delete_grocery_item)
+                .patch(update_grocery_item)
+                .put(patch_grocery_item),
         )
         .route(
             "/meal-plan",
@@ -309,8 +311,37 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
         name: row.get::<String, _>("name"),
         bought: row.get::<i64, _>("bought") != 0,
         category: row.get::<String, _>("category"),
+        recipe: None,
     }
 }
+
+/// Grocery row joined with its provenance recipe (`g.*` + `r.*` aliased
+/// columns); `recipe` is `None` when the item has no linked recipe.
+fn row_to_joined_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
+    use sqlx::Row;
+    let recipe = row.get::<Option<i64>, _>("recipe_id").map(|id| {
+        let url = |col: Option<String>| col.map(|p| format!("/api/images/{p}"));
+        Recipe {
+            id,
+            name: row.get::<String, _>("recipe_name"),
+            image: url(row.get::<Option<String>, _>("image_path")),
+            thumb: url(row.get::<Option<String>, _>("thumb_path")),
+        }
+    });
+    GroceryItem {
+        id: row.get::<i64, _>("id"),
+        name: row.get::<String, _>("name"),
+        bought: row.get::<i64, _>("bought") != 0,
+        category: row.get::<String, _>("category"),
+        recipe,
+    }
+}
+
+/// The grocery SELECT with provenance joined in; `r.id` aliases as
+/// `recipe_id` so it never collides with `g.id`.
+const GROCERY_SELECT: &str = "SELECT g.id, g.name, g.bought, g.category, \
+     r.id AS recipe_id, r.name AS recipe_name, r.image_path, r.thumb_path \
+     FROM grocery_items g LEFT JOIN recipes r ON r.id = g.recipe_id";
 
 /// DB stores relative paths under the image dir; expose them as URLs.
 fn recipe_urls(row: &sqlx::sqlite::SqliteRow) -> (Option<String>, Option<String>) {
@@ -953,10 +984,10 @@ async fn list_recipes(
 async fn list_grocery(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<Vec<GroceryItem>>, ApiError> {
-    let rows = sqlx::query("SELECT id, name, bought, category FROM grocery_items ORDER BY id ASC")
+    let rows = sqlx::query(&format!("{GROCERY_SELECT} ORDER BY g.id ASC"))
         .fetch_all(&state.db)
         .await?;
-    Ok(Json(rows.iter().map(row_to_item).collect()))
+    Ok(Json(rows.iter().map(row_to_joined_item).collect()))
 }
 
 async fn add_grocery_item(
@@ -989,6 +1020,7 @@ async fn add_grocery_item(
 /// Adds several grocery items in one call. Each becomes its own line —
 /// duplicates are intentional (the caller picked them). The whole batch is
 /// rejected (and nothing inserted) if it is empty or any name is blank.
+/// `recipe_id`, when given, is stamped onto every line as provenance.
 async fn add_grocery_batch(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(batch): Json<NewGroceryBatch>,
@@ -1015,18 +1047,36 @@ async fn add_grocery_batch(
             .unwrap_or(shared::DEFAULT_CATEGORY);
         prepared.push((name, category));
     }
+    // Provenance recipe: validated up front so a bad id rejects the whole
+    // batch instead of failing halfway through the inserts.
+    let recipe = match batch.recipe_id {
+        Some(id) => {
+            let row = sqlx::query("SELECT id, name, image_path, thumb_path FROM recipes WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await?
+                .ok_or_else(|| {
+                    ApiError((StatusCode::NOT_FOUND, "no such recipe").into_response())
+                })?;
+            Some(row_to_recipe(&row))
+        }
+        None => None,
+    };
     let mut tx = state.db.begin().await?;
     let mut created = Vec::with_capacity(prepared.len());
     for (name, category) in prepared {
         let row = sqlx::query(
-            "INSERT INTO grocery_items (name, category) VALUES (?, ?) \
+            "INSERT INTO grocery_items (name, category, recipe_id) VALUES (?, ?, ?) \
              RETURNING id, name, bought, category",
         )
         .bind(name)
         .bind(category)
+        .bind(batch.recipe_id)
         .fetch_one(&mut *tx)
         .await?;
-        created.push(row_to_item(&row));
+        let mut item = row_to_item(&row);
+        item.recipe = recipe.clone();
+        created.push(item);
     }
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -1059,6 +1109,41 @@ async fn update_grocery_item(
         }
         Ok(StatusCode::NO_CONTENT)
     }
+}
+
+/// Edits a grocery item (rename and/or regroup). A blank name is rejected;
+/// a blank or missing category resets the item to the default group.
+async fn patch_grocery_item(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(patch): Json<GroceryPatch>,
+) -> Result<Json<GroceryItem>, ApiError> {
+    let name = patch.name.trim();
+    if name.is_empty() {
+        return Err(ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
+        ));
+    }
+    let category = patch
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or(shared::DEFAULT_CATEGORY);
+    let result = sqlx::query("UPDATE grocery_items SET name = ?, category = ? WHERE id = ?")
+        .bind(name)
+        .bind(category)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
+    }
+    let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(row_to_joined_item(&row)))
 }
 
 async fn delete_grocery_item(
@@ -1522,6 +1607,154 @@ pub(crate) mod tests {
         for (i, item) in list.as_array().unwrap().iter().enumerate() {
             assert_eq!(item["name"], format!("item {i}"), "order broken at {i}: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_stamps_recipe_provenance() {
+        let app = test_router(None).await;
+        let recipe_id = create_test_recipe(app.clone(), "Provenance Soup").await;
+
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(&format!(
+                r#"{{"items":[{{"name":"2 tbsp soy sauce"}},{{"name":"Salt"}}],"recipe_id":{recipe_id}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for item in list.as_array().unwrap() {
+            assert_eq!(item["recipe"]["id"], recipe_id, "{body}");
+            assert_eq!(item["recipe"]["name"], "Provenance Soup", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grocery_batch_unknown_recipe_rejects_everything() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(r#"{"items":[{"name":"Milk"}],"recipe_id":424242}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        assert_eq!(
+            body.trim(), "[]",
+            "a batch with an unknown recipe must not insert anything: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grocery_manual_add_has_no_provenance() {
+        let app = test_router(None).await;
+        let (status, _) =
+            json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Rice"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            list[0]["recipe"].is_null(),
+            "manual adds must not carry provenance: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grocery_put_edit_renames_and_regroups() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery",
+            Some(r#"{"name":"Oats","category":"Pantry"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let (status, body) = json_response(
+            app.clone(),
+            "PUT",
+            &format!("/api/grocery/{id}"),
+            Some(r#"{"name":"Rolled oats","category":"Breakfast"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let edited: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(edited["name"], "Rolled oats", "{body}");
+        assert_eq!(edited["category"], "Breakfast", "{body}");
+
+        // Blank category resets to the default group.
+        let (status, body) = json_response(
+            app.clone(),
+            "PUT",
+            &format!("/api/grocery/{id}"),
+            Some(r#"{"name":"Rolled oats","category":"  "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let edited: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(edited["category"], "Groceries", "{body}");
+
+        // Blank name → 422, unknown id → 404.
+        let (status, _) = json_response(
+            app.clone(),
+            "PUT",
+            &format!("/api/grocery/{id}"),
+            Some(r#"{"name":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = json_response(app, "PUT", "/api/grocery/999999", Some(r#"{"name":"X"}"#))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn grocery_provenance_clears_when_recipe_deleted() {
+        let app = test_router(None).await;
+        let recipe_id = create_test_recipe(app.clone(), "Doomed Dish").await;
+        let (status, _) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(&format!(
+                r#"{{"items":[{{"name":"1 onion"}}],"recipe_id":{recipe_id}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _) =
+            json_response(app.clone(), "DELETE", &format!("/api/recipes/{recipe_id}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The item survives; its provenance is cleared.
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(list[0]["name"], "1 onion", "{body}");
+        assert!(list[0]["recipe"].is_null(), "{body}");
+    }
+
+    /// Creates a minimal recipe and returns its id.
+    async fn create_test_recipe(app: axum::Router, name: &str) -> i64 {
+        let payload = format!(
+            r#"{{"name":"{name}","sections":[],"ingredients":[{{"quantity":1.0,"unit":"tbsp","name":"oil","prep":null,"section":null}}],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}}"#
+        );
+        let (status, body) = json_response(app, "POST", "/api/recipes", Some(&payload)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_i64()
+            .unwrap()
     }
 
     #[tokio::test]

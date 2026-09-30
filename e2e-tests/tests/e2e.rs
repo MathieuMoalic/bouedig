@@ -940,6 +940,153 @@ async fn recipe_add_to_shopping_list_flow() -> anyhow::Result<()> {
     result
 }
 
+/// Grocery provenance + editing: adding a planned recipe's ingredients
+/// stamps the provenance recipe on each line, the edit sheet shows the
+/// recipe with its plan day ("… in 4 days"), renaming via the sheet updates
+/// the list and the database, and checking the row's checkbox marks it
+/// bought (removed).
+#[tokio::test(flavor = "multi_thread")]
+async fn grocery_edit_provenance_and_bought_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // A recipe planned 4 days out, with two ingredients to push.
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Provenance Loaf".into(),
+            sections: vec![],
+            ingredients: vec![
+                Ingredient {
+                    quantity: Some(120.0),
+                    unit: Some("ml".into()),
+                    name: "Lentils".into(),
+                    prep: None,
+                    section: None,
+                },
+                Ingredient {
+                    quantity: Some(1.0),
+                    unit: None,
+                    name: "Onion".into(),
+                    prep: None,
+                    section: None,
+                },
+            ],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let recipe_id = recipes[0].id;
+
+    let planned = (chrono::Local::now().date_naive() + chrono::Duration::days(4))
+        .format("%Y-%m-%d");
+    let status = http
+        .post(format!("{base}/api/meal-plan"))
+        .json(&serde_json::json!({ "date": planned.to_string(), "recipe_id": recipe_id }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        // Push the ingredients from the detail page's cart sheet.
+        driver.goto(format!("{base}/recipe/{recipe_id}")).await?;
+        wait_for_url_path(&driver, &format!("/recipe/{recipe_id}")).await?;
+        driver.find(By::Id("ingredient-list")).await?;
+        driver.find(By::Id("hdr-cart")).await?.click().await?;
+        driver.find(By::Id("sheet-all")).await?.click().await?;
+        driver.find(By::Id("sheet-add")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
+
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        driver
+            .find(By::XPath("//li[contains(@class, 'grocery-item') and contains(., '120 ml Lentils')]"))
+            .await
+            .context("recipe ingredient did not reach the grocery list")?;
+
+        // Tap the row: the edit sheet opens with the provenance line.
+        driver
+            .find(By::XPath("//li[contains(@class, 'grocery-item') and contains(., '120 ml Lentils')]"))
+            .await?
+            .click()
+            .await?;
+        driver.find(By::Id("sheet-item-name")).await
+            .context("edit sheet did not open")?;
+        let source = driver.find(By::Id("sheet-item-source")).await?.text().await?;
+        anyhow::ensure!(
+            source == "Provenance Loaf in 4 days",
+            "provenance line wrong: '{source}'"
+        );
+
+        // Rename and move to a named group.
+        let name_input = driver.find(By::Id("sheet-item-name")).await?;
+        name_input.clear().await?;
+        name_input.send_keys("Red lentils").await?;
+        let group_input = driver.find(By::Id("sheet-item-group")).await?;
+        group_input.clear().await?;
+        group_input.send_keys("Pantry").await?;
+        driver.find(By::Id("sheet-item-save")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
+
+        let texts = grocery_item_texts(&driver).await?;
+        anyhow::ensure!(
+            texts.iter().any(|t| t.contains("Red lentils")),
+            "renamed item missing from the list: {texts:?}"
+        );
+        let items: Vec<serde_json::Value> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let lentils = items
+            .iter()
+            .find(|i| i["name"] == "Red lentils")
+            .context("rename never reached the database")?;
+        anyhow::ensure!(
+            lentils["category"] == "Pantry",
+            "group change never reached the database: {items:?}"
+        );
+
+        // Checking the box marks the item bought: the row disappears.
+        driver
+            .find(By::XPath(
+                "//li[contains(@class, 'grocery-item') and contains(., 'Red lentils')]//input[@type='checkbox']",
+            ))
+            .await?
+            .click()
+            .await?;
+        poll_grocery_gone(&http, &base, "Red lentils").await?;
+        let items: Vec<serde_json::Value> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(items.len() == 1, "only the lentils line should be gone: {items:?}");
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 /// Poll until no element matches `selector` (e.g. a dialog has closed).
 async fn wait_for_gone(driver: &WebDriver, selector: &str) -> anyhow::Result<()> {
     for _ in 0..50 {
