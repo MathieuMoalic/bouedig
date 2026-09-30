@@ -2803,11 +2803,10 @@ fn MealPlan() -> Element {
         }
     });
 
-    // The rendered day range. It starts a week back and two months ahead,
-    // and the buttons at either end extend it — practically infinite scroll
-    // with zero platform-specific code.
-    let mut back = use_signal(|| 7i64);
-    let mut forward = use_signal(|| 59i64);
+    // The rendered day range. It starts small (3 days back, 3 weeks ahead)
+    // and grows a week at a time as the reader scrolls toward either end.
+    let mut back = use_signal(|| 3i64);
+    let mut forward = use_signal(|| 21i64);
 
     // Group every day in the range: entries grouped per day, empty days
     // render with their ⊕ so any day is plannable.
@@ -2831,17 +2830,24 @@ fn MealPlan() -> Element {
         .collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
 
-    // Infinite scroll: a light poll watches the content scroller and extends
-    // the rendered range when the reader nears either end. Polling (instead
-    // of scroll events) works in every webview, including ones that swallow
-    // programmatic scroll events. Capped at ~1 year out in 30-day pages.
+    // Infinite scroll: a light poll watches the content scroller. While the
+    // reader is actively scrolling toward an end, the range grows a week at
+    // a time to fill the timeline; prepends compensate the scroll position
+    // so the view stays put. Polling (instead of scroll events) works in
+    // every webview, including ones that swallow programmatic scroll events.
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         spawn(async move {
+            let mut last_top: i64 = 0;
+            let mut pending: Option<(i64, i64)> = None; // (pre-extension height, user's scroll pos)
             loop {
                 let promise = js_sys::Promise::new(&mut |resolve, _| {
                     if let Some(window) = web_sys::window() {
-                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 400);
+                        let _ = window
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                &resolve,
+                                250,
+                            );
                     }
                 });
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -2853,16 +2859,29 @@ fn MealPlan() -> Element {
                 else {
                     continue;
                 };
-                let top = element.scroll_top();
-                let near_bottom = top as i64 + element.client_height() as i64
-                    > element.scroll_height() as i64 - 600;
-                let near_top = top > 0 && top < 600;
-                if near_bottom && forward() < 370 {
-                    forward.set((forward() + 30).min(370));
+
+                // A backward extension rendered since the last tick: restore
+                // the reader's viewport over the prepended days.
+                if let Some((pre_height, user_top)) = pending.take() {
+                    let delta = element.scroll_height() as i64 - pre_height;
+                    if delta > 0 {
+                        element.set_scroll_top((user_top + delta) as i32);
+                    }
                 }
-                if near_top && back() < 370 {
-                    back.set((back() + 30).min(370));
+
+                let top = element.scroll_top() as i64;
+                let height = element.scroll_height() as i64;
+                let client = element.client_height() as i64;
+                let bottom_dist = height - (top + client);
+                let moving_up = top < last_top;
+
+                if bottom_dist < 400 && forward() < 370 {
+                    forward.set((forward() + 7).min(370));
+                } else if moving_up && top < 400 && back() < 365 {
+                    back.set(back + 7);
+                    pending = Some((height, top));
                 }
+                last_top = top;
             }
         });
     });

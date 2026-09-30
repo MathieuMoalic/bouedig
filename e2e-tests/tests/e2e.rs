@@ -1164,7 +1164,12 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        anyhow::ensure!(day_count >= 60, "expected 60+ rendered days, got {day_count}");
+        // The lazy window starts at 25 sections (3 back, today, 21 ahead)
+        // and grows a week at a time as the reader approaches an end.
+        anyhow::ensure!(
+            day_count >= 20 && day_count <= 40,
+            "unexpected initial window: {day_count} sections"
+        );
 
         // Infinite scroll: driving the content scroller to its bottom must
         // extend the range automatically (no buttons).
