@@ -138,11 +138,12 @@ fn parse_recipe(map: &serde_json::Map<String, Value>) -> SchemaRecipe {
     }
 }
 
-/// Decode HTML entities (`&#39;`, `&amp;`, …) in every string of a JSON
-/// value. Recipe sites routinely leave them encoded inside JSON-LD text.
+/// Sanitize every string of a JSON value: decode HTML entities and strip
+/// HTML tags. Recipe sites routinely embed both inside JSON-LD text
+/// ("Step 1.<br><br><strong>Chef's Notes:</strong> rest the dough").
 fn decode_entities_in_value(value: Value) -> Value {
     match value {
-        Value::String(s) => Value::String(decode_html_entities(&s)),
+        Value::String(s) => Value::String(sanitize_text(&s)),
         Value::Array(items) => {
             Value::Array(items.into_iter().map(decode_entities_in_value).collect())
         }
@@ -153,6 +154,63 @@ fn decode_entities_in_value(value: Value) -> Value {
         ),
         other => other,
     }
+}
+
+/// Clean recipe text for display: decode HTML entities, remove HTML tags,
+/// collapse the horizontal whitespace the removal leaves behind. Newlines
+/// survive — free-text instruction blobs rely on them for step splitting.
+pub fn sanitize_text(input: &str) -> String {
+    let decoded = decode_html_entities(input);
+    let stripped = strip_html_tags(&decoded);
+    let mut out = String::with_capacity(stripped.len());
+    let mut pending_space = false;
+    let mut pending_newline = false;
+    for c in stripped.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+            pending_newline |= c == '\n';
+            continue;
+        }
+        if pending_space {
+            out.push(if pending_newline { '\n' } else { ' ' });
+            pending_space = false;
+            pending_newline = false;
+        }
+        out.push(c);
+    }
+    out.trim().to_string()
+}
+
+/// Remove HTML tags (`<br>`, `<strong>…</strong>`, comments) from text.
+/// Only sequences that look like real tags are touched — `<` followed by a
+/// letter, `/` or `!` — so prose like "bake at <200°C" survives. An
+/// unterminated `<` is left as plain text.
+fn strip_html_tags(input: &str) -> String {
+    if !input.contains('<') {
+        return input.to_string();
+    }
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<'
+            && chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/' || *c == '!')
+        {
+            match chars[i..].iter().position(|c| *c == '>') {
+                Some(length) => {
+                    out.push(' ');
+                    i += length + 1;
+                    continue;
+                }
+                None => {}
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Minimal HTML entity decoder: the common named entities plus decimal and
@@ -221,7 +279,7 @@ pub fn decode_html_entities(input: &str) -> String {
 /// String, array of strings or `{ "name": … }` → first meaningful string.
 pub(super) fn value_to_string(value: Option<&Value>) -> Option<String> {
     match value? {
-        Value::String(s) => non_empty(s.trim()).map(|s| decode_html_entities(&s)),
+        Value::String(s) => non_empty(s.trim()).map(|s| sanitize_text(&s)),
         Value::Array(items) => items.iter().find_map(|item| value_to_string(Some(item))),
         Value::Object(map) => ["name", "text", "url", "@id"]
             .iter()
@@ -317,4 +375,44 @@ pub fn page_title(document: &Html) -> Option<String> {
         .map(|el: ElementRef| el.text().collect::<String>())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tags_are_stripped_from_recipe_text() {
+        // The exact pattern from a forksoverknives import.
+        assert_eq!(
+            sanitize_text("Remove and let cool 10 to 15 minutes before slicing and serving. <br> <br> <strong>Chef's Notes:</strong> During the holidays I like to use fresh herbs in this recipe."),
+            "Remove and let cool 10 to 15 minutes before slicing and serving. Chef's Notes: During the holidays I like to use fresh herbs in this recipe."
+        );
+        // Simple line breaks collapse into spaces.
+        assert_eq!(sanitize_text("Mix.<br><br>Rest the dough."), "Mix. Rest the dough.");
+        // Closing tags are stripped as well.
+        assert_eq!(sanitize_text("<em>Soft</em> peaks"), "Soft peaks");
+        // Entities decode first, then the resulting tags strip too.
+        assert_eq!(sanitize_text("Heat &amp; stir&lt;br&gt;often"), "Heat & stir often");
+        // Prose with a bare < that is not a tag survives.
+        assert_eq!(sanitize_text("bake at <200°C"), "bake at <200°C");
+        assert_eq!(sanitize_text("2 < 3 cups"), "2 < 3 cups");
+        // An unterminated '<' is left as text.
+        assert_eq!(sanitize_text("use 1 <2 cups"), "use 1 <2 cups");
+        // Comments go too.
+        assert_eq!(sanitize_text("a<!-- ad -->b"), "a b");
+    }
+
+    #[test]
+    fn instruction_values_are_sanitized_recursively() {
+        let raw: Value = serde_json::from_str(
+            r#"[{"@type":"HowToStep","text":"Preheat.<br>Wait."},{"@type":"HowToStep","text":"<strong>Serve:</strong> warm."}]"#,
+        )
+        .unwrap();
+        let sanitized = decode_entities_in_value(raw);
+        let steps = super::super::normalize::parse_instructions(Some(&sanitized));
+        let texts: Vec<&str> = steps.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["Preheat. Wait.", "Serve: warm."]);
+        assert!(texts.iter().all(|t| !t.contains('<')));
+    }
 }

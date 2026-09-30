@@ -956,6 +956,7 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
  "recipeInstructions":[
    {"@type":"HowToStep","text":"Warm the galettes."},
    {"@type":"HowToStep","text":"Crack an egg onto each."},
+   {"@type":"HowToStep","text":"Season.<br><strong>Chef's Notes:</strong> Rest before serving."},
    {"@type":"HowToStep","text":"Add cheese, fold and serve."}]}
 </script></head>
 <body><h1>Breton Galette Complète</h1></body></html>
@@ -1075,6 +1076,16 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
         anyhow::ensure!(
             instructions.contains("Crack an egg onto each."),
             "imported instruction missing from detail: {instructions}"
+        );
+        // The tagged fixture step must arrive as clean prose: no HTML tags
+        // and the decoded apostrophe from "Chef's".
+        anyhow::ensure!(
+            instructions.contains("Season. Chef's Notes: Rest before serving."),
+            "tagged instruction not sanitized: {instructions}"
+        );
+        anyhow::ensure!(
+            !instructions.contains('<'),
+            "HTML tags leaked into detail instructions: {instructions}"
         );
         let source_text = driver.find(By::Id("detail-source")).await?.text().await?;
         anyhow::ensure!(

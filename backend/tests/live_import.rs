@@ -96,6 +96,16 @@ macro_rules! live_test {
                     "{url}: undecoded entity in instruction {:?}",
                     step.text
                 );
+                // HTML tags from the source page must never survive into
+                // stored instructions.
+                let stray = step.text.chars().collect::<Vec<_>>();
+                for window in stray.windows(2) {
+                    assert!(
+                        window != ['<', '/'] && !(window[0] == '<' && window[1].is_ascii_alphabetic()),
+                        "{url}: HTML tag fragment in instruction {:?}",
+                        step.text
+                    );
+                }
             }
 
             // Most ingredients should carry a parsed quantity (conservative

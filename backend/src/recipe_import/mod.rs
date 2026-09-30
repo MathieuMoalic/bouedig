@@ -781,6 +781,11 @@ mod tests {
         // "1-2 jalapeño peppers, (diced (see Note 1) )"
         assert_eq!(recipe.ingredients[4].quantity, Some(1.0), "range lower bound");
         assert_eq!(recipe.ingredients[4].name, "jalapeño peppers");
+        // Source instructions embed <br>/<strong> tags: stripped on import.
+        assert!(recipe
+            .instructions
+            .iter()
+            .all(|s| !s.text.contains('<') && !s.text.contains("&#")));
         // "4 cups (945 mL) low-sodium vegetable broth" — metric wins.
         assert_eq!(recipe.ingredients[12].quantity, Some(945.0));
         assert_eq!(recipe.ingredients[12].unit.as_deref(), Some("ml"));
