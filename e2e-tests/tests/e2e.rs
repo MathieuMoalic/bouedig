@@ -1146,16 +1146,47 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
         wait_for_url_path(&driver, "/meal-plan").await?;
 
         // The rolling range renders many days (a week back, two months
-        // ahead) — every day is plannable.
-        let day_count = driver
+        // ahead) — every day is plannable. The wasm client needs a moment
+        // to boot, so poll for the first render.
+        let mut day_count: i64 = 0;
+        for _ in 0..50 {
+            day_count = driver
+                .execute(
+                    "return document.querySelectorAll('.plan-day').length;",
+                    Vec::<serde_json::Value>::new(),
+                )
+                .await?
+                .json()
+                .as_i64()
+                .context("day count not a number")?;
+            if day_count > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(day_count >= 60, "expected 60+ rendered days, got {day_count}");
+
+        // Infinite scroll: driving the content scroller to its bottom must
+        // extend the range automatically (no buttons).
+        driver
+            .execute(
+                "var c = document.querySelector('.content'); c.scrollTop = c.scrollHeight;",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let extended = driver
             .execute(
                 "return document.querySelectorAll('.plan-day').length;",
                 Vec::<serde_json::Value>::new(),
             )
             .await?
-            .as_i64()
-            .context("day count missing")?;
-        anyhow::ensure!(day_count >= 60, "expected 60+ rendered days, got {day_count}");
+            .json().as_i64().context("day count not a number")
+            .context("extended day count missing")?;
+        anyhow::ensure!(
+            extended > day_count,
+            "scrolling to the bottom must extend the range: {day_count} -> {extended}"
+        );
 
         // Today's section: open its picker via the labeled section.
         driver

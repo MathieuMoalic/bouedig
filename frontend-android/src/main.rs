@@ -76,6 +76,12 @@ fn App() -> Element {
 // App shell: wallpaper + content + bottom navigation
 // ---------------------------------------------------------------------------
 
+/// Scroll position flags for the app-wide content scroller, published by
+/// `Layout` and consumed by pages with long lists (the meal plan) to extend
+/// their rendered range when the reader nears either end.
+pub static CONTENT_SCROLL_NEAR_TOP: GlobalSignal<bool> = Signal::global(|| false);
+pub static CONTENT_SCROLL_NEAR_BOTTOM: GlobalSignal<bool> = Signal::global(|| false);
+
 #[component]
 fn Layout() -> Element {
     rsx! {
@@ -85,6 +91,18 @@ fn Layout() -> Element {
         div { class: "app",
             div { class: "wallpaper", style: "background-image: url('{WALLPAPER}')" }
             main { class: "content",
+                id: "content-scroller",
+                onscroll: move |e: Event<ScrollData>| {
+                    let near_top = e.scroll_top() > 0.0 && e.scroll_top() < 600.0;
+                    let near_bottom = e.scroll_top() as i32 + e.client_height()
+                        > e.scroll_height() - 600;
+                    if *CONTENT_SCROLL_NEAR_TOP.read() != near_top {
+                        *CONTENT_SCROLL_NEAR_TOP.write() = near_top;
+                    }
+                    if *CONTENT_SCROLL_NEAR_BOTTOM.read() != near_bottom {
+                        *CONTENT_SCROLL_NEAR_BOTTOM.write() = near_bottom;
+                    }
+                },
                 Outlet::<Route> {}
             }
             BottomNav {}
@@ -2394,54 +2412,61 @@ fn MealPlan() -> Element {
         .collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
 
+    // Infinite scroll: approaching either end of the rendered range extends
+    // it. The scroll flags come from the shared content scroller (Layout)
+    // and re-arm as soon as the grown list pushes the end out of reach.
+    use_effect(move || {
+        // Capped at ~1 year out in 30-day pages; the flag re-arms as soon
+        // as the grown list pushes the end back out of the trigger zone.
+        if *CONTENT_SCROLL_NEAR_BOTTOM.read() && forward() < 370 {
+            forward.set((forward() + 30).min(370));
+        }
+    });
+    use_effect(move || {
+        if *CONTENT_SCROLL_NEAR_TOP.read() && back() < 370 {
+            back.set((back() + 30).min(370));
+        }
+    });
+
     rsx! {
         div { class: "page",
-            button {
-                class: "plan-more",
-                r#type: "button",
-                onclick: move |_| back.set(back + 30),
-                "‹ Show earlier days"
-            }
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
-            for day in days {
-                PlanDaySection {
-                    key: "{day.date}",
-                    day: day.clone(),
-                    on_remove: move |entry_id: i64| {
-                        spawn(async move {
-                            let client = reqwest::Client::new();
-                            match client
-                                .delete(format!("{}/api/meal-plan/{entry_id}", api_base()))
-                                .send()
-                                .await
-                            {
-                                Ok(r) if r.status().is_success() => {
-                                    entries.with_mut(|v| v.retain(|e| e.id != entry_id));
+            // The keyed day list lives in its own container: mixing a keyed
+            // list with static siblings panics dioxus's differ when the
+            // range grows.
+            div { class: "plan-days",
+                for day in days {
+                    PlanDaySection {
+                        day: day.clone(),
+                        on_remove: move |entry_id: i64| {
+                            spawn(async move {
+                                let client = reqwest::Client::new();
+                                match client
+                                    .delete(format!("{}/api/meal-plan/{entry_id}", api_base()))
+                                    .send()
+                                    .await
+                                {
+                                    Ok(r) if r.status().is_success() => {
+                                        entries.with_mut(|v| v.retain(|e| e.id != entry_id));
+                                    }
+                                    Ok(r) => tracing::error!("meal plan delete failed: {}", r.status()),
+                                    Err(err) => tracing::error!("meal plan delete request failed: {err:#}"),
                                 }
-                                Ok(r) => tracing::error!("meal plan delete failed: {}", r.status()),
-                                Err(err) => tracing::error!("meal plan delete request failed: {err:#}"),
-                            }
-                        });
-                    },
-                    on_add: move |date: String| {
-                        picker.set(Some(PickerState {
-                            date,
-                            label: day.label.clone(),
-                        }));
-                    },
-                    on_open: move |recipe_id: i64| {
-                        navigator.push(Route::RecipeDetail { id: recipe_id });
-                    },
+                            });
+                        },
+                        on_add: move |date: String| {
+                            picker.set(Some(PickerState {
+                                date,
+                                label: day.label.clone(),
+                            }));
+                        },
+                        on_open: move |recipe_id: i64| {
+                            navigator.push(Route::RecipeDetail { id: recipe_id });
+                        },
+                    }
                 }
-            }
-
-            button {
-                class: "plan-more",
-                r#type: "button",
-                onclick: move |_| forward.set(forward + 30),
-                "Show more days ›"
             }
 
             if let Some(state) = picker.read().clone() {
@@ -2536,7 +2561,7 @@ fn PlanDaySection(
 ) -> Element {
     let day_is_empty = day.entries.is_empty();
     rsx! {
-        div { class: "plan-day", key: "{day.date}",
+            div { class: "plan-day",
             div { class: "plan-day-head",
                 span { class: "plan-day-label", "{day.label}" }
                 button {

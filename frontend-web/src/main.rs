@@ -63,6 +63,7 @@ fn Layout() -> Element {
         div { class: "app",
             div { class: "wallpaper", style: "background-image: url('{WALLPAPER}')" }
             main { class: "content",
+                id: "content-scroller",
                 Outlet::<Route> {}
             }
             BottomNav {}
@@ -2827,54 +2828,82 @@ fn MealPlan() -> Element {
         .collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
 
+    // Infinite scroll: a light poll watches the content scroller and extends
+    // the rendered range when the reader nears either end. Polling (instead
+    // of scroll events) works in every webview, including ones that swallow
+    // programmatic scroll events. Capped at ~1 year out in 30-day pages.
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                let promise = js_sys::Promise::new(&mut |resolve, _| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 400);
+                    }
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                let Some(window) = web_sys::window() else { continue };
+                let Some(document) = window.document() else { continue };
+                let Some(element) = document
+                    .get_element_by_id("content-scroller")
+                    .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                let top = element.scroll_top();
+                let near_bottom = top as i64 + element.client_height() as i64
+                    > element.scroll_height() as i64 - 600;
+                let near_top = top > 0 && top < 600;
+                if near_bottom && forward() < 370 {
+                    forward.set((forward() + 30).min(370));
+                }
+                if near_top && back() < 370 {
+                    back.set((back() + 30).min(370));
+                }
+            }
+        });
+    });
+
     rsx! {
         div { class: "page",
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
-            button {
-                class: "plan-more",
-                r#type: "button",
-                onclick: move |_| back.set(back + 30),
-                "‹ Show earlier days"
-            }
-            for day in days {
-                PlanDaySection {
-                    key: "{day.date}",
-                    day: day.clone(),
-                    on_remove: move |entry_id: i64| {
-                        spawn(async move {
-                            let client = reqwest::Client::new();
-                            match client
-                                .delete(format!("{}/api/meal-plan/{entry_id}", api_base()))
-                                .send()
-                                .await
-                            {
-                                Ok(r) if r.status().is_success() => {
-                                    entries.with_mut(|v| v.retain(|e| e.id != entry_id));
+            // The keyed day list lives in its own container: mixing a keyed
+            // list with static siblings panics dioxus's differ when the
+            // range grows.
+            div { class: "plan-days",
+                for day in days {
+                    PlanDaySection {
+                        key: "{day.date}",
+                        day: day.clone(),
+                        on_remove: move |entry_id: i64| {
+                            spawn(async move {
+                                let client = reqwest::Client::new();
+                                match client
+                                    .delete(format!("{}/api/meal-plan/{entry_id}", api_base()))
+                                    .send()
+                                    .await
+                                {
+                                    Ok(r) if r.status().is_success() => {
+                                        entries.with_mut(|v| v.retain(|e| e.id != entry_id));
+                                    }
+                                    Ok(r) => tracing::error!("meal plan delete failed: {}", r.status()),
+                                    Err(err) => tracing::error!("meal plan delete request failed: {err:#}"),
                                 }
-                                Ok(r) => tracing::error!("meal plan delete failed: {}", r.status()),
-                                Err(err) => tracing::error!("meal plan delete request failed: {err:#}"),
-                            }
-                        });
-                    },
-                    on_add: move |date: String| {
-                        picker.set(Some(PickerState {
-                            date,
-                            label: day.label.clone(),
-                        }));
-                    },
-                    on_open: move |recipe_id: i64| {
-                        navigator.push(Route::RecipeDetail { id: recipe_id });
-                    },
+                            });
+                        },
+                        on_add: move |date: String| {
+                            picker.set(Some(PickerState {
+                                date,
+                                label: day.label.clone(),
+                            }));
+                        },
+                        on_open: move |recipe_id: i64| {
+                            navigator.push(Route::RecipeDetail { id: recipe_id });
+                        },
+                    }
                 }
-            }
-
-            button {
-                class: "plan-more",
-                r#type: "button",
-                onclick: move |_| forward.set(forward + 30),
-                "Show more days ›"
             }
 
             if let Some(state) = picker.read().clone() {

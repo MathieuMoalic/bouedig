@@ -1183,20 +1183,4 @@ ol.instruction-list li {
     margin-bottom: 8px;
 }
 
-.plan-more {
-    display: block;
-    width: 100%;
-    background: var(--surface);
-    border: none;
-    color: var(--muted);
-    font: inherit;
-    font-size: 13px;
-    padding: 10px;
-    border-radius: 12px;
-    margin-bottom: 14px;
-    cursor: pointer;
-}
 
-.plan-more:hover {
-    color: var(--accent-bright);
-}
