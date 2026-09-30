@@ -88,6 +88,11 @@ pub async fn import(raw_url: &str, allow_private: bool) -> Result<RecipePreview,
     warnings.extend(extraction_score.warnings);
 
     let preview = RecipePreview {
+        image_url: select_image(
+            json_ld_image_candidates(&scan),
+            html::og_image(&document).as_deref(),
+            &page.final_url,
+        ),
         recipe,
         method,
         confidence: extraction_score.confidence,
@@ -245,6 +250,51 @@ fn humanize_duration(value: &str) -> Option<String> {
     )
 }
 
+/// Image candidates from the chosen JSON-LD Recipe object. Exposed per
+/// candidate (not deduplicated) so `select_image` can prefer larger variants.
+fn json_ld_image_candidates(scan: &json_ld::JsonLdScan) -> Vec<String> {
+    scan.candidates
+        .iter()
+        .flat_map(|candidate| candidate.image.iter().cloned().collect::<Vec<_>>())
+        .collect()
+}
+
+/// Pick the representative image: the first JSON-LD candidate, preferring
+/// larger size variants (URLs hinting at pixel dimensions), else og:image.
+/// Relative URLs resolve against the page; non-http(s) results are dropped.
+fn select_image(
+    json_ld_candidates: Vec<String>,
+    og_image: Option<&str>,
+    base: &Url,
+) -> Option<String> {
+    let pick = best_sized(&json_ld_candidates).map(String::from).or_else(|| og_image.map(str::to_string))?;
+    let resolved = base.join(&pick).ok()?;
+    if resolved.scheme() == "http" || resolved.scheme() == "https" {
+        Some(resolved.to_string())
+    } else {
+        None
+    }
+}
+
+/// From a list of size variants of the same hero image, prefer one that
+/// hints at a large width (1200–2000px in the URL) over thumbnails.
+fn best_sized(candidates: &[String]) -> Option<&str> {
+    let first = candidates.first()?;
+    // Look for a width hint in any variant (…-1200x675.jpg, /1200/…).
+    for candidate in candidates {
+        for (width, _) in candidate
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|part| part.parse::<u32>().ok())
+            .map(|w| (w, ()))
+        {
+            if (1200..=2400).contains(&width) {
+                return Some(candidate);
+            }
+        }
+    }
+    Some(first)
+}
+
 /// HTML-only extraction → `RecipeInput` (None when nothing was recovered).
 fn from_html_only(html: &html::HtmlExtraction, final_url: &Url) -> Option<RecipeInput> {
     if html.ingredients.is_empty() && html.instructions.is_empty() {
@@ -343,6 +393,80 @@ mod tests {
         assert_eq!(recipe.ingredients.len(), 2);
         assert_eq!(recipe.instructions.len(), 2);
         assert_eq!(recipe.source, PAGE_URL);
+    }
+
+    #[test]
+    fn image_selection_prefers_json_ld_and_larger_variants() {
+        let base = Url::parse("https://www.example.com/recipe/cake").unwrap();
+        // JSON-LD wins over og:image; a 1200px variant beats a thumbnail.
+        let picked = select_image(
+            vec![
+                "https://cdn.example.com/cake-150x150.jpg".into(),
+                "https://cdn.example.com/cake-1200x800.jpg".into(),
+            ],
+            Some("https://www.example.com/og.jpg"),
+            &base,
+        );
+        assert_eq!(picked.as_deref(), Some("https://cdn.example.com/cake-1200x800.jpg"));
+
+        // No JSON-LD image → og:image.
+        let picked = select_image(vec![], Some("https://www.example.com/og.jpg"), &base);
+        assert_eq!(picked.as_deref(), Some("https://www.example.com/og.jpg"));
+
+        // Relative URLs resolve against the page.
+        let picked = select_image(vec!["/images/cake.jpg".into()], None, &base);
+        assert_eq!(
+            picked.as_deref(),
+            Some("https://www.example.com/images/cake.jpg")
+        );
+
+        // Nothing at all → None.
+        assert_eq!(select_image(vec![], None, &base), None);
+    }
+
+    #[test]
+    fn image_selection_from_full_page() {
+        let document = parse(
+            r#"
+            <html><head>
+            <meta property="og:image" content="https://www.example.com/og-cake.jpg">
+            </head><body>
+            <script type="application/ld+json">
+            {"@type":"Recipe","name":"Cake",
+             "image":[{"@type":"ImageObject","url":"https://cdn.example.com/cake-1600.jpg"}],
+             "recipeIngredient":["1 egg"],"recipeInstructions":["Mix."]}
+            </script></body></html>
+            "#,
+        );
+        let scan = json_ld::scan(&document);
+        let picked = select_image(
+            json_ld_image_candidates(&scan),
+            html::og_image(&document).as_deref(),
+            &Url::parse("https://www.example.com/recipe/cake").unwrap(),
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("https://cdn.example.com/cake-1600.jpg")
+        );
+
+        // The same page without a JSON-LD image falls back to og:image.
+        let document = parse(
+            r#"
+            <html><head>
+            <meta property="og:image" content="https://www.example.com/og-cake.jpg">
+            </head><body></body></html>
+            "#,
+        );
+        let scan = json_ld::scan(&document);
+        let picked = select_image(
+            json_ld_image_candidates(&scan),
+            html::og_image(&document).as_deref(),
+            &Url::parse("https://www.example.com/recipe/cake").unwrap(),
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("https://www.example.com/og-cake.jpg")
+        );
     }
 
     #[test]

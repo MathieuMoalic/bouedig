@@ -676,6 +676,7 @@ async fn parse_recipe_multipart(
     let mut yield_amount = String::new();
     let mut source = String::new();
     let mut image: Option<(String, String)> = None;
+    let mut image_url = String::new();
 
     while let Some(field) = multipart
         .next_field()
@@ -691,6 +692,7 @@ async fn parse_recipe_multipart(
             "notes" => notes = field.text().await.unwrap_or_default(),
             "yield" => yield_amount = field.text().await.unwrap_or_default(),
             "source" => source = field.text().await.unwrap_or_default(),
+            "image_url" => image_url = field.text().await.unwrap_or_default(),
             "image" => {
                 let bytes = field
                     .bytes()
@@ -702,6 +704,23 @@ async fn parse_recipe_multipart(
                 }
             }
             _ => {}
+        }
+    }
+
+    // A remote image URL (recipe import): download it now — only for recipes
+    // actually being saved. A manual photo upload always wins; failures are
+    // soft (the recipe saves without a photo).
+    if image.is_none() && !image_url.trim().is_empty() {
+        match recipe_import::fetch::download_image(image_url.trim(), state.import_allow_private).await {
+            Ok(bytes) => match save_recipe_image(&state.data_dir, &bytes) {
+                Ok(paths) => image = Some(paths),
+                Err(err) => {
+                    tracing::warn!("imported image could not be stored: {err:#}");
+                }
+            },
+            Err(err) => {
+                tracing::warn!("imported image could not be downloaded: {err}");
+            }
         }
     }
 
@@ -1491,6 +1510,89 @@ pub(crate) mod tests {
             json_response(app, "POST", "/api/recipes/import", Some(&payload)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert!(body.contains("could not extract"), "{body}");
+    }
+
+    /// A tiny PNG served from a loopback origin (for the image-import tests).
+    fn png_server() -> SocketAddr {
+        let img = image::DynamicImage::new_rgb8(8, 8);
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let body: &'static [u8] = Box::leak(png.into_boxed_slice());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 4096];
+                use std::io::{Read, Write};
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        addr
+    }
+
+    /// `image_url` on the multipart save: the backend downloads the image at
+    /// save time and stores full-res + thumbnail like a manual upload.
+    #[tokio::test]
+    async fn imported_image_url_downloads_at_save() {
+        let image_addr = png_server();
+        let app = test_router_import().await;
+        let boundary = "ImgUrlBnd";
+        let image_url = format!("http://{image_addr}/hero.png");
+        let payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nImported Cake\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n[{{\"quantity\":200,\"unit\":\"g\",\"name\":\"flour\",\"prep\":null}}]\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n[{{\"text\":\"Bake.\"}}]\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"image_url\"\r\n\r\n{image_url}\r\n\
+             --{boundary}--\r\n"
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/photo")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let recipe: Recipe = serde_json::from_slice(&bytes).unwrap();
+        let image = recipe.image.expect("imported image must be stored");
+        assert!(image.starts_with("/api/images/images/"));
+        let thumb = recipe.thumb.expect("imported thumbnail must be stored");
+        assert!(thumb.starts_with("/api/images/images/thumbs/"));
+    }
+
+    /// A broken image URL never blocks the save — the recipe stores fine
+    /// without a photo.
+    #[tokio::test]
+    async fn imported_image_url_failure_is_soft() {
+        let app = test_router_import().await;
+        let boundary = "ImgBadBnd";
+        let payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nImported Soup\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"ingredients\"\r\n\r\n[]\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"instructions\"\r\n\r\n[]\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"image_url\"\r\n\r\nhttp://127.0.0.1:9/missing.png\r\n\
+             --{boundary}--\r\n"
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/photo")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let recipe: Recipe = serde_json::from_slice(&bytes).unwrap();
+        assert!(recipe.image.is_none(), "failed download must not block the save");
     }
 
     /// The full plan Phase 13 journey: import preview → save → retrieve and

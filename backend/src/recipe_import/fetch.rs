@@ -317,3 +317,61 @@ mod tests {
         assert!(!is_disallowed_ip(&"2606:4700::1111".parse::<IpAddr>().unwrap()));
     }
 }
+
+
+/// Upper bound for a downloaded recipe image (site heroes stay well below).
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// Download recipe image bytes from a page-provided URL. The URL comes from
+/// a fetched page, so it gets the same SSRF treatment as the page fetch
+/// (validated, private targets refused, every redirect hop re-checked) plus
+/// a size cap. `Content-Type` is not trusted — the caller detects the real
+/// format from the bytes themselves.
+pub async fn download_image(raw_url: &str, allow_private: bool) -> Result<Vec<u8>, ImportError> {
+    let url = validate_url(raw_url, allow_private).await?;
+    let client = http_client();
+    let mut current = url;
+    for _hop in 0..=MAX_REDIRECTS {
+        if !allow_private {
+            if let Some(host) = current.host_str() {
+                ensure_public_host(host)
+                    .await
+                    .map_err(ImportError::DisallowedTarget)?;
+            }
+        }
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| ImportError::FetchFailed(format!("{}: {e}", current.host_str().unwrap_or_default())))?;
+        if response.status().is_redirection() {
+            current = final_redirect(&response, &current)?;
+            continue;
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ImportError::FetchFailed(format!(
+                "the image server answered with HTTP {status}"
+            )));
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut chunks = response;
+        while let Some(chunk) = chunks
+            .chunk()
+            .await
+            .map_err(|e| ImportError::FetchFailed(format!("download interrupted: {e}")))?
+        {
+            if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+                return Err(ImportError::FetchFailed(format!(
+                    "the image is larger than the {} MiB limit",
+                    MAX_IMAGE_BYTES / (1024 * 1024)
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return Ok(bytes);
+    }
+    Err(ImportError::FetchFailed(format!(
+        "more than {MAX_REDIRECTS} redirects"
+    )))
+}

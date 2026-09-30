@@ -122,7 +122,7 @@ fn parse_recipe(map: &serde_json::Map<String, Value>) -> SchemaRecipe {
     SchemaRecipe {
         name: value_to_string(map.get("name")),
         description: value_to_string(map.get("description")),
-        image: image_url(map.get("image")),
+        image: image_urls(map.get("image")).first().cloned(),
         author: author_name(map.get("author")),
         ingredients: string_list(map.get("recipeIngredient")),
         instructions_raw: map
@@ -246,13 +246,32 @@ fn value_to_joined_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn image_url(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) => non_empty(s.trim()),
-        Value::Array(items) => items.iter().find_map(|item| image_url(Some(item))),
-        Value::Object(map) => map.get("url").and_then(|u| value_to_string(Some(u))),
-        _ => None,
+/// Every image URL candidate in a `image` value: a bare string, an array of
+/// strings/ImageObjects, or an ImageObject (possibly with a nested array).
+/// Size variants are kept — the best one is picked later.
+pub(super) fn image_urls(value: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    fn collect(value: Option<&Value>, out: &mut Vec<String>) {
+        match value {
+            Some(Value::String(s)) => {
+                if let Some(s) = non_empty(s.trim()) {
+                    out.push(s);
+                }
+            }
+            Some(Value::Array(items)) => {
+                for item in items {
+                    collect(Some(item), out);
+                }
+            }
+            Some(Value::Object(map)) => {
+                collect(map.get("url"), out);
+                collect(map.get("contentUrl"), out);
+            }
+            _ => {}
+        }
     }
+    collect(value, &mut out);
+    out
 }
 
 fn author_name(value: Option<&Value>) -> Option<String> {

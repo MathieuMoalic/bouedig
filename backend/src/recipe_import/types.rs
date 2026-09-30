@@ -119,6 +119,10 @@ impl std::error::Error for ImportError {}
 /// provenance. Nothing is persisted by the import endpoint itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecipePreview {
+    /// Best image candidate for the recipe (JSON-LD image, falling back to
+    /// og:image). Resolved absolute; downloaded only when the recipe is saved.
+    #[serde(default)]
+    pub image_url: Option<String>,
     pub recipe: shared::RecipeInput,
     pub method: ExtractionMethod,
     pub confidence: f32,

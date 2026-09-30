@@ -332,6 +332,7 @@ fn build_multipart(
     yield_amount: &str,
     source: &str,
     image: Option<(&str, &[u8])>,
+    image_url: Option<&str>,
 ) -> (String, Vec<u8>) {
     // `SystemTime::now` is not implemented on wasm, use the JS clock.
     let boundary = format!("bouedig{}", js_sys::Date::now() as u64);
@@ -344,6 +345,9 @@ fn build_multipart(
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"notes\"\r\n\r\n{notes}\r\n").as_bytes());
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"yield\"\r\n\r\n{yield_amount}\r\n").as_bytes());
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\n{source}\r\n").as_bytes());
+    if let Some(url) = image_url {
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image_url\"\r\n\r\n{url}\r\n").as_bytes());
+    }
     if let Some((filename, bytes)) = image {
         let mime = match filename.rsplit('.').next().unwrap_or_default() {
             "png" => "image/png",
@@ -617,6 +621,10 @@ struct ImportPreview {
     method: String,
     confidence: f32,
     warnings: Vec<String>,
+    /// Absolute image URL from the source page; downloaded by the backend
+    /// only when the recipe is saved.
+    #[serde(default)]
+    image_url: Option<String>,
 }
 
 /// Where a warning can take the user in the form below.
@@ -842,6 +850,9 @@ fn ImportRecipe() -> Element {
             rsx! {
             div { class: "page",
                 div { class: "card import-summary", id: "import-summary",
+                    if let Some(image) = &p.image_url {
+                        img { class: "import-photo", src: "{image}", alt: "{p.recipe.name}", referrerpolicy: "no-referrer" }
+                    }
                     div { class: "import-summary-head",
                         span { class: "import-badge", "{p.method}" }
                         span { class: "muted", "confidence {confidence_pct}%" }
@@ -891,6 +902,7 @@ fn ImportRecipe() -> Element {
                 // Review/edit in the existing editor, then save explicitly.
                 RecipeFormFields {
                     initial: import_preview_to_detail(&p),
+                    initial_image_url: p.image_url.clone(),
                     editing_id: None,
                 }
             }
@@ -940,10 +952,10 @@ fn RecipeForm(editing: Option<i64>) -> Element {
     let loaded = detail.read().clone();
     match (editing, loaded) {
         (None, _) => rsx! {
-            RecipeFormFields { initial: RecipeDetailModel::default(), editing_id: None }
+            RecipeFormFields { initial: RecipeDetailModel::default(), initial_image_url: None, editing_id: None }
         },
         (Some(_), Some(initial)) => rsx! {
-            RecipeFormFields { initial: initial, editing_id: editing }
+            RecipeFormFields { initial: initial, initial_image_url: None, editing_id: editing }
         },
         (Some(_), None) => rsx! {
             if load_error.read().is_empty() {
@@ -1012,7 +1024,11 @@ fn IconHandle() -> Element {
 }
 
 #[component]
-fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Element {
+fn RecipeFormFields(
+    initial: RecipeDetailModel,
+    initial_image_url: Option<String>,
+    editing_id: Option<i64>,
+) -> Element {
     // One shared id counter so element ids never collide across lists.
     let sec_count = initial.sections.len() as u64;
     let ing_count = initial.ingredients.len() as u64;
@@ -1087,6 +1103,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
     let mut drag = use_signal(|| None::<DragState>);
     let mut suppress_click = use_signal(|| false);
     let mut photo = use_signal(|| None::<(String, Vec<u8>)>);
+    let mut import_image_url = use_signal(|| initial_image_url);
     let mut status = use_signal(|| String::new());
     let mut status_error = use_signal(|| false);
     let navigator = use_navigator();
@@ -1315,13 +1332,38 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                         let yield_json = input.yield_amount.clone();
                         let source_json = input.source.clone();
 
+                        let import_url = import_image_url.read().clone();
+                        let import_url_ref = import_url.as_deref();
                         let result = match (editing_id, image) {
-                            (None, None) => client
+                            // Plain create: multipart (not JSON) whenever an
+                            // imported image URL must ride along.
+                            (None, None) if import_url.is_none() => client
                                 .post(format!("{base}/api/recipes"))
                                 .json(&input)
                                 .send()
                                 .await
                                 .map(|r| (r, None)),
+                            (None, None) => {
+                                let (ct, body) = build_multipart(
+                                    &input.name,
+                                    &sections_json,
+                                    &ingredients_json,
+                                    &instructions_json,
+                                    &instruction_sections_json,
+                                    &notes_json,
+                                    &yield_json,
+                                    &source_json,
+                                    None,
+                                    import_url.as_deref(),
+                                );
+                                client
+                                    .post(format!("{base}/api/recipes/photo"))
+                                    .header("Content-Type", ct)
+                                    .body(body)
+                                    .send()
+                                    .await
+                                    .map(|r| (r, None))
+                            }
                             (None, Some((filename, bytes))) => {
                                 let (ct, body) = build_multipart(
                                     &input.name,
@@ -1333,6 +1375,7 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                     &yield_json,
                                     &source_json,
                                     Some((&filename, &bytes)),
+                                    None,
                                 );
                                 client
                                     .post(format!("{base}/api/recipes/photo"))
@@ -1356,6 +1399,11 @@ fn RecipeFormFields(initial: RecipeDetailModel, editing_id: Option<i64>) -> Elem
                                     &yield_json,
                                     &source_json,
                                     image_ref,
+                                    if image_ref.is_some() {
+                                        None
+                                    } else {
+                                        import_url_ref
+                                    },
                                 );
                                 client
                                     .put(format!("{base}/api/recipes/{id}"))

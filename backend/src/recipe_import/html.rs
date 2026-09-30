@@ -238,3 +238,27 @@ fn heading_level(tag: &str) -> Option<usize> {
         _ => None,
     }
 }
+
+/// The page's `og:image` (or `twitter:image`) — the social-share image sites
+/// craft to represent the page. Used as the recipe-image fallback when the
+/// JSON-LD carries no image.
+pub fn og_image(document: &Html) -> Option<String> {
+    for selector in [
+        "meta[property=\"og:image\"]",
+        "meta[name=\"og:image\"]",
+        "meta[name=\"twitter:image\"]",
+        "meta[property=\"twitter:image:src\"]",
+    ] {
+        if let Ok(sel) = Selector::parse(selector) {
+            for element in document.select(&sel) {
+                if let Some(content) = element.value().attr("content") {
+                    let content = content.trim();
+                    if !content.is_empty() {
+                        return Some(content.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}

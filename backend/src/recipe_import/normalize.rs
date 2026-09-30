@@ -263,7 +263,7 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
 
     // A leading parenthetical with a digit ("(454g) sweet potatoes") must not
     // block unit detection: skip over it, keep it in the name.
-    let (mut unit, mut remainder) = if remainder_trimmed.starts_with('(') {
+    let (mut unit, remainder) = if remainder_trimmed.starts_with('(') {
         match leading_group(&remainder_trimmed) {
             Some((group, after_group)) if group_content_has_digit(group) => {
                 let after_group_trim = after_group.trim_start();

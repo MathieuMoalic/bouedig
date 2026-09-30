@@ -1182,3 +1182,12 @@ ol.instruction-list li {
 .warnings-dismiss:hover {
     color: var(--error);
 }
+
+.import-photo {
+    display: block;
+    width: 100%;
+    max-height: 220px;
+    object-fit: cover;
+    border-radius: 12px;
+    margin-bottom: 8px;
+}
