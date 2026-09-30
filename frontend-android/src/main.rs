@@ -2366,9 +2366,18 @@ fn MealPlan() -> Element {
         }
     });
 
-    // Group the rolling week: today .. today+6, entries grouped per day.
+    // The rendered day range. It starts a week back and two months ahead,
+    // and the buttons at either end extend it — practically infinite scroll
+    // with zero platform-specific code.
+    let mut back = use_signal(|| 7i64);
+    let mut forward = use_signal(|| 59i64);
+
+    // Group every day in the range: entries grouped per day, empty days
+    // render with their ⊕ so any day is plannable.
     let today_value = today.read().clone();
-    let mut days: Vec<PlanDay> = (0..7)
+    let back_value = back.read().clone();
+    let forward_value = forward.read().clone();
+    let mut days: Vec<PlanDay> = ((-back_value)..=forward_value)
         .map(|offset| {
             let date = shift_local_iso(&today_value, offset);
             PlanDay {
@@ -2383,14 +2392,16 @@ fn MealPlan() -> Element {
             }
         })
         .collect();
-    // Days with no entries after tomorrow collapse away to keep the screen
-    // dense; today and tomorrow always show (the blaz pattern).
-    days.retain(|day| {
-        !day.entries.is_empty() || day.label == "Today" || day.label == "Tomorrow"
-    });
+    days.sort_by(|a, b| a.date.cmp(&b.date));
 
     rsx! {
         div { class: "page",
+            button {
+                class: "plan-more",
+                r#type: "button",
+                onclick: move |_| back.set(back + 30),
+                "‹ Show earlier days"
+            }
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
@@ -2424,6 +2435,13 @@ fn MealPlan() -> Element {
                         navigator.push(Route::RecipeDetail { id: recipe_id });
                     },
                 }
+            }
+
+            button {
+                class: "plan-more",
+                r#type: "button",
+                onclick: move |_| forward.set(forward + 30),
+                "Show more days ›"
             }
 
             if let Some(state) = picker.read().clone() {
@@ -2559,7 +2577,7 @@ fn PlanDaySection(
                     }
                 }
                 if day_is_empty {
-                    span { class: "plan-empty", "Nothing planned" }
+                    span { class: "plan-empty", "No recipes" }
                 }
             }
         }

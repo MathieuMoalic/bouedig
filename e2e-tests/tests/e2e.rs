@@ -1145,8 +1145,26 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
         driver.goto(format!("{base}/meal-plan")).await?;
         wait_for_url_path(&driver, "/meal-plan").await?;
 
-        // Today's section is always present; open its picker.
-        driver.find(By::Css(".plan-day .plan-add")).await?.click().await?;
+        // The rolling range renders many days (a week back, two months
+        // ahead) — every day is plannable.
+        let day_count = driver
+            .execute(
+                "return document.querySelectorAll('.plan-day').length;",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .as_i64()
+            .context("day count missing")?;
+        anyhow::ensure!(day_count >= 60, "expected 60+ rendered days, got {day_count}");
+
+        // Today's section: open its picker via the labeled section.
+        driver
+            .find(By::XPath(
+                "//div[contains(@class, 'plan-day')][.//span[@class='plan-day-label' and text()='Today']]//button[@class='plan-add']",
+            ))
+            .await?
+            .click()
+            .await?;
         driver
             .find(By::Id("plan-search"))
             .await
