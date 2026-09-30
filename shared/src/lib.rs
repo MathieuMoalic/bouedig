@@ -112,3 +112,21 @@ pub struct NewGroceryItem {
 pub struct GroceryUpdate {
     pub bought: bool,
 }
+
+/// One recipe scheduled on one day of the meal plan. The recipe summary is
+/// embedded so clients need no second request to render the plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MealPlanEntry {
+    pub id: i64,
+    /// Local calendar date, `YYYY-MM-DD`.
+    pub date: String,
+    pub recipe: Recipe,
+}
+
+/// Payload used to add a recipe to a day of the meal plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMealPlanEntry {
+    /// Local calendar date, `YYYY-MM-DD`.
+    pub date: String,
+    pub recipe_id: i64,
+}

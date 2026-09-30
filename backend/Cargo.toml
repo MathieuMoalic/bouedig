@@ -19,6 +19,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 uuid = { version = "1", features = ["v4"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 scraper.workspace = true
+chrono.workspace = true
 url.workspace = true
 
 [dev-dependencies]

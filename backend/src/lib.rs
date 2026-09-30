@@ -16,8 +16,8 @@ use axum::routing::{get, delete, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use shared::{
-    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, NewGroceryItem, Recipe, RecipeDetail,
-    RecipeInput,
+    GroceryItem, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry, NewGroceryItem,
+    Recipe, RecipeDetail, RecipeInput,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -132,6 +132,11 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
             "/grocery/{id}",
             delete(delete_grocery_item).patch(update_grocery_item),
         )
+        .route(
+            "/meal-plan",
+            get(list_meal_plan).post(add_meal_plan_entry),
+        )
+        .route("/meal-plan/{id}", delete(delete_meal_plan_entry))
         .route("/images/{*path}", get(serve_image))
         // Photo uploads can be several megabytes.
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
@@ -1024,6 +1029,98 @@ async fn delete_grocery_item(
 }
 
 // ---------------------------------------------------------------------------
+// Meal plan
+// ---------------------------------------------------------------------------
+
+/// One meal-plan row joined with its recipe summary.
+fn row_to_meal_plan_entry(row: &sqlx::sqlite::SqliteRow) -> MealPlanEntry {
+    use sqlx::Row;
+    let (image, thumb) = recipe_urls(row);
+    MealPlanEntry {
+        id: row.get::<i64, _>("id"),
+        date: row.get::<String, _>("date"),
+        recipe: Recipe {
+            id: row.get::<i64, _>("recipe_id"),
+            name: row.get::<String, _>("name"),
+            image,
+            thumb,
+        },
+    }
+}
+
+const MEAL_PLAN_SELECT: &str = "SELECT m.id, m.date, r.id AS recipe_id, r.name, \
+     r.image_path, r.thumb_path \
+     FROM meal_plan_entries m JOIN recipes r ON r.id = m.recipe_id";
+
+/// `GET /api/meal-plan`: every entry, ordered by day then insertion order.
+async fn list_meal_plan(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<Json<Vec<MealPlanEntry>>, ApiError> {
+    let rows = sqlx::query(&format!("{MEAL_PLAN_SELECT} ORDER BY m.date, m.id"))
+        .fetch_all(&state.db)
+        .await?;
+    Ok(Json(rows.iter().map(row_to_meal_plan_entry).collect()))
+}
+
+/// `POST /api/meal-plan`: schedule a recipe on a day. The date must be a
+/// real calendar day in `YYYY-MM-DD` form; duplicates are allowed (leftovers
+/// are a thing).
+#[derive(Debug, Deserialize)]
+struct NewMealPlanEntry {
+    date: String,
+    recipe_id: i64,
+}
+
+async fn add_meal_plan_entry(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(entry): Json<NewMealPlanEntry>,
+) -> Result<(StatusCode, Json<MealPlanEntry>), ApiError> {
+    if chrono::NaiveDate::parse_from_str(entry.date.trim(), "%Y-%m-%d").is_err() {
+        return Err(ApiError(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "date must be a real calendar day in YYYY-MM-DD form",
+            )
+                .into_response(),
+        ));
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO meal_plan_entries (date, recipe_id) VALUES (?, ?) RETURNING id",
+    )
+    .bind(entry.date.trim())
+    .bind(entry.recipe_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| match &err {
+        sqlx::Error::Database(db) if db.message().contains("FOREIGN KEY") => {
+            ApiError((StatusCode::NOT_FOUND, "no such recipe").into_response())
+        }
+        _ => ApiError::from(err),
+    })?
+    .ok_or_else(|| ApiError((StatusCode::NOT_FOUND, "no such recipe").into_response()))?;
+    let row = sqlx::query(&format!("{MEAL_PLAN_SELECT} WHERE m.id = ?"))
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok((StatusCode::CREATED, Json(row_to_meal_plan_entry(&row))))
+}
+
+/// `DELETE /api/meal-plan/{id}`: unschedule one entry.
+async fn delete_meal_plan_entry(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let rows = sqlx::query("DELETE FROM meal_plan_entries WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    if rows.rows_affected() == 0 {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such meal plan entry").into_response()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
 // Tests (router level, no HTTP server or browser required)
 // ---------------------------------------------------------------------------
 
@@ -1712,11 +1809,142 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::OK, "{response_body}");
         let preview: serde_json::Value = serde_json::from_str(&response_body).unwrap();
         assert_eq!(preview["recipe"]["name"], "Apple Cake", "{response_body}");
-        // The source is the final URL after the redirect.
         assert_eq!(preview["recipe"]["source"], format!("http://{addr}/final"));
-    }
 }
 
+
+    #[tokio::test]
+    async fn meal_plan_round_trip() {
+        let app = test_router(None).await;
+        // Seed two recipes.
+        let mut ids = Vec::new();
+        for name in ["Soup", "Pasta"] {
+            let (status, body) = json_response(
+                app.clone(),
+                "POST",
+                "/api/recipes",
+                Some(&format!(r#"{{"name":"{name}","ingredients":[],"instructions":[]}}"#)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let recipe: Recipe = serde_json::from_str(&body).unwrap();
+            ids.push(recipe.id);
+        }
+
+        // Add entries: Soup today-ish, Pasta on another day. Same recipe may
+        // repeat on one day (leftovers).
+        for (date, recipe_id) in [
+            ("2026-10-01", ids[0]),
+            ("2026-10-02", ids[1]),
+            ("2026-10-01", ids[1]),
+            ("2026-10-01", ids[1]),
+        ] {
+            let (status, body) = json_response(
+                app.clone(),
+                "POST",
+                "/api/meal-plan",
+                Some(&format!(r#"{{"date":"{date}","recipe_id":{recipe_id}}}"#)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let entry: MealPlanEntry = serde_json::from_str(&body).unwrap();
+            assert_eq!(entry.date, date);
+            assert_eq!(entry.recipe.id, recipe_id);
+            assert_eq!(entry.recipe.name, if recipe_id == ids[0] { "Soup" } else { "Pasta" });
+        }
+
+        // GET returns everything ordered by date then insertion.
+        let (status, body) = json_response(app.clone(), "GET", "/api/meal-plan", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let entries: Vec<MealPlanEntry> = serde_json::from_str(&body).unwrap();
+        assert_eq!(entries.len(), 4);
+        let dates: Vec<&str> = entries.iter().map(|e| e.date.as_str()).collect();
+        assert_eq!(dates, vec!["2026-10-01", "2026-10-01", "2026-10-01", "2026-10-02"]);
+
+        // DELETE one entry; it is gone, the rest stay.
+        let deleted_id = entries[0].id;
+        let (status, _) =
+            json_response(app.clone(), "DELETE", &format!("/api/meal-plan/{deleted_id}"), None)
+                .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = json_response(app.clone(), "GET", "/api/meal-plan", None).await;
+        let entries: Vec<MealPlanEntry> = serde_json::from_str(&body).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        // Deleting again is 404.
+        let (status, _) =
+            json_response(app, "DELETE", &format!("/api/meal-plan/{deleted_id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn meal_plan_rejects_bad_input() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"Soup","ingredients":[],"instructions":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let recipe: Recipe = serde_json::from_str(&body).unwrap();
+
+        // Invalid dates are 422, including real-looking but impossible ones.
+        for date in ["not-a-date", "2026-02-30", "2026-13-01", ""] {
+            let payload = format!(r#"{{"date":"{date}","recipe_id":{}}}"#, recipe.id);
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/meal-plan", Some(&payload)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "date {date:?}: {body}");
+        }
+
+        // Unknown recipe is 404.
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/meal-plan",
+            Some(r#"{"date":"2026-10-01","recipe_id":9999}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_recipe_cascades_its_meal_plan_entries() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"Goner","ingredients":[],"instructions":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let recipe: Recipe = serde_json::from_str(&body).unwrap();
+
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/meal-plan",
+            Some(&format!(r#"{{"date":"2026-10-01","recipe_id":{}}}"#, recipe.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // Delete the recipe; the plan entry cascades away.
+        let (status, _) = json_response(
+            app.clone(),
+            "DELETE",
+            &format!("/api/recipes/{}", recipe.id),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = json_response(app, "GET", "/api/meal-plan", None).await;
+        let entries: Vec<MealPlanEntry> = serde_json::from_str(&body).unwrap();
+        assert!(entries.is_empty(), "entries must cascade: {body}");
+    }
+}
 #[cfg(test)]
 mod photo_tests {
     use super::tests::*;

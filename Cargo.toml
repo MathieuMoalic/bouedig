@@ -31,6 +31,7 @@ scraper = "0.27"
 url = "2.5"
 dioxus = { version = "0.7", features = ["router"] }
 tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Pinned to match the wasm-bindgen support bundled with the `dx` CLI
 # provided by nixpkgs (see flake.nix). Do not bump these independently.

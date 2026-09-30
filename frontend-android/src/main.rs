@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
 use shared::{
-    GroceryItem, Ingredient, InstructionStep, NewGroceryItem, Recipe,
+    GroceryItem, Ingredient, InstructionStep, MealPlanEntry, NewGroceryItem, Recipe,
     RecipeDetail as RecipeDetailModel, RecipeInput,
 };
 
@@ -2339,10 +2339,300 @@ async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>)
 
 #[component]
 fn MealPlan() -> Element {
+    let mut entries = use_signal(Vec::<MealPlanEntry>::new);
+    let mut recipes = use_signal(Vec::<Recipe>::new);
+    let mut error = use_signal(|| String::new());
+    let mut loaded = use_signal(|| false);
+    let mut picker = use_signal(|| None::<PickerState>);
+    let navigator = use_navigator();
+    let today = use_signal(today_local_iso);
+
+    use_effect(move || {
+        if !loaded() {
+            loaded.set(true);
+            spawn(async move {
+                match api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                    Ok(list) => entries.set(list),
+                    Err(err) => {
+                        tracing::error!("meal plan refresh failed: {err:#}");
+                        error.set(err.to_string());
+                    }
+                }
+                match api_get::<Vec<Recipe>>("/api/recipes").await {
+                    Ok(list) => recipes.set(list),
+                    Err(err) => tracing::error!("recipes refresh failed: {err:#}"),
+                }
+            });
+        }
+    });
+
+    // Group the rolling week: today .. today+6, entries grouped per day.
+    let today_value = today.read().clone();
+    let mut days: Vec<PlanDay> = (0..7)
+        .map(|offset| {
+            let date = shift_local_iso(&today_value, offset);
+            PlanDay {
+                label: day_label(&date, &today_value),
+                entries: entries
+                    .read()
+                    .iter()
+                    .filter(|e| e.date == date)
+                    .cloned()
+                    .collect(),
+                date,
+            }
+        })
+        .collect();
+    // Days with no entries after tomorrow collapse away to keep the screen
+    // dense; today and tomorrow always show (the blaz pattern).
+    days.retain(|day| {
+        !day.entries.is_empty() || day.label == "Today" || day.label == "Tomorrow"
+    });
+
     rsx! {
-        PlaceholderPage {
-            title: "Meal plan",
-            text: "Plan your week — coming soon.",
+        div { class: "page",
+            if !error.read().is_empty() {
+                p { class: "status-error", "{error}" }
+            }
+            for day in days {
+                PlanDaySection {
+                    key: "{day.date}",
+                    day: day.clone(),
+                    on_remove: move |entry_id: i64| {
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            match client
+                                .delete(format!("{}/api/meal-plan/{entry_id}", api_base()))
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    entries.with_mut(|v| v.retain(|e| e.id != entry_id));
+                                }
+                                Ok(r) => tracing::error!("meal plan delete failed: {}", r.status()),
+                                Err(err) => tracing::error!("meal plan delete request failed: {err:#}"),
+                            }
+                        });
+                    },
+                    on_add: move |date: String| {
+                        picker.set(Some(PickerState {
+                            date,
+                            label: day.label.clone(),
+                        }));
+                    },
+                    on_open: move |recipe_id: i64| {
+                        navigator.push(Route::RecipeDetail { id: recipe_id });
+                    },
+                }
+            }
+
+            if let Some(state) = picker.read().clone() {
+                PlanPicker {
+                    key: "{state.date}",
+                    date: state.date.clone(),
+                    label: state.label.clone(),
+                    recipes: recipes.read().clone(),
+                    on_add: move |(date, recipe_id): (String, i64)| {
+                        picker.set(None);
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            match client
+                                .post(format!("{}/api/meal-plan", api_base()))
+                                .json(&serde_json::json!({ "date": date, "recipe_id": recipe_id }))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    match resp.json::<MealPlanEntry>().await {
+                                        Ok(entry) => entries.with_mut(|v| v.push(entry)),
+                                        Err(err) => {
+                                            tracing::error!("meal plan add: unreadable body: {err:#}")
+                                        }
+                                    }
+                                }
+                                Ok(resp) => {
+                                    tracing::error!("meal plan add failed: {}", resp.status())
+                                }
+                                Err(err) => {
+                                    tracing::error!("meal plan add request failed: {err:#}")
+                                }
+                            }
+                        });
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Local today as `YYYY-MM-DD` (device timezone via chrono).
+fn today_local_iso() -> String {
+    chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
+}
+
+/// `YYYY-MM-DD` shifted by `days` (negative goes back).
+fn shift_local_iso(date: &str, days: i64) -> String {
+    match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(d) => (d + chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string(),
+        Err(_) => date.to_string(),
+    }
+}
+
+/// Human label for a plan day: Today / Tomorrow / "Thu, Oct 1".
+fn day_label(date: &str, today: &str) -> String {
+    if date == today {
+        return "Today".into();
+    }
+    if date == shift_local_iso(today, 1) {
+        return "Tomorrow".into();
+    }
+    match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(d) => d.format("%a, %b %-d").to_string(),
+        Err(_) => date.to_string(),
+    }
+}
+
+/// Which day the picker modal is adding to.
+#[derive(Clone, PartialEq)]
+struct PickerState {
+    date: String,
+    label: String,
+}
+
+/// A rendered day of the meal plan: header (label + ⊕) and recipe cards.
+#[derive(Clone, PartialEq)]
+struct PlanDay {
+    date: String,
+    label: String,
+    entries: Vec<MealPlanEntry>,
+}
+
+#[component]
+fn PlanDaySection(
+    day: PlanDay,
+    on_remove: EventHandler<i64>,
+    on_add: EventHandler<String>,
+    on_open: EventHandler<i64>,
+) -> Element {
+    let day_is_empty = day.entries.is_empty();
+    rsx! {
+        div { class: "plan-day", key: "{day.date}",
+            div { class: "plan-day-head",
+                span { class: "plan-day-label", "{day.label}" }
+                button {
+                    class: "plan-add",
+                    r#type: "button",
+                    title: "Add recipe",
+                    onclick: move |_| on_add.call(day.date.clone()),
+                    IconPlus {}
+                }
+            }
+            div { class: "plan-cards",
+                for entry in day.entries {
+                    div { class: "plan-card",
+                        key: "{entry.id}",
+                        onclick: move |_| on_open.call(entry.recipe.id),
+                        button {
+                            class: "plan-remove",
+                            r#type: "button",
+                            title: "Remove from plan",
+                            onclick: move |ev: MouseEvent| {
+                                ev.stop_propagation();
+                                on_remove.call(entry.id);
+                            },
+                            IconX {}
+                        }
+                        div { class: "plan-card-media",
+                            if let Some(thumb) = &entry.recipe.thumb {
+                                img { src: "{thumb}", alt: "{entry.recipe.name}" }
+                            } else if let Some(image) = &entry.recipe.image {
+                                img { src: "{image}", alt: "{entry.recipe.name}" }
+                            } else {
+                                div { class: "plan-card-initials",
+                                    {entry.recipe.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase()}
+                                }
+                            }
+                        }
+                        div { class: "plan-card-name", "{entry.recipe.name}" }
+                    }
+                }
+                if day_is_empty {
+                    span { class: "plan-empty", "Nothing planned" }
+                }
+            }
+        }
+    }
+}
+
+/// Search-and-pick dialog for adding a recipe to a plan day.
+#[component]
+fn PlanPicker(
+    date: String,
+    label: String,
+    recipes: Vec<Recipe>,
+    on_add: EventHandler<(String, i64)>,
+) -> Element {
+    let mut search = use_signal(String::new);
+    let search_value = search.read().trim().to_lowercase();
+    let matches: Vec<Recipe> = recipes
+        .iter()
+        .filter(|recipe| {
+            search_value.is_empty() || recipe.name.to_lowercase().contains(&search_value)
+        })
+        .cloned()
+        .collect();
+    let matches_is_empty = matches.is_empty();
+    let any_recipes = !recipes.is_empty();
+
+    rsx! {
+        div { class: "dialog-backdrop",
+            div { class: "dialog plan-picker", role: "dialog",
+                h2 { class: "dialog-title", "Add to {label}" }
+                input {
+                    class: "plan-search",
+                    r#type: "text",
+                    placeholder: "Search recipes…",
+                    value: "{search}",
+                    oninput: move |e: FormEvent| search.set(e.value()),
+                }
+                div { class: "plan-picker-list",
+                    for recipe in matches {
+                        PlanPickerRow {
+                            key: "{recipe.id}",
+                            recipe: recipe.clone(),
+                            date: date.clone(),
+                            on_add: on_add.clone(),
+                        }
+                    }
+                    if !any_recipes {
+                        p { class: "empty", "No recipes yet — add some first." }
+                    } else if matches_is_empty {
+                        p { class: "empty", "No recipes match." }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One tappable recipe row inside the meal-plan picker dialog.
+#[component]
+fn PlanPickerRow(
+    recipe: Recipe,
+    date: String,
+    on_add: EventHandler<(String, i64)>,
+) -> Element {
+    rsx! {
+        button {
+            class: "plan-picker-row",
+            r#type: "button",
+            onclick: move |_| on_add.call((date.clone(), recipe.id)),
+            if let Some(thumb) = &recipe.thumb {
+                img { src: "{thumb}", alt: "" }
+            }
+            span { "{recipe.name}" }
         }
     }
 }

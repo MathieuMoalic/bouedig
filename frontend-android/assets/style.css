@@ -1014,3 +1014,171 @@ ol.instruction-list li {
     margin: -4px 0 10px;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Meal plan                                                           */
+/* ------------------------------------------------------------------ */
+
+.plan-day {
+    background: var(--surface);
+    border-radius: 14px;
+    padding: 10px 12px 12px;
+    margin-bottom: 14px;
+}
+
+.plan-day-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.plan-day-label {
+    font-weight: 700;
+    font-size: 16px;
+}
+
+.plan-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border: none;
+    border-radius: 50%;
+    background: var(--pill);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.plan-add:hover {
+    background: var(--accent);
+    color: #fff;
+}
+
+.plan-cards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.plan-card {
+    position: relative;
+    width: calc(50% - 5px);
+    min-width: 150px;
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--raised);
+    cursor: pointer;
+}
+
+.plan-card-media {
+    aspect-ratio: 4 / 3;
+    background: #1c2a25;
+}
+
+.plan-card-media img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.plan-card-initials {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--accent-bright);
+}
+
+.plan-card-name {
+    padding: 6px 8px;
+    font-size: 13px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.plan-remove {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
+    cursor: pointer;
+}
+
+.plan-remove:hover {
+    background: var(--error);
+}
+
+.plan-empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 6px 2px;
+}
+
+.plan-picker {
+    width: min(340px, 90vw);
+}
+
+.plan-picker input {
+    width: 100%;
+    margin-bottom: 8px;
+}
+
+.plan-picker-list {
+    max-height: 46vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.plan-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: none;
+    border: none;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    padding: 6px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.plan-picker-row:hover {
+    background: var(--pill);
+}
+
+.plan-picker-row img {
+    width: 44px;
+    height: 34px;
+    object-fit: cover;
+    border-radius: 6px;
+}
+
+.plan-search {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--divider);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font: inherit;
+    margin-bottom: 8px;
+}

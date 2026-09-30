@@ -1110,6 +1110,107 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
     result
 }
 
+/// Meal plan: add a recipe to a day through the picker, see the card, then
+/// remove it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // Seed two recipes directly through the API.
+    for name in ["Plan Soup", "Plan Pasta"] {
+        let status = http
+            .post(format!("{base}/api/recipes"))
+            .json(&RecipeInput {
+                name: name.into(),
+                sections: vec![],
+                ingredients: vec![],
+                instructions: vec![InstructionStep { text: "Cook.".into(), section: None }],
+                instruction_sections: vec![],
+                notes: String::new(),
+                yield_amount: String::new(),
+                source: String::new(),
+            })
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, 201);
+    }
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/meal-plan")).await?;
+        wait_for_url_path(&driver, "/meal-plan").await?;
+
+        // Today's section is always present; open its picker.
+        driver.find(By::Css(".plan-day .plan-add")).await?.click().await?;
+        driver
+            .find(By::Id("plan-search"))
+            .await
+            .context("picker dialog did not open")?;
+
+        // Search filters the picker rows; pick the soup.
+        driver
+            .find(By::Id("plan-search"))
+            .await?
+            .send_keys("Plan Soup")
+            .await?;
+        let row = driver
+            .find(By::XPath(
+                "//button[contains(@class, 'plan-picker-row') and contains(., 'Plan Soup')]",
+            ))
+            .await?;
+        row.click().await?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // The card appears in today's section.
+        let card = driver
+            .find(By::XPath(
+                "//div[contains(@class, 'plan-card') and contains(., 'Plan Soup')]",
+            ))
+            .await
+            .context("planned card did not appear")?;
+        let _ = card;
+
+        // The database has the entry for today.
+        let entries: Vec<serde_json::Value> = http
+            .get(format!("{base}/api/meal-plan"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            entries.len() == 1,
+            "expected 1 meal plan entry, got {entries:?}"
+        );
+
+        // Remove it via the card's × button.
+        driver
+            .find(By::Css(".plan-card .plan-remove"))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let entries: Vec<serde_json::Value> = http
+            .get(format!("{base}/api/meal-plan"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            entries.is_empty(),
+            "meal plan entry must be gone: {entries:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Shared UI assertions & helpers
 // ---------------------------------------------------------------------------
