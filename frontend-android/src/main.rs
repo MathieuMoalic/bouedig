@@ -2436,7 +2436,7 @@ fn MealPlan() -> Element {
             // The keyed day list lives in its own container: mixing a keyed
             // list with static siblings panics dioxus's differ when the
             // range grows.
-            div { class: "plan-days",
+            div { class: "plan-days", key: "{back_value}-{forward_value}",
                 for day in days {
                     PlanDaySection {
                         day: day.clone(),

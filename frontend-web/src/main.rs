@@ -2872,10 +2872,9 @@ fn MealPlan() -> Element {
             // The keyed day list lives in its own container: mixing a keyed
             // list with static siblings panics dioxus's differ when the
             // range grows.
-            div { class: "plan-days",
+            div { class: "plan-days", key: "{back_value}-{forward_value}",
                 for day in days {
                     PlanDaySection {
-                        key: "{day.date}",
                         day: day.clone(),
                         on_remove: move |entry_id: i64| {
                             spawn(async move {
@@ -2957,7 +2956,7 @@ fn PlanDaySection(
     let day_entries = day.entries;
     let day_is_empty = day_entries.is_empty();
     rsx! {
-        div { class: "plan-day", key: "{day.date}",
+            div { class: "plan-day",
             div { class: "plan-day-head",
                 span { class: "plan-day-label", "{day.label}" }
                 button {
