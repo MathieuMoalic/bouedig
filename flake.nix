@@ -377,7 +377,7 @@
         };
     in
     {
-      nixosModules.bouedig = serviceModule;
+      nixosModules.bouedig-service = serviceModule;
 
       # Local smoke-test VM: `nixos-rebuild build-vm --flake .#bouedig-vm`
       # then run ./result/bin/run-bouedig-vm-vm and open

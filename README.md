@@ -33,7 +33,7 @@ The flake provides everything needed to run Bouedig on a server:
     nix build .#release-tarball  # the server tarball layout `just release` publishes
     nix build .#prebuilt         # same tarball fetched from GitHub releases (hash set by `just release`)
 
-`nixosModules.bouedig` is a `services.bouedig` NixOS module with a hardened
+`nixosModules.bouedig-service` is a `services.bouedig` NixOS module with a hardened
 systemd service (dedicated user, `/var/lib/bouedig` state):
 
 ```nix
@@ -44,7 +44,7 @@ systemd service (dedicated user, `/var/lib/bouedig` state):
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        bouedig.nixosModules.bouedig
+        bouedig.nixosModules.bouedig-service
         {
           services.bouedig = {
             enable = true;

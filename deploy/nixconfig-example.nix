@@ -1,19 +1,27 @@
-# Drop-in equivalent of nixconfig's blaz.nix for Bouedig. Add the flake
-# input to your nixconfig,
+# bouedig.nix — drop this in your nixconfig next to blaz.nix
+# (e.g. nixos/selfhosted/bouedig.nix). Wiring needed elsewhere:
 #
-#   inputs.bouedig.url = "github:MathieuMoalic/bouedig";
+#   1. flake input:  bouedig.url = "github:MathieuMoalic/bouedig";
+#   2. self-hosted.nix imports:
+#        inputs.bouedig.nixosModules.bouedig-service
+#        bouedig            # (via `with self.nixosModules`)
+#   3. sops secrets in secrets.yaml (keys `bouedig/password` and
+#      `bouedig/llm-api-key`), e.g. `sops secrets.yaml`:
 #
-# then import this module from your selfhosted host and add the two sops
-# secrets (`bouedig/password`, `bouedig/llm-api-key`).
+#        bouedig:
+#            password: <your household password>
+#            llm-api-key: sk-or-v1-...
+#
+# Recipe browsing is public; everything else needs the password.
 {
-  flake.nixosModules.bouedig-deploy = {
+  flake.nixosModules.bouedig = {
     config,
     pkgs,
     inputs,
     ...
   }: let
     url = "bouedig.matmoa.eu";
-    port = 10025;
+    port = 10001;
 
     s = config.sops.secrets;
     passwordFile = s."bouedig/password".path;
@@ -32,11 +40,9 @@
       };
     };
     users.users.mat.extraGroups = ["bouedig"];
+    users.users.bouedig.homeMode = "0750";
     services.bouedig = {
       enable = true;
-      # `prebuilt` avoids compiling the Rust workspace on the server; its
-      # URL + hash in the flake are updated automatically by `just release`.
-      # Use `packages.bouedig` to build from source instead.
       package = inputs.bouedig.packages.${pkgs.stdenv.hostPlatform.system}.prebuilt;
       bindAddr = "127.0.0.1:${toString port}";
 
