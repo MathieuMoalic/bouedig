@@ -2631,9 +2631,9 @@ fn GroceryRow(
     }
 }
 
-/// Bottom sheet for editing one grocery item: name and group are editable
-/// (group is a real dropdown over the preset + existing categories), the
-/// provenance recipe ("Lentil Loaf in 4 days") is read-only.
+/// Bottom sheet for editing one grocery item: name is editable, the group is
+/// chosen by tapping one of the emoji category buttons, and the provenance
+/// recipe ("Lentil Loaf in 4 days") is read-only.
 #[component]
 fn GroceryEditSheet(
     item: GroceryItem,
@@ -2645,12 +2645,23 @@ fn GroceryEditSheet(
     let mut name = use_signal(|| item.name.clone());
     let mut group = use_signal(|| item.category.clone());
     let name_value = name.read().trim().to_string();
-    // The item's own group is always selectable, even if it somehow fell
-    // out of the merged option list.
+    // The item's own group always has a button, even if it somehow fell out
+    // of the merged category list. Precomputed so rsx can map plainly.
     let mut options = groups;
     if !options.iter().any(|g| g == &item.category) {
         options.insert(0, item.category.clone());
     }
+    let categories: Vec<(String, &'static str, bool, String)> = options
+        .iter()
+        .map(|g| {
+            (
+                g.clone(),
+                shared::category_emoji(g),
+                g == &item.category,
+                format!("cat-{}", g.replace(' ', "-")),
+            )
+        })
+        .collect();
 
     rsx! {
         div { class: "sheet-backdrop",
@@ -2671,16 +2682,20 @@ fn GroceryEditSheet(
                             oninput: move |e: FormEvent| name.set(e.value()),
                         }
                     }
-                    label { class: "sheet-field",
+                    div { class: "sheet-field",
                         span { "Group" }
-                        select {
-                            id: "sheet-item-group",
-                            onchange: move |e: FormEvent| group.set(e.value()),
-                            for group_name in options {
-                                option {
-                                    value: "{group_name}",
-                                    selected: if group_name == item.category { "true" } else { "false" },
-                                    "{group_name}"
+                        div { class: "sheet-cats",
+                            for (label, emoji, selected, button_id) in categories.iter() {
+                                button {
+                                    id: "{button_id}",
+                                    class: if *selected { "cat-btn selected" } else { "cat-btn" },
+                                    r#type: "button",
+                                    onclick: {
+                                        let label = label.clone();
+                                        move |_| group.set(label.clone())
+                                    },
+                                    span { class: "cat-emoji", "{emoji}" }
+                                    span { class: "cat-name", "{label}" }
                                 }
                             }
                         }

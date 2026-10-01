@@ -813,8 +813,7 @@ ol.instruction-list li {
     font-weight: 600;
 }
 
-.sheet-field input,
-.sheet-field select {
+.sheet-field input {
     font: inherit;
     font-size: 14px;
     color: var(--text);
@@ -824,15 +823,45 @@ ol.instruction-list li {
     padding: 10px 12px;
 }
 
-.sheet-field input:focus,
-.sheet-field select:focus {
+.sheet-field input:focus {
     outline: none;
     border-color: var(--accent-bright);
 }
 
-.sheet-field select option {
-    background: var(--surface-solid);
+/* Category picker: a grid of emoji buttons, one per category. */
+.sheet-cats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+}
+
+.cat-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 7px 4px;
+    background: var(--pill);
+    border: 1.5px solid transparent;
+    border-radius: 10px;
     color: var(--text);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.2;
+    cursor: pointer;
+    overflow: hidden;
+}
+
+.cat-btn .cat-emoji {
+    font-size: 17px;
+    line-height: 1;
+}
+
+.cat-btn.selected {
+    background: var(--accent);
+    border-color: var(--accent-bright);
+    color: #fff;
 }
 
 /* Confirmation shown under the detail header after a successful add. */

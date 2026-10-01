@@ -1163,7 +1163,9 @@ async fn update_grocery_item(
 }
 
 /// Edits a grocery item (rename and/or regroup). A blank name is rejected;
-/// a blank or missing category resets the item to the default group.
+/// a blank or missing category resets the item to the default group. A
+/// manual category change is pinned in the cache so future adds of the same
+/// item land there and the classifier never overrides it.
 async fn patch_grocery_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -1181,6 +1183,11 @@ async fn patch_grocery_item(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .unwrap_or(shared::DEFAULT_CATEGORY);
+    let old: Option<String> =
+        sqlx::query_scalar("SELECT category FROM grocery_items WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
     let result = sqlx::query("UPDATE grocery_items SET name = ?, category = ? WHERE id = ?")
         .bind(name)
         .bind(category)
@@ -1189,6 +1196,9 @@ async fn patch_grocery_item(
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
+    }
+    if old.as_deref() != Some(category) {
+        classifier::pin_manual(&state.db, name, category).await;
     }
     let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
         .bind(id)
@@ -2009,6 +2019,70 @@ pub(crate) mod tests {
         assert_eq!(created["category"], "Non-Food", "{body}");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "explicit groups must never reach the API");
+    }
+
+    #[tokio::test]
+    async fn grocery_manual_move_pins_the_category_over_the_classifier() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = counting_server(
+            openrouter_answer(r#"{"category":"Vegan","confidence":0.9}"#),
+            "200 OK",
+            hits.clone(),
+        );
+        let (app, pool) = test_router_with_classifier(format!("http://{server}/v1/chat/completions")).await;
+
+        // JEV says Vegan and the add lands there.
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"milk"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+        let mut flipped = false;
+        for _ in 0..40 {
+            let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+            if body.contains("\"Vegan\"") {
+                flipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(flipped, "JEV answer never applied");
+
+        // The user manually moves it to Drinks.
+        let (status, body) = json_response(
+            app.clone(),
+            "PUT",
+            &format!("/api/grocery/{id}"),
+            Some(r#"{"name":"milk","category":"Drinks"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pinned: (String, i64) =
+            sqlx::query_as("SELECT category, pinned FROM ingredient_categories WHERE name = 'milk'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pinned, ("Drinks".into(), 1), "manual choice must be pinned");
+
+        // Mark done (row deleted), then re-add: the pinned choice applies…
+        let (status, _) =
+            json_response(app.clone(), "PATCH", &format!("/api/grocery/{id}"), Some(r#"{"bought":true}"#))
+                .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"milk"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let recreated: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(recreated["category"], "Drinks", "re-add must land in the pinned category: {body}");
+
+        // …and a later JEV answer for the same name cannot overwrite the pin.
+        classifier::remember(&pool, "milk", "Vegan").await;
+        let pinned: (String, i64) =
+            sqlx::query_as("SELECT category, pinned FROM ingredient_categories WHERE name = 'milk'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pinned, ("Drinks".into(), 1), "classifier must not overwrite a pin");
     }
 
     #[tokio::test]

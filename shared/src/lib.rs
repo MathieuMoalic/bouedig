@@ -40,6 +40,26 @@ pub const CLASSIFIER_CATEGORIES: &[&str] = &[
     "Pantry",
 ];
 
+/// Emoji badge for a grocery category, used by the category buttons.
+pub fn category_emoji(name: &str) -> &'static str {
+    match name {
+        "Fruits" => "🍎",
+        "Vegetables" => "🥕",
+        "Bakery" => "🥖",
+        "Vegan" => "🌱",
+        "Drinks" => "🥤",
+        "Alcohol" => "🍷",
+        "Seasoning" => "🧂",
+        "Canned" => "🥫",
+        "Pantry" => "🍝",
+        "Non-Food" => "🧼",
+        "Pharmacy" => "💊",
+        "Online" => "📦",
+        "Online Alcohol" => "🍾",
+        _ => "🧺", // Other
+    }
+}
+
 /// A recipe as shown in the grid (summary; no ingredients/instructions).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Recipe {

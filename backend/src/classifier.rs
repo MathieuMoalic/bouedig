@@ -120,11 +120,26 @@ pub fn cache_key(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-/// Remember a confident classification for future adds.
+/// Remember a confident classification for future adds. Never overwrites a
+/// pinned (manually chosen) category — the human wins.
 pub async fn remember(db: &sqlx::SqlitePool, name: &str, category: &str) {
     let _ = sqlx::query(
-        "INSERT INTO ingredient_categories (name, category) VALUES (?, ?) \
-         ON CONFLICT(name) DO UPDATE SET category = excluded.category",
+        "INSERT INTO ingredient_categories (name, category, pinned) VALUES (?, ?, 0) \
+         ON CONFLICT(name) DO UPDATE SET category = excluded.category \
+         WHERE ingredient_categories.pinned = 0",
+    )
+    .bind(cache_key(name))
+    .bind(category)
+    .execute(db)
+    .await;
+}
+
+/// Record a manual category choice: pinned, so every future add of this
+/// name lands there and the classifier leaves it alone.
+pub async fn pin_manual(db: &sqlx::SqlitePool, name: &str, category: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO ingredient_categories (name, category, pinned) VALUES (?, ?, 1) \
+         ON CONFLICT(name) DO UPDATE SET category = excluded.category, pinned = 1",
     )
     .bind(cache_key(name))
     .bind(category)
