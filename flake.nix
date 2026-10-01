@@ -171,10 +171,15 @@
         }).overrideAttrs {
           unsafeDiscardReferences = { out = true; };
         };
+        dontUnpack = true;
         dontBuild = true;
         nativeBuildInputs = [ pkgs.patchelf ];
         installPhase = ''
           runHook preInstall
+          # The tarball has two top-level entries (bin/ + share/), which the
+          # stdenv unpacker rejects, so unpack manually.
+          mkdir work && cd work
+          tar xzf $src
           mkdir -p $out/share/bouedig
           cp -r bin $out/bin
           cp -r share/bouedig/web $out/share/bouedig/web
