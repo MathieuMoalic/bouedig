@@ -8,3 +8,6 @@ result
 .env
 /.direnv/flake-inputs
 .zcode/
+
+# NixOS VM disk images (nixos-rebuild build-vm)
+*.qcow2

@@ -1,0 +1,46 @@
+# Publish a release on tag push: build the release tarball (binaries +
+# embedded web bundle) with the flake and attach it to the GitHub release.
+#
+# After the release exists, paste the `nix hash file` value from the job
+# summary into `prebuiltHash` in flake.nix to make `packages.prebuilt`
+# buildable (that is what nixconfig deploys).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Build release tarball
+        run: nix build -L .#release-tarball --cores 4
+
+      - name: Rename tarball to the tag
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          src=$(ls result/bouedig-v*-x86_64-linux.tar.gz)
+          mv "$src" "bouedig-${tag}-x86_64-linux.tar.gz"
+
+      - name: Record prebuilt hash
+        run: |
+          {
+            echo '### Update the flake for `prebuilt`'
+            echo '```'
+            nix hash file --sri "bouedig-${GITHUB_REF_NAME}-x86_64-linux.tar.gz"
+            echo '```'
+            echo "Paste it as \`prebuiltHash\` in flake.nix (and bump \`version\` to match this tag)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bouedig-*.tar.gz
+          generate_release_notes: true
