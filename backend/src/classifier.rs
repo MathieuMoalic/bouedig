@@ -3,8 +3,9 @@
 //! The app is cache-first: `ingredient_categories` remembers every confident
 //! answer, and only cache misses reach the API — from a background task, so
 //! adds never wait on the network. Jev answers typed questions; over
-//! OpenRouter's chat interface we ask one strict JSON Choice question per
-//! ingredient and trust the answer only at confidence ≥ 0.5.
+//! OpenRouter's chat interface (model slug `typesafe/jev-router`) we ask one
+//! strict JSON Choice question per ingredient and trust the answer only at
+//! confidence ≥ 0.5.
 
 use shared::CLASSIFIER_CATEGORIES;
 
@@ -33,7 +34,9 @@ impl Classifier {
         let api_key = api_key.filter(|k| !k.trim().is_empty())?;
         Some(Self {
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(3))
+                // Generous: classification runs in the background, and the
+                // router's first calls after idle can be slow.
+                .timeout(std::time::Duration::from_secs(8))
                 .build()
                 .unwrap_or_default(),
             endpoint: endpoint
@@ -42,7 +45,7 @@ impl Classifier {
             api_key,
             model: model
                 .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| "typesafe-ai/jev".into()),
+                .unwrap_or_else(|| "typesafe/jev-router".into()),
         })
     }
 
@@ -71,15 +74,22 @@ impl Classifier {
             "temperature": 0,
             "max_tokens": 60,
         });
-        let response = self
+        let response = match self
             .http
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
             .await
-            .ok()?;
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("classifier request for {name:?} failed: {err}");
+                return None;
+            }
+        };
         if !response.status().is_success() {
+            tracing::warn!("classifier returned {} for {name:?}", response.status());
             return None;
         }
         // OpenRouter shape: choices[0].message.content is the JSON answer.
