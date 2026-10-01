@@ -21,6 +21,18 @@ fn api_base() -> String {
     API_BASE.to_string()
 }
 
+/// One shared HTTP client with a cookie jar: the auth session cookie must
+/// survive across every call, so `reqwest::Client::new()` is never used.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .expect("failed to build the HTTP client")
+    })
+}
+
 /// Recipe images arrive as server-relative URLs (`/api/images/...`); a
 /// webview on a device needs them absolutised against the backend address.
 fn absolutize(url: &str) -> String {
@@ -348,7 +360,9 @@ fn IconImage() -> Element {
 async fn api_get<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     let url = format!("{}{}", api_base(), path);
     tracing::info!("GET {url}");
-    let resp = reqwest::get(&url)
+    let resp = http()
+        .get(&url)
+        .send()
         .await
         .map_err(|err| {
             tracing::error!("GET {url} request failed: {err:#}");
@@ -481,6 +495,97 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// `GET /api/session` → am I authenticated? 401 and network errors both mean
+/// "no" (with auth off the endpoint always says yes).
+async fn session_authenticated() -> bool {
+    match http().get(format!("{}/api/session", api_base())).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Gate tab content behind the household login: children render only when
+/// authenticated, otherwise a password form is shown.
+#[component]
+fn LoginGate(children: Element) -> Element {
+    let mut authed = use_signal(|| None::<bool>);
+    let mut password = use_signal(String::new);
+    let mut error = use_signal(|| String::new());
+    let mut busy = use_signal(|| false);
+
+    use_effect(move || {
+        spawn(async move {
+            authed.set(Some(session_authenticated().await));
+        });
+    });
+
+    let mut submit = move |_| {
+        let target = password.read().trim().to_string();
+        if target.is_empty() || *busy.read() {
+            return;
+        }
+        busy.set(true);
+        error.set(String::new());
+        spawn(async move {
+            let url = format!("{}/api/login", api_base());
+            match http()
+                .post(&url)
+                .json(&serde_json::json!({ "password": target }))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    authed.set(Some(true));
+                    password.set(String::new());
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    error.set("Wrong password.".into());
+                }
+                Ok(r) => error.set(format!("Login failed: {}", r.status())),
+                Err(err) => error.set(format!("Could not reach the server: {err}")),
+            }
+            busy.set(false);
+        });
+    };
+
+    match authed() {
+        None => rsx! {
+            div { class: "page",
+                div { class: "card placeholder-card",
+                    p { class: "empty", "Checking…" }
+                }
+            }
+        },
+        Some(true) => children,
+        Some(false) => rsx! {
+            div { class: "page",
+                div { class: "card login-card",
+                    h2 { "This area is private" }
+                    p { class: "muted", "Enter the household password to continue." }
+                    input {
+                        id: "login-password",
+                        r#type: "password",
+                        placeholder: "Password",
+                        value: "{password}",
+                        oninput: move |e: FormEvent| password.set(e.value()),
+                    }
+                    if !error.read().is_empty() {
+                        p { class: "status-error", "{error}" }
+                    }
+                    button {
+                        id: "login-submit",
+                        class: "btn-primary",
+                        r#type: "button",
+                        disabled: *busy.read(),
+                        onclick: move |_| submit(()),
+                        if *busy.read() { "Signing in…" } else { "Sign in" }
+                    }
+                }
+            }
+        },
+    }
+}
+
 /// Deterministic in-place shuffle (xorshift): stable across re-renders for
 /// one seed, and every seed press is a brand-new order.
 fn seeded_shuffle(list: &mut [Recipe], seed: u64) {
@@ -559,7 +664,7 @@ fn Recipes() -> Element {
             if generation != search_generation() {
                 return;
             }
-            let client = reqwest::Client::new();
+            let client = http();
             let url = format!("{}/api/recipes/search", api_base());
             if let Ok(response) = client.get(&url).query(&[("q", &text)]).send().await {
                 if response.status().is_success() {
@@ -600,7 +705,7 @@ fn Recipes() -> Element {
             value: mode.setting_value().to_string(),
         };
         spawn(async move {
-            let client = reqwest::Client::new();
+            let client = http();
             let url = format!("{}/api/settings/recipes_sort", api_base());
             let _ = client.put(&url).json(&payload).send().await;
         });
@@ -678,7 +783,7 @@ fn Recipes() -> Element {
                         card_chooser.set(None);
                         let recipe_id = recipe.id;
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             let url = format!("{}/api/meal-plan", api_base());
                             let payload = serde_json::json!({
                                 "date": date,
@@ -987,7 +1092,7 @@ fn ImportRecipe() -> Element {
         loading.set(true);
         error.set(String::new());
         spawn(async move {
-            let client = reqwest::Client::new();
+            let client = http();
             let endpoint = format!("{}/api/recipes/import", api_base());
             tracing::info!("importing recipe from {target}");
             let result = client
@@ -1509,7 +1614,7 @@ fn RecipeFormFields(
                     let image = photo.read().clone();
                     let image_url = initial_image_url.clone();
                     spawn(async move {
-                        let client = reqwest::Client::new();
+                        let client = http();
                         let base = api_base();
                         tracing::info!(
                             "Recipe form submit (edit={:?}, name={:?}, ingredients={}, photo={})",
@@ -2275,7 +2380,16 @@ fn RecipeDetail(id: i64) -> Element {
     let mut cart_sheet = use_signal(|| false);
     let mut day_chooser = use_signal(|| false);
     let mut added_note = use_signal(|| String::new());
+    let mut authed = use_signal(|| true);
     let navigator = use_navigator();
+
+    // Anonymous visitors browse read-only: the mutating header actions only
+    // render once authenticated.
+    use_effect(move || {
+        spawn(async move {
+            authed.set(session_authenticated().await);
+        });
+    });
 
     use_effect(move || {
         spawn(async move {
@@ -2392,53 +2506,55 @@ fn RecipeDetail(id: i64) -> Element {
                     IconBack {}
                 }
                 div { class: "hdr-spacer" }
-                button {
-                    id: "hdr-share",
-                    class: "hdr-btn",
-                    title: "Share link",
-                    onclick: move |_| {
-                        added_note.set(format!("{}/recipe/{id}", api_base()));
-                    },
-                    IconShare {}
-                }
-                button {
-                    id: "hdr-mealplan",
-                    class: "hdr-btn",
-                    title: "Add to meal plan",
-                    onclick: move |_| {
-                        added_note.set(String::new());
-                        day_chooser.set(true);
-                    },
-                    IconCalendar {}
-                }
-                button {
-                    id: "hdr-cart",
-                    class: if has_ingredients { "hdr-btn" } else { "hdr-btn ph" },
-                    title: "Add to shopping list",
-                    onclick: move |_| {
-                        if has_ingredients {
+                if authed() {
+                    button {
+                        id: "hdr-share",
+                        class: "hdr-btn",
+                        title: "Share link",
+                        onclick: move |_| {
+                            added_note.set(format!("{}/recipe/{id}", api_base()));
+                        },
+                        IconShare {}
+                    }
+                    button {
+                        id: "hdr-mealplan",
+                        class: "hdr-btn",
+                        title: "Add to meal plan",
+                        onclick: move |_| {
                             added_note.set(String::new());
-                            cart_sheet.set(true);
-                        }
-                    },
-                    IconCart {}
-                }
-                button {
-                    id: "hdr-edit",
-                    class: "hdr-btn",
-                    title: "Edit",
-                    onclick: move |_| { navigator.push(Route::EditRecipe { id }); },
-                    IconPencil {}
-                }
-                button {
-                    id: "hdr-delete",
-                    class: "hdr-btn danger",
-                    title: "Delete",
-                    onclick: move |_| {
-                        tracing::info!("delete requested for recipe {id}");
-                        confirm_delete.set(true);
-                    },
-                    IconTrash {}
+                            day_chooser.set(true);
+                        },
+                        IconCalendar {}
+                    }
+                    button {
+                        id: "hdr-cart",
+                        class: if has_ingredients { "hdr-btn" } else { "hdr-btn ph" },
+                        title: "Add to shopping list",
+                        onclick: move |_| {
+                            if has_ingredients {
+                                added_note.set(String::new());
+                                cart_sheet.set(true);
+                            }
+                        },
+                        IconCart {}
+                    }
+                    button {
+                        id: "hdr-edit",
+                        class: "hdr-btn",
+                        title: "Edit",
+                        onclick: move |_| { navigator.push(Route::EditRecipe { id }); },
+                        IconPencil {}
+                    }
+                    button {
+                        id: "hdr-delete",
+                        class: "hdr-btn danger",
+                        title: "Delete",
+                        onclick: move |_| {
+                            tracing::info!("delete requested for recipe {id}");
+                            confirm_delete.set(true);
+                        },
+                        IconTrash {}
+                    }
                 }
             }
 
@@ -2557,7 +2673,7 @@ fn RecipeDetail(id: i64) -> Element {
                     on_cancel: move |_| confirm_delete.set(false),
                     on_confirm: move |_| {
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             let url = format!("{}/api/recipes/{id}", api_base());
                             tracing::info!("deleting recipe {id}: DELETE {url}");
                             match client.delete(&url).send().await {
@@ -2602,7 +2718,7 @@ fn RecipeDetail(id: i64) -> Element {
                             recipe_id: Some(id),
                         };
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             let url = format!("{}/api/grocery/batch", api_base());
                             match client.post(&url).json(&payload).send().await {
                                 Ok(r) if r.status().is_success() => {
@@ -2640,7 +2756,7 @@ fn RecipeDetail(id: i64) -> Element {
                         day_chooser.set(false);
                         let recipe_id = id;
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             let url = format!("{}/api/meal-plan", api_base());
                             let payload = serde_json::json!({
                                 "date": date,
@@ -2932,6 +3048,15 @@ fn rank_suggestions(input: &str, past: &[String]) -> Vec<(String, usize)> {
 
 #[component]
 fn Grocery() -> Element {
+    rsx! {
+        LoginGate {
+            GroceryContent {}
+        }
+    }
+}
+
+#[component]
+fn GroceryContent() -> Element {
     let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut new_category = use_signal(String::new);
@@ -3092,7 +3217,7 @@ fn Grocery() -> Element {
                         }
                         new_item.set(String::new());
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             let url = format!("{}/api/grocery", api_base());
                             tracing::info!("Grocery Add button: POST {url} (name={:?}, category={:?})", item.name, item.category);
                             match client.post(url).json(&item).send().await {
@@ -3155,7 +3280,7 @@ fn Grocery() -> Element {
                             category: Some(category),
                         };
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             let url = format!("{}/api/grocery/{id}", api_base());
                             match client.put(&url).json(&payload).send().await {
                                 Ok(r) if r.status().is_success() => {
@@ -3276,7 +3401,7 @@ fn GroceryRow(
                 onchange: move |_| {
                     let id = item_id;
                     spawn(async move {
-                        let client = reqwest::Client::new();
+                        let client = http();
                         let url = format!("{}/api/grocery/{id}", api_base());
                         match client
                             .patch(&url)
@@ -3419,6 +3544,15 @@ async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>)
 
 #[component]
 fn MealPlan() -> Element {
+    rsx! {
+        LoginGate {
+            MealPlanContent {}
+        }
+    }
+}
+
+#[component]
+fn MealPlanContent() -> Element {
     let mut entries = use_signal(Vec::<MealPlanEntry>::new);
     let mut recipes = use_signal(Vec::<Recipe>::new);
     let mut error = use_signal(|| String::new());
@@ -3504,7 +3638,7 @@ fn MealPlan() -> Element {
                         day: day.clone(),
                         on_remove: move |entry_id: i64| {
                             spawn(async move {
-                                let client = reqwest::Client::new();
+                                let client = http();
                                 match client
                                     .delete(format!("{}/api/meal-plan/{entry_id}", api_base()))
                                     .send()
@@ -3540,7 +3674,7 @@ fn MealPlan() -> Element {
                     on_add: move |(date, recipe_id): (String, i64)| {
                         picker.set(None);
                         spawn(async move {
-                            let client = reqwest::Client::new();
+                            let client = http();
                             match client
                                 .post(format!("{}/api/meal-plan", api_base()))
                                 .json(&serde_json::json!({ "date": date, "recipe_id": recipe_id }))
@@ -3793,9 +3927,11 @@ fn PlanPickerRow(
 #[component]
 fn Settings() -> Element {
     rsx! {
-        PlaceholderPage {
-            title: "Settings",
-            text: "Theme, account and server settings — coming soon.",
+        LoginGate {
+            PlaceholderPage {
+                title: "Settings",
+                text: "Theme, account and server settings — coming soon.",
+            }
         }
     }
 }

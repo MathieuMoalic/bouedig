@@ -59,6 +59,10 @@ pub struct Config {
     /// Classifier endpoint override (`BOUEDIG_CLASSIFIER_ENDPOINT`), used by
     /// tests to point at a local mock.
     pub classifier_endpoint: Option<String>,
+    /// Household password (`BOUEDIG_PASSWORD`). When set, recipe browsing
+    /// stays public but every other API call needs a session cookie; unset
+    /// disables auth entirely (dev/test default).
+    pub password: Option<String>,
 }
 
 impl Config {
@@ -89,6 +93,7 @@ impl Config {
             openrouter_key: std::env::var("BOUEDIG_OPENROUTER_KEY").ok(),
             classifier_model: std::env::var("BOUEDIG_CLASSIFIER_MODEL").ok(),
             classifier_endpoint: std::env::var("BOUEDIG_CLASSIFIER_ENDPOINT").ok(),
+            password: std::env::var("BOUEDIG_PASSWORD").ok().filter(|p| !p.is_empty()),
         }
     }
 }
@@ -101,6 +106,8 @@ pub struct AppState {
     import_allow_private: bool,
     /// Present only when an OpenRouter key is configured.
     classifier: Option<classifier::Classifier>,
+    /// Household password; `None` disables auth entirely.
+    password: Option<String>,
 }
 
 impl AppState {
@@ -114,6 +121,7 @@ impl AppState {
                 config.classifier_model.clone(),
                 config.classifier_endpoint.clone(),
             ),
+            password: config.password.clone(),
         }
     }
 }
@@ -177,10 +185,17 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
             "/settings/{key}",
             get(get_setting).put(put_setting),
         )
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/session", get(session_status))
         .route("/images/{*path}", get(serve_image))
         // Photo uploads can be several megabytes.
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(CorsLayer::very_permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_guard,
+        ))
         .with_state(state);
 
     let mut app = Router::new().nest("/api", api);
@@ -967,6 +982,173 @@ async fn serve_image(
         .into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Authentication: single household password, cookie sessions
+// ---------------------------------------------------------------------------
+
+/// The session cookie's name.
+const SESSION_COOKIE: &str = "bouedig_session";
+
+/// `GET /api/recipes`, its search, and image fetches stay public so anyone
+/// can browse the recipes read-only; logging in/out is obviously open too.
+/// Accepts the path with or without the `/api` prefix — the guard middleware
+/// sits inside the nest, which strips it.
+fn is_public_api(method: &axum::http::Method, path: &str) -> bool {
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    if path == "/login" || path == "/logout" || path == "/session" {
+        return true;
+    }
+    if method == axum::http::Method::GET {
+        if path == "/recipes" || path == "/recipes/search" {
+            return true;
+        }
+        if let Some(rest) = path.strip_prefix("/recipes/") {
+            // A detail id (digits); anything else under /recipes is an action.
+            return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+        }
+        if path.starts_with("/images/") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Gate every /api call when a password is configured: public reads pass,
+/// everything else needs a valid session cookie. No password configured →
+/// auth is off and every call passes (dev/test behaviour).
+async fn auth_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    if state.password.is_none() {
+        return Ok(next.run(req).await);
+    }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    if is_public_api(&method, &path) {
+        return Ok(next.run(req).await);
+    }
+    let token = req
+        .headers()
+        .get(axum::http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(session_token_from_cookies)
+        .map(str::to_string);
+    let authenticated = match token {
+        Some(token) => session_exists(&state.db, &token).await.unwrap_or(false),
+        None => false,
+    };
+    if authenticated {
+        Ok(next.run(req).await)
+    } else {
+        Err(ApiError(
+            (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+        ))
+    }
+}
+
+/// Extract the session token from a Cookie header value.
+fn session_token_from_cookies(cookies: &str) -> Option<&str> {
+    cookies.split(';').find_map(|pair| {
+        let pair = pair.trim();
+        let value = pair.strip_prefix(SESSION_COOKIE)?.strip_prefix('=')?;
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+async fn session_exists(db: &SqlitePool, token: &str) -> anyhow::Result<bool> {
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sessions WHERE token = ?").bind(token).fetch_optional(db).await?;
+    Ok(found.is_some())
+}
+
+/// `POST /api/login {"password": …}`: 204 + session cookie on success, 401
+/// on a wrong password, 409 when no password is configured (nothing to log
+/// into).
+async fn login(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(expected) = state.password.as_deref() else {
+        return Err(ApiError(
+            (StatusCode::CONFLICT, "auth is not configured").into_response(),
+        ));
+    };
+    let supplied = payload["password"].as_str().unwrap_or_default();
+    if supplied != expected {
+        return Err(ApiError(
+            (StatusCode::UNAUTHORIZED, "wrong password").into_response(),
+        ));
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    sqlx::query("INSERT INTO sessions (token) VALUES (?)")
+        .bind(&token)
+        .execute(&state.db)
+        .await?;
+    let cookie = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax"
+    );
+    Ok((
+        [(axum::http::header::SET_COOKIE, cookie)],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response())
+}
+
+/// `POST /api/logout`: invalidate the session and expire the cookie.
+async fn logout(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Some(token) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(session_token_from_cookies)
+    {
+        let _ = sqlx::query("DELETE FROM sessions WHERE token = ?")
+            .bind(token)
+            .execute(&state.db)
+            .await;
+    }
+    let cookie = format!("{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response()
+}
+
+/// `GET /api/session`: 200 when authenticated — with a valid cookie, or
+/// trivially when auth is off — 401 otherwise.
+async fn session_status(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let authenticated = match state.password.as_deref() {
+        // Auth off: treat every visitor as authenticated.
+        None => true,
+        Some(_) => {
+            let token = headers
+                .get(axum::http::header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(session_token_from_cookies)
+                .map(str::to_string);
+            match token {
+                Some(token) => session_exists(&state.db, &token).await.unwrap_or(false),
+                None => false,
+            }
+        }
+    };
+    if authenticated {
+        Ok(Json(serde_json::json!({ "authenticated": true })))
+    } else {
+        Err(ApiError(
+            (StatusCode::UNAUTHORIZED, "not authenticated").into_response(),
+        ))
+    }
+}
+
 /// `POST /api/recipes/import`: fetch a recipe webpage, extract a structured
 /// recipe and return it as a **preview**. Nothing is persisted here — the
 /// client reviews/edits the preview and saves it through the normal
@@ -1454,6 +1636,7 @@ pub(crate) mod tests {
             openrouter_key: None,
             classifier_model: None,
             classifier_endpoint: None,
+            password: None,
         }
     }
 
@@ -1478,6 +1661,7 @@ pub(crate) mod tests {
             db: pool.clone(),
             data_dir: config.data_dir.clone(),
             import_allow_private: true,
+            password: None,
             classifier: classifier::Classifier::from_parts(
                 Some("test-key".into()),
                 Some("typesafe-ai/jev".into()),
@@ -2096,6 +2280,184 @@ pub(crate) mod tests {
         assert!(!levenshtein_within("curry", "pasta", 2));
         // Multibyte characters count per character, not per byte.
         assert!(levenshtein_within("café", "cafe", 1));
+    }
+
+    /// Router backed by a DB pool, with auth configured for `password`.
+    async fn test_router_with_password(password: &str) -> (Router, SqlitePool) {
+        let config = Config {
+            password: Some(password.to_string()),
+            ..test_config(None, None)
+        };
+        ensure_data_dirs(&config.data_dir).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let app = build_router(AppState::from_config(pool.clone(), &config), &config);
+        (app, pool)
+    }
+
+    /// Log in against `app` and return the bare session cookie pair.
+    async fn login_cookie(app: Router, password: &str) -> String {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"password":"{password}"}}"#)))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn auth_public_reads_stay_open_and_writes_are_gated() {
+        let (app, _pool) = test_router_with_password("fondue").await;
+        // Seed one recipe while authenticated.
+        let cookie = login_cookie(app.clone(), "fondue").await;
+        let (status, body) = json_with_cookie(
+            app.clone(),
+            Some(cookie),
+            "POST",
+            "/api/recipes",
+            Some(r#"{"name":"Public Loaf","sections":[],"ingredients":[],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // Anonymous: public reads succeed…
+        for path in ["/api/recipes", "/api/recipes/search?q=loaf"] {
+            let (status, _) = json_response(app.clone(), "GET", path, None).await;
+            assert_eq!(status, StatusCode::OK, "public read {path} failed");
+        }
+        let detail_path = format!("/api/recipes/{}", 
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_i64().unwrap());
+        let (status, _) = json_response(app.clone(), "GET", &detail_path, None).await;
+        assert_eq!(status, StatusCode::OK, "public detail read failed");
+
+        // …and everything else is 401.
+        for (method, path) in [
+            ("POST", "/api/recipes"),
+            ("GET", "/api/grocery"),
+            ("GET", "/api/meal-plan"),
+            ("DELETE", "/api/recipes/1"),
+            ("GET", "/api/settings/recipes_sort"),
+        ] {
+            let (status, _) = json_response(app.clone(), method, path, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path} must be gated");
+        }
+    }
+
+    /// json_response variant carrying a Cookie header.
+    async fn json_with_cookie(
+        app: Router,
+        cookie: Option<String>,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        let request = match (&cookie, body) {
+            (Some(cookie), Some(b)) => builder
+                .header(axum::http::header::COOKIE, cookie.clone())
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            (Some(cookie), None) => builder
+                .header(axum::http::header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+            (None, Some(b)) => builder.body(Body::from(b.to_string())).unwrap(),
+            (None, None) => builder.body(Body::empty()).unwrap(),
+        };
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn auth_login_logout_cycle() {
+        let (app, pool) = test_router_with_password("fondue").await;
+
+        // Wrong password: 401, no session.
+        let (status, _) = json_with_cookie(
+            app.clone(), None, "POST", "/api/login",
+            Some(r#"{"password":"wrong"}"#),
+        ).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Right password: 204 + cookie.
+        let (status, _) = json_with_cookie(
+            app.clone(), None, "POST", "/api/login",
+            Some(r#"{"password":"fondue"}"#),
+        ).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let token: String = sqlx::query_scalar("SELECT token FROM sessions")
+            .fetch_one(&pool).await.unwrap();
+
+        // The cookie opens a gated call.
+        let (status, _) = json_with_cookie(
+            app.clone(),
+            Some(format!("{SESSION_COOKIE}={token}")),
+            "GET", "/api/grocery", None,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "session cookie must unlock the API");
+
+        // Session status agrees.
+        let (status, _) = json_with_cookie(
+            app.clone(),
+            Some(format!("{SESSION_COOKIE}={token}")),
+            "GET", "/api/session", None,
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Logout invalidates the token.
+        let (status, _) = json_with_cookie(
+            app.clone(),
+            Some(format!("{SESSION_COOKIE}={token}")),
+            "POST", "/api/logout", None,
+        ).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = json_with_cookie(
+            app.clone(),
+            Some(format!("{SESSION_COOKIE}={token}")),
+            "GET", "/api/grocery", None,
+        ).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "logged-out session must be rejected");
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_when_no_password_configured() {
+        let app = test_router(None).await;
+        // Everything reachable with no session at all.
+        let (status, _) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = json_response(
+            app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Rice"}"#),
+        ).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        // Login reports that auth is not configured.
+        let (status, _) = json_response(
+            app, "POST", "/api/login", Some(r#"{"password":"x"}"#),
+        ).await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

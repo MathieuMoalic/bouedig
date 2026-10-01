@@ -963,6 +963,44 @@ ol.instruction-list li {
     border-color: var(--accent-bright);
 }
 
+/* Login gate: one centered card with the password form. */
+.login-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 340px;
+    margin: 12vh auto 0;
+}
+
+.login-card h2 {
+    margin: 0;
+}
+
+.login-card .muted {
+    margin: 0;
+    font-size: 13px;
+    color: var(--muted);
+}
+
+.login-card input {
+    font: inherit;
+    font-size: 14px;
+    color: var(--text);
+    background: var(--pill);
+    border: 1px solid var(--divider);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+
+.login-card input:focus {
+    outline: none;
+    border-color: var(--accent-bright);
+}
+
+.login-card .status-error {
+    margin: 0;
+}
+
 /* Day chooser sheet: blaz-style rows with planned thumbnails. */
 .day-list {
     display: flex;

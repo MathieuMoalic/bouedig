@@ -445,6 +445,104 @@ fn now_millis() -> u64 {
     js_sys::Date::now() as u64
 }
 
+/// `GET /api/session` → am I authenticated? 401 and network errors both mean
+/// "no" (with auth off the endpoint always says yes).
+#[cfg(target_arch = "wasm32")]
+async fn session_authenticated() -> bool {
+    match reqwest::get(format!("{}/api/session", api_base())).await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Gate tab content behind the household login: children render only when
+/// authenticated, otherwise a password form is shown.
+#[component]
+fn LoginGate(children: Element) -> Element {
+    let mut authed = use_signal(|| None::<bool>);
+    let mut password = use_signal(String::new);
+    let mut error = use_signal(|| String::new());
+    let mut busy = use_signal(|| false);
+
+    use_effect(move || {
+        spawn(async move {
+            authed.set(Some(session_authenticated().await));
+        });
+    });
+
+    let mut submit = move |_| {
+        let target = password.read().trim().to_string();
+        if target.is_empty() || *busy.read() {
+            return;
+        }
+        busy.set(true);
+        error.set(String::new());
+        spawn(async move {
+            let client = reqwest::Client::new();
+            let url = format!("{}/api/login", api_base());
+            match client
+                .post(&url)
+                .json(&serde_json::json!({ "password": target }))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    authed.set(Some(true));
+                    password.set(String::new());
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    error.set("Wrong password.".into());
+                }
+                Ok(r) => error.set(format!("Login failed: {}", r.status())),
+                Err(err) => error.set(format!("Could not reach the server: {err}")),
+            }
+            busy.set(false);
+        });
+    };
+
+    match authed() {
+        None => rsx! {
+            div { class: "page",
+                div { class: "card placeholder-card",
+                    p { class: "empty", "Checking…" }
+                }
+            }
+        },
+        Some(true) => children,
+        Some(false) => rsx! {
+            div { class: "page",
+                div { class: "card login-card",
+                    h2 { "This area is private" }
+                    p { class: "muted", "Enter the household password to continue." }
+                    input {
+                        id: "login-password",
+                        r#type: "password",
+                        placeholder: "Password",
+                        value: "{password}",
+                        oninput: move |e: FormEvent| password.set(e.value()),
+                        onkeydown: move |e: KeyboardEvent| {
+                            if e.key() == Key::Enter {
+                                submit(());
+                            }
+                        },
+                    }
+                    if !error.read().is_empty() {
+                        p { class: "status-error", "{error}" }
+                    }
+                    button {
+                        id: "login-submit",
+                        class: "btn-primary",
+                        r#type: "button",
+                        disabled: *busy.read(),
+                        onclick: move |_| submit(()),
+                        if *busy.read() { "Signing in…" } else { "Sign in" }
+                    }
+                }
+            }
+        },
+    }
+}
+
 /// Deterministic in-place shuffle (xorshift): stable across re-renders for
 /// one seed, and every seed press is a brand-new order.
 fn seeded_shuffle(list: &mut [Recipe], seed: u64) {
@@ -2450,7 +2548,16 @@ fn RecipeDetail(id: i64) -> Element {
     let mut cart_sheet = use_signal(|| false);
     let mut day_chooser = use_signal(|| false);
     let mut added_note = use_signal(|| String::new());
+    let mut authed = use_signal(|| true);
     let navigator = use_navigator();
+
+    // Anonymous visitors browse read-only: the mutating header actions only
+    // render once authenticated.
+    use_effect(move || {
+        spawn(async move {
+            authed.set(session_authenticated().await);
+        });
+    });
 
     use_effect(move || {
         spawn(async move {
@@ -2567,60 +2674,62 @@ fn RecipeDetail(id: i64) -> Element {
                     IconBack {}
                 }
                 div { class: "hdr-spacer" }
-                button {
-                    id: "hdr-share",
-                    class: "hdr-btn",
-                    title: "Share link",
-                    onclick: move |_| {
-                        let url = format!("{}/recipe/{id}", api_base());
-                        spawn(async move {
-                            if copy_clipboard(url.clone()).await {
-                                added_note.set("Link copied to clipboard".into());
-                            } else {
-                                added_note.set(url);
-                            }
-                        });
-                    },
-                    IconShare {}
-                }
-                button {
-                    id: "hdr-mealplan",
-                    class: "hdr-btn",
-                    title: "Add to meal plan",
-                    onclick: move |_| {
-                        added_note.set(String::new());
-                        day_chooser.set(true);
-                    },
-                    IconCalendar {}
-                }
-                button {
-                    id: "hdr-cart",
-                    class: if has_ingredients { "hdr-btn" } else { "hdr-btn ph" },
-                    title: "Add to shopping list",
-                    onclick: move |_| {
-                        if has_ingredients {
+                if authed() {
+                    button {
+                        id: "hdr-share",
+                        class: "hdr-btn",
+                        title: "Share link",
+                        onclick: move |_| {
+                            let url = format!("{}/recipe/{id}", api_base());
+                            spawn(async move {
+                                if copy_clipboard(url.clone()).await {
+                                    added_note.set("Link copied to clipboard".into());
+                                } else {
+                                    added_note.set(url);
+                                }
+                            });
+                        },
+                        IconShare {}
+                    }
+                    button {
+                        id: "hdr-mealplan",
+                        class: "hdr-btn",
+                        title: "Add to meal plan",
+                        onclick: move |_| {
                             added_note.set(String::new());
-                            cart_sheet.set(true);
-                        }
-                    },
-                    IconCart {}
-                }
-                button {
-                    id: "hdr-edit",
-                    class: "hdr-btn",
-                    title: "Edit",
-                    onclick: move |_| { navigator.push(Route::EditRecipe { id }); },
-                    IconPencil {}
-                }
-                button {
-                    id: "hdr-delete",
-                    class: "hdr-btn danger",
-                    title: "Delete",
-                    onclick: move |_| {
-                        tracing::info!("delete requested for recipe {id}");
-                        confirm_delete.set(true);
-                    },
-                    IconTrash {}
+                            day_chooser.set(true);
+                        },
+                        IconCalendar {}
+                    }
+                    button {
+                        id: "hdr-cart",
+                        class: if has_ingredients { "hdr-btn" } else { "hdr-btn ph" },
+                        title: "Add to shopping list",
+                        onclick: move |_| {
+                            if has_ingredients {
+                                added_note.set(String::new());
+                                cart_sheet.set(true);
+                            }
+                        },
+                        IconCart {}
+                    }
+                    button {
+                        id: "hdr-edit",
+                        class: "hdr-btn",
+                        title: "Edit",
+                        onclick: move |_| { navigator.push(Route::EditRecipe { id }); },
+                        IconPencil {}
+                    }
+                    button {
+                        id: "hdr-delete",
+                        class: "hdr-btn danger",
+                        title: "Delete",
+                        onclick: move |_| {
+                            tracing::info!("delete requested for recipe {id}");
+                            confirm_delete.set(true);
+                        },
+                        IconTrash {}
+                    }
                 }
             }
 
@@ -3114,6 +3223,15 @@ fn rank_suggestions(input: &str, past: &[String]) -> Vec<(String, usize)> {
 
 #[component]
 fn Grocery() -> Element {
+    rsx! {
+        LoginGate {
+            GroceryContent {}
+        }
+    }
+}
+
+#[component]
+fn GroceryContent() -> Element {
     let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut new_category = use_signal(String::new);
@@ -3739,6 +3857,15 @@ struct PickerState {
 
 #[component]
 fn MealPlan() -> Element {
+    rsx! {
+        LoginGate {
+            MealPlanContent {}
+        }
+    }
+}
+
+#[component]
+fn MealPlanContent() -> Element {
     let mut entries = use_signal(Vec::<MealPlanEntry>::new);
     let mut recipes = use_signal(Vec::<Recipe>::new);
     let mut error = use_signal(|| String::new());
@@ -4048,9 +4175,11 @@ fn PlanPicker(
 #[component]
 fn Settings() -> Element {
     rsx! {
-        PlaceholderPage {
-            title: "Settings",
-            text: "Theme, account and server settings — coming soon.",
+        LoginGate {
+            PlaceholderPage {
+                title: "Settings",
+                text: "Theme, account and server settings — coming soon.",
+            }
         }
     }
 }

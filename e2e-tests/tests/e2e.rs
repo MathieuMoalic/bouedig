@@ -24,8 +24,14 @@ fn env_port(name: &str, default: u16) -> u16 {
 }
 
 /// Start an isolated backend (temp SQLite, temp image dir, built web bundle)
-/// and return its bound address.
+/// and return its bound address. Auth is off — every existing flow test
+/// relies on that; the auth test uses [`spawn_test_backend_with_password`].
 async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
+    spawn_test_backend_with_password(None).await
+}
+
+/// Same, with the household password configured (auth on).
+async fn spawn_test_backend_with_password(password: Option<&str>) -> anyhow::Result<SocketAddr> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("warn,backend=info,sqlx=warn"))
         .with_test_writer()
@@ -44,6 +50,7 @@ async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
         openrouter_key: None,
         classifier_model: None,
         classifier_endpoint: None,
+        password: password.map(str::to_string),
     };
     let addr = backend::spawn_server(config).await?;
     // Keep the tempdirs alive for the rest of the process.
@@ -1303,6 +1310,113 @@ async fn recipes_search_sort_and_detail_actions_flow() -> anyhow::Result<()> {
             note.contains("copied") || note.contains("http"),
             "share note wrong: '{note}'"
         );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Auth: recipe browsing stays public while the private tabs show the login
+/// gate; a wrong password errors, the right one reveals the tab, and the
+/// detail-page actions only exist for the authenticated.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_login_gate_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend_with_password(Some("fondue")).await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // Anonymous API: grocery is gated, writes are gated…
+    let status = http.get(format!("{base}/api/grocery")).send().await?.status();
+    assert_eq!(status, 401);
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .body(r#"{"name":"Gate Loaf","sections":[],"ingredients":[],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}"#)
+        .header("content-type", "application/json")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 401);
+
+    // …but a logged-in cookie client can seed a recipe for browsing.
+    let authed = reqwest::Client::builder().cookie_store(true).build()?;
+    let status = authed
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({ "password": "fondue" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 204);
+    let status = authed
+        .post(format!("{base}/api/recipes"))
+        .json(&serde_json::json!({
+            "name": "Gate Loaf",
+            "sections": [],
+            "ingredients": [{"quantity": 1.0, "unit": "g", "name": "flour", "prep": null, "section": null}],
+            "instructions": [],
+            "instruction_sections": [],
+            "notes": "",
+            "yield": "",
+            "source": ""
+        }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        // The recipes grid loads without any login.
+        driver.goto(format!("{base}/")).await?;
+        wait_for_url_path(&driver, "/").await?;
+        driver
+            .find(By::Css(".recipe-card-name"))
+            .await
+            .context("public grid did not render")?;
+
+        // The Shopping tab is the login gate.
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        driver
+            .find(By::Id("login-password"))
+            .await
+            .context("login gate missing on the shopping tab")?;
+
+        // Wrong password errors.
+        driver
+            .find(By::Id("login-password"))
+            .await?
+            .send_keys("wrong")
+            .await?;
+        driver.find(By::Id("login-submit")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let error = driver
+            .find(By::Css(".login-card .status-error"))
+            .await?
+            .text()
+            .await?;
+        anyhow::ensure!(error.contains("Wrong password"), "login error wrong: '{error}'");
+
+        // The right password reveals the list.
+        let input = driver.find(By::Id("login-password")).await?;
+        input.clear().await?;
+        input.send_keys("fondue").await?;
+        driver.find(By::Id("login-submit")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        driver
+            .find(By::Id("grocery-input"))
+            .await
+            .context("grocery content did not appear after login")?;
+
+        // The detail page now shows the authenticated actions.
+        driver.goto(format!("{base}/recipe/1")).await?;
+        wait_for_url_path_prefix(&driver, "/recipe/").await?;
+        driver.find(By::Id("ingredient-list")).await?;
+        driver
+            .find(By::Id("hdr-cart"))
+            .await
+            .context("detail actions missing after login")?;
         Ok(())
     })()
     .await;
