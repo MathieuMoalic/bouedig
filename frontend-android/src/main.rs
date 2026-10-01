@@ -2645,19 +2645,21 @@ fn GroceryEditSheet(
     let mut name = use_signal(|| item.name.clone());
     let mut group = use_signal(|| item.category.clone());
     let name_value = name.read().trim().to_string();
+    // Reading the live selection here subscribes the render to `group`, so
+    // the highlight follows taps instead of staying on the loaded category.
+    let group_value = group.read().clone();
     // The item's own group always has a button, even if it somehow fell out
     // of the merged category list. Precomputed so rsx can map plainly.
     let mut options = groups;
     if !options.iter().any(|g| g == &item.category) {
         options.insert(0, item.category.clone());
     }
-    let categories: Vec<(String, &'static str, bool, String)> = options
+    let categories: Vec<(String, &'static str, String)> = options
         .iter()
         .map(|g| {
             (
                 g.clone(),
                 shared::category_emoji(g),
-                g == &item.category,
                 format!("cat-{}", g.replace(' ', "-")),
             )
         })
@@ -2685,10 +2687,10 @@ fn GroceryEditSheet(
                     div { class: "sheet-field",
                         span { "Group" }
                         div { class: "sheet-cats",
-                            for (label, emoji, selected, button_id) in categories.iter() {
+                            for (label, emoji, button_id) in categories.iter() {
                                 button {
                                     id: "{button_id}",
-                                    class: if *selected { "cat-btn selected" } else { "cat-btn" },
+                                    class: if *label == group_value { "cat-btn selected" } else { "cat-btn" },
                                     r#type: "button",
                                     onclick: {
                                         let label = label.clone();
