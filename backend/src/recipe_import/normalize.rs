@@ -216,7 +216,7 @@ const PREP_PHRASES: &[&str] = &[
     "melted", "chilled", "finely chopped", "chopped", "minced", "diced",
     "sliced", "grated", "shredded", "peeled", "crushed", "julienned",
     "toasted", "roughly chopped", "coarsely chopped", "thinly sliced",
-    "cut into chunks", "cubed", "torn", "rinsed", "drained", "pitted",
+    "cut into chunks", "cut into", "cubed", "torn", "rinsed", "drained", "pitted",
     "halved", "quartered", "zested", "juiced", "sifted", "cooled", "cooked",
     "uncooked", "raw", "fresh", "freshly ground", "ground", "unsalted",
     "salted", "extra-virgin", "extra virgin", "virgin", "cold", "hot", "warm",
@@ -242,11 +242,22 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
         };
     }
 
-    // Split off the preparation suffix at the first comma (…, finely chopped).
-    let (main, prep) = match line.split_once(',') {
+    // Split off the preparation suffix at the first comma *outside any
+    // paren group* (…, finely chopped) — a comma inside a group
+    // ("mushrooms (white or cremini, sliced)") is not a suffix boundary.
+    // A parenthesized suffix ("seitan, (cut into 1-inch pieces)") is an
+    // explicit aside, so it gets a longer word budget before it counts as
+    // prep instead of part of the name.
+    let (main, prep) = match split_top_level_comma(&line) {
         Some((main, rest)) => {
+            let parenthesized = rest.trim().starts_with('(');
             let rest = strip_outer_parens(rest.trim());
-            if rest.split_whitespace().count() <= 4 && looks_like_prep(rest) {
+            let words = rest.split_whitespace().count();
+            let limit = if parenthesized { 8 } else { 4 };
+            let lifted = words <= limit
+                && looks_like_prep(rest)
+                && !(words > 4 && has_top_level_alternative(rest));
+            if lifted {
                 (main.trim(), Some(rest.to_string()))
             } else {
                 // Long/odd comma content stays part of the name ("sauce, homemade, spicy").
@@ -328,11 +339,16 @@ pub fn parse_ingredient_line(line: &str) -> Ingredient {
 
     let mut name = strip_unbalanced_parens(remainder.trim());
     let mut prep = prep;
-    // A short trailing parenthetical note ("oil (divided)", "noodles (*see
-    // note)") is preparation information, not part of the name.
+    // A trailing parenthetical note ("oil (divided)", "seitan (cut into
+    // about 1-inch pieces)") is preparation information, not part of the
+    // name. Short notes always move; longer ones move when they look like
+    // prep and are not "or"-style alternatives.
     if let Some((group, start)) = trailing_group(&name) {
         let content = strip_outer_parens(group);
-        if prep.is_none() && content.split_whitespace().count() <= 4 {
+        let words = content.split_whitespace().count();
+        let acceptable = words <= 4
+            || (words <= 8 && looks_like_prep(&content) && !has_top_level_alternative(&content));
+        if prep.is_none() && acceptable {
             let cut = name[..start].trim_end().to_string();
             let note = content.to_string();
             name = cut;
@@ -597,6 +613,28 @@ fn looks_like_prep(text: &str) -> bool {
         || lowered.starts_with("plus ")
         || lowered.starts_with("or ")
         || lowered.starts_with("to ")
+}
+
+/// Split at the first comma that sits outside every parenthesized group, so
+/// "mushrooms (white or cremini, sliced)" has no prep suffix at all.
+fn split_top_level_comma(line: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some((&line[..index], &line[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// "or"-style alternatives ("or Indian red chili powder") are variety notes,
+/// not preparation, so long parentheticals containing one stay in the name.
+fn has_top_level_alternative(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    lowered.starts_with("or ") || lowered.contains(" or ")
 }
 
 /// Consume a leading quantity from `remainder` (mutating it). Supports:
@@ -1093,6 +1131,39 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_prep_after_comma_never_joins_the_name() {
+        // The Vegan Souvlaki pattern: the parenthesized aside after the
+        // comma used to exceed the prep word budget and glue itself onto
+        // the name.
+        let i = parse_ingredient_line("454 g seitan, (cut into about 1-inch pieces)");
+        assert_eq!(i.quantity, Some(454.0));
+        assert_eq!(i.unit.as_deref(), Some("g"));
+        assert_eq!(i.name, "seitan");
+        assert_eq!(i.prep.as_deref(), Some("cut into about 1-inch pieces"));
+
+        let i = parse_ingredient_line("1 small red bell pepper, (cut into about 1-inch pieces)");
+        assert_eq!(i.name, "small red bell pepper");
+        assert_eq!(i.prep.as_deref(), Some("cut into about 1-inch pieces"));
+    }
+
+    #[test]
+    fn trailing_parenthesized_prep_is_lifted_out_of_the_name() {
+        let i = parse_ingredient_line("454 g seitan (cut into about 1-inch pieces)");
+        assert_eq!(i.quantity, Some(454.0));
+        assert_eq!(i.unit.as_deref(), Some("g"));
+        assert_eq!(i.name, "seitan");
+        assert_eq!(i.prep.as_deref(), Some("cut into about 1-inch pieces"));
+    }
+
+    #[test]
+    fn long_non_prep_parenthetical_stays_in_the_name() {
+        // Variety descriptions are not preparation: keep them.
+        let i = parse_ingredient_line("100 g mushrooms (white button or cremini, sliced thin)");
+        assert_eq!(i.name, "mushrooms (white button or cremini, sliced thin)");
+        assert_eq!(i.prep, None);
+    }
+
+    #[test]
     fn no_quantity_is_fine() {
         let i = parse_ingredient_line("salt, to taste");
         assert_eq!(i.quantity, None);
@@ -1263,15 +1334,17 @@ mod tests {
     #[test]
     fn metric_parens_stay_balanced_in_name() {
         // rainbowplantlife.com, verbatim: imperial main + metric alternate —
-        // the metric value wins and the imperial text disappears.
+        // the metric value wins and the imperial text disappears. The
+        // parenthesized prep aside moves to prep (long parenthesized asides
+        // lift when they look like prep and aren't "or" alternatives).
         let i = parse_ingredient_line("1 pound (454g) sweet potatoes, (peeled and finely diced (see Note 3) )");
         assert_eq!(i.quantity, Some(454.0));
         assert_eq!(i.unit.as_deref(), Some("g"));
+        assert_eq!(i.name, "sweet potatoes");
         assert_eq!(
-            i.name,
-            "sweet potatoes, (peeled and finely diced (see Note 3))"
+            i.prep.as_deref(),
+            Some("peeled and finely diced (see Note 3)")
         );
-        assert_eq!(i.prep, None, "long note stays in the name, conservatively");
         assert_balanced(&i);
     }
 
