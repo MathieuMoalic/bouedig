@@ -29,6 +29,10 @@ use tower_http::services::{ServeDir, ServeFile};
 /// regression suite (`backend/tests/live_import.rs`).
 pub mod recipe_import;
 
+/// Grocery-category classification via Jev on OpenRouter (cache-first,
+/// background — see the module docs).
+pub mod classifier;
+
 use recipe_import::{ImportError, RecipePreview};
 
 /// Runtime configuration, all overridable via environment variables.
@@ -47,6 +51,14 @@ pub struct Config {
     /// Test/dev escape hatch: allow the importer to fetch loopback/private
     /// targets (`BOUEDIG_IMPORT_ALLOW_PRIVATE=1`). Never request-controlled.
     pub import_allow_private: bool,
+    /// OpenRouter key enabling Jev grocery categorization
+    /// (`BOUEDIG_OPENROUTER_KEY`). Absent → items stay in "Other".
+    pub openrouter_key: Option<String>,
+    /// OpenRouter model slug for the classifier (`BOUEDIG_CLASSIFIER_MODEL`).
+    pub classifier_model: Option<String>,
+    /// Classifier endpoint override (`BOUEDIG_CLASSIFIER_ENDPOINT`), used by
+    /// tests to point at a local mock.
+    pub classifier_endpoint: Option<String>,
 }
 
 impl Config {
@@ -74,6 +86,9 @@ impl Config {
             import_allow_private: std::env::var("BOUEDIG_IMPORT_ALLOW_PRIVATE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            openrouter_key: std::env::var("BOUEDIG_OPENROUTER_KEY").ok(),
+            classifier_model: std::env::var("BOUEDIG_CLASSIFIER_MODEL").ok(),
+            classifier_endpoint: std::env::var("BOUEDIG_CLASSIFIER_ENDPOINT").ok(),
         }
     }
 }
@@ -84,6 +99,23 @@ pub struct AppState {
     db: SqlitePool,
     data_dir: PathBuf,
     import_allow_private: bool,
+    /// Present only when an OpenRouter key is configured.
+    classifier: Option<classifier::Classifier>,
+}
+
+impl AppState {
+    fn from_config(db: SqlitePool, config: &Config) -> Self {
+        Self {
+            db,
+            data_dir: config.data_dir.clone(),
+            import_allow_private: config.import_allow_private,
+            classifier: classifier::Classifier::from_parts(
+                config.openrouter_key.clone(),
+                config.classifier_model.clone(),
+                config.classifier_endpoint.clone(),
+            ),
+        }
+    }
 }
 
 /// Open (creating if needed) the SQLite pool for `db_url`.
@@ -205,14 +237,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let pool = open_db(&config.db_url).await?;
     run_migrations(&pool).await?;
     ensure_data_dirs(&config.data_dir)?;
-    let app = build_router(
-        AppState {
-            db: pool,
-            data_dir: config.data_dir.clone(),
-            import_allow_private: config.import_allow_private,
-        },
-        &config,
-    );
+    let app = build_router(AppState::from_config(pool, &config), &config);
     tracing::info!("listening on http://{}", config.addr);
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
@@ -226,14 +251,7 @@ pub async fn spawn_server(config: Config) -> anyhow::Result<SocketAddr> {
     let pool = open_db(&config.db_url).await?;
     run_migrations(&pool).await?;
     ensure_data_dirs(&config.data_dir)?;
-    let app = build_router(
-        AppState {
-            db: pool,
-            data_dir: config.data_dir.clone(),
-            import_allow_private: config.import_allow_private,
-        },
-        &config,
-    );
+    let app = build_router(AppState::from_config(pool, &config), &config);
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .context("failed to bind address")?;
@@ -990,6 +1008,27 @@ async fn list_grocery(
     Ok(Json(rows.iter().map(row_to_joined_item).collect()))
 }
 
+/// Resolve the category for a newly added item: an explicitly typed group
+/// always wins; otherwise the cached classification applies instantly; only
+/// a cache miss lands in "Other" and is queued for background classification.
+/// Returns `(category, needs_classification)`.
+async fn resolve_category(db: &SqlitePool, item: &NewGroceryItem) -> (String, bool) {
+    if let Some(explicit) = item.category.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        return (explicit.to_string(), false);
+    }
+    let cached: Option<String> =
+        sqlx::query_scalar("SELECT category FROM ingredient_categories WHERE name = ?")
+            .bind(classifier::cache_key(&item.name))
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    match cached {
+        Some(cached) => (cached, false),
+        None => (shared::DEFAULT_CATEGORY.to_string(), true),
+    }
+}
+
 async fn add_grocery_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(item): Json<NewGroceryItem>,
@@ -1000,12 +1039,7 @@ async fn add_grocery_item(
             (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
         ));
     }
-    let category = item
-        .category
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .unwrap_or(shared::DEFAULT_CATEGORY);
+    let (category, needs_classification) = resolve_category(&state.db, &item).await;
     let row = sqlx::query(
         "INSERT INTO grocery_items (name, category) VALUES (?, ?) \
          RETURNING id, name, bought, category",
@@ -1014,6 +1048,16 @@ async fn add_grocery_item(
     .bind(category)
     .fetch_one(&state.db)
     .await?;
+    if needs_classification {
+        if let Some(classifier) = state.classifier.clone() {
+            let id = sqlx::Row::get::<i64, _>(&row, "id");
+            let db = state.db.clone();
+            let key = classifier::cache_key(name);
+            tokio::spawn(async move {
+                classifier::classify_pending(db, classifier, vec![(id, key)]).await;
+            });
+        }
+    }
     Ok((StatusCode::CREATED, Json(row_to_item(&row))))
 }
 
@@ -1039,13 +1083,8 @@ async fn add_grocery_batch(
                 (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
             ));
         }
-        let category = item
-            .category
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .unwrap_or(shared::DEFAULT_CATEGORY);
-        prepared.push((name, category));
+        let (category, needs_classification) = resolve_category(&state.db, item).await;
+        prepared.push((name.to_string(), category, needs_classification));
     }
     // Provenance recipe: validated up front so a bad id rejects the whole
     // batch instead of failing halfway through the inserts.
@@ -1064,21 +1103,33 @@ async fn add_grocery_batch(
     };
     let mut tx = state.db.begin().await?;
     let mut created = Vec::with_capacity(prepared.len());
-    for (name, category) in prepared {
+    let mut pending = Vec::new();
+    for (name, category, needs_classification) in prepared {
         let row = sqlx::query(
             "INSERT INTO grocery_items (name, category, recipe_id) VALUES (?, ?, ?) \
              RETURNING id, name, bought, category",
         )
-        .bind(name)
-        .bind(category)
+        .bind(&name)
+        .bind(&category)
         .bind(batch.recipe_id)
         .fetch_one(&mut *tx)
         .await?;
+        if needs_classification {
+            pending.push((sqlx::Row::get::<i64, _>(&row, "id"), classifier::cache_key(&name)));
+        }
         let mut item = row_to_item(&row);
         item.recipe = recipe.clone();
         created.push(item);
     }
     tx.commit().await?;
+    if !pending.is_empty() {
+        if let Some(classifier) = state.classifier.clone() {
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                classifier::classify_pending(db, classifier, pending).await;
+            });
+        }
+    }
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1271,11 +1322,76 @@ pub(crate) mod tests {
             static_dir,
             data_dir: std::env::temp_dir().join(format!("bouedig-test-{}", uuid::Uuid::new_v4())),
             import_allow_private: false,
+            openrouter_key: None,
+            classifier_model: None,
+            classifier_endpoint: None,
         }
     }
 
     pub(crate) async fn test_router(base_path: Option<&str>) -> Router {
         test_router_with_config(base_path).await.0
+    }
+
+    /// Router (plus its pool for cache seeding/inspection) with a classifier
+    /// pointed at `endpoint` — a local mock server in the tests.
+    pub(crate) async fn test_router_with_classifier(
+        endpoint: String,
+    ) -> (Router, SqlitePool) {
+        let config = test_config(None, None);
+        ensure_data_dirs(&config.data_dir).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let state = AppState {
+            db: pool.clone(),
+            data_dir: config.data_dir.clone(),
+            import_allow_private: true,
+            classifier: classifier::Classifier::from_parts(
+                Some("test-key".into()),
+                Some("typesafe-ai/jev".into()),
+                Some(endpoint),
+            ),
+        };
+        (build_router(state.clone(), &config), state.db)
+    }
+
+    /// HTTP server that counts requests and always answers `body` with
+    /// `status` — a stand-in for the OpenRouter chat endpoint.
+    pub(crate) fn counting_server(
+        body: &'static str,
+        status: &'static str,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 8192];
+                use std::io::{Read, Write};
+                let _ = stream.read(&mut buffer);
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// An OpenRouter chat response whose message content is `content`.
+    fn openrouter_answer(content: &str) -> &'static str {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string();
+        Box::leak(body.into_boxed_str())
     }
 
     /// Router whose importer may fetch loopback targets (fixture servers).
@@ -1288,17 +1404,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         run_migrations(&pool).await.unwrap();
-        build_router(
-            AppState {
-                db: pool,
-                data_dir: config.data_dir.clone(),
-                import_allow_private: true,
-            },
-            &Config {
-                import_allow_private: true,
-                ..config
-            },
-        )
+        let config = Config {
+            import_allow_private: true,
+            ..config
+        };
+        build_router(AppState::from_config(pool, &config), &config)
     }
 
     pub(crate) async fn test_router_with_config(base_path: Option<&str>) -> (Router, Config) {
@@ -1311,14 +1421,7 @@ pub(crate) mod tests {
             .unwrap();
         run_migrations(&pool).await.unwrap();
         (
-            build_router(
-                AppState {
-                    db: pool,
-                    data_dir: config.data_dir.clone(),
-                    import_allow_private: config.import_allow_private,
-                },
-                &config,
-            ),
+            build_router(AppState::from_config(pool, &config), &config),
             config,
         )
     }
@@ -1533,7 +1636,7 @@ pub(crate) mod tests {
         let created: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(created.as_array().unwrap().len(), 3, "{body}");
         assert_eq!(created[2]["name"], "Salt", "names must be trimmed: {body}");
-        assert_eq!(created[0]["category"], "Groceries", "default category: {body}");
+        assert_eq!(created[0]["category"], "Other", "default category: {body}");
 
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1564,7 +1667,7 @@ pub(crate) mod tests {
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(list[0]["category"], "Fresh", "{body}");
-        assert_eq!(list[1]["category"], "Groceries", "{body}");
+        assert_eq!(list[1]["category"], "Other", "{body}");
     }
 
     #[tokio::test]
@@ -1702,7 +1805,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let edited: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(edited["category"], "Groceries", "{body}");
+        assert_eq!(edited["category"], "Other", "{body}");
 
         // Blank name → 422, unknown id → 404.
         let (status, _) = json_response(
@@ -1755,6 +1858,157 @@ pub(crate) mod tests {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
             .as_i64()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn grocery_cache_hit_skips_the_api() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = counting_server(
+            openrouter_answer(r#"{"category":"Vegan","confidence":0.9}"#),
+            "200 OK",
+            hits.clone(),
+        );
+        let (app, pool) = test_router_with_classifier(format!("http://{server}/v1/chat/completions")).await;
+        sqlx::query("INSERT INTO ingredient_categories (name, category) VALUES ('onion', 'Vegetables')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Onion"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["category"], "Vegetables", "cache hit must apply instantly: {body}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "cached names must never reach the API");
+    }
+
+    #[tokio::test]
+    async fn grocery_background_classification_updates_and_remembers() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = counting_server(
+            openrouter_answer(r#"{"category":"Vegan","confidence":0.9}"#),
+            "200 OK",
+            hits.clone(),
+        );
+        let (app, pool) = test_router_with_classifier(format!("http://{server}/v1/chat/completions")).await;
+
+        // The add answers immediately with the default; the flip happens later.
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(r#"{"items":[{"name":"1 lb firm tofu"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created[0]["category"], "Other", "cache miss starts in Other: {body}");
+
+        // The background task moves it (and everything of that name) out.
+        let mut flipped = false;
+        for _ in 0..40 {
+            let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+            let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if list[0]["category"] == "Vegan" {
+                flipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(flipped, "background classification never applied the category");
+        let cached: String =
+            sqlx::query_scalar("SELECT category FROM ingredient_categories WHERE name = '1 lb firm tofu'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cached, "Vegan");
+
+        // A repeat add resolves from the cache — the API was called once.
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery",
+            Some(r#"{"name":"1 lb Firm Tofu"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["category"], "Vegan", "repeat add must use the cache: {body}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn grocery_low_confidence_stays_other_and_is_not_cached() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = counting_server(
+            openrouter_answer(r#"{"category":"Vegan","confidence":0.3}"#),
+            "200 OK",
+            hits.clone(),
+        );
+        let (app, pool) = test_router_with_classifier(format!("http://{server}/v1/chat/completions")).await;
+
+        let (status, _) =
+            json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"mysterygoo"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["category"], "Other", "{body}");
+        let cached: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingredient_categories")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cached, 0, "low-confidence answers must not be cached");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "the API was consulted once");
+    }
+
+    #[tokio::test]
+    async fn grocery_api_failure_stays_other() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = counting_server("{}", "500 Internal Server Error", hits.clone());
+        let (app, pool) = test_router_with_classifier(format!("http://{server}/v1/chat/completions")).await;
+
+        let (status, body) =
+            json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"carrot"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["category"], "Other", "API failure must fall back to Other: {body}");
+        let cached: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingredient_categories")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cached, 0);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn grocery_explicit_category_skips_classification() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = counting_server(
+            openrouter_answer(r#"{"category":"Vegan","confidence":0.9}"#),
+            "200 OK",
+            hits.clone(),
+        );
+        let (app, _pool) = test_router_with_classifier(format!("http://{server}/v1/chat/completions")).await;
+
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery",
+            Some(r#"{"name":"Dish soap","category":" Non-Food "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["category"], "Non-Food", "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "explicit groups must never reach the API");
     }
 
     #[tokio::test]

@@ -40,6 +40,10 @@ async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
         data_dir: data_dir.path().to_path_buf(),
         // The browser import test fetches a loopback fixture page.
         import_allow_private: true,
+        // No OpenRouter key in e2e: unclassified items simply stay in Other.
+        openrouter_key: None,
+        classifier_model: None,
+        classifier_endpoint: None,
     };
     let addr = backend::spawn_server(config).await?;
     // Keep the tempdirs alive for the rest of the process.
@@ -1055,7 +1059,7 @@ async fn grocery_edit_provenance_and_bought_flow() -> anyhow::Result<()> {
             .find_all(By::Css("#sheet-item-group option"))
             .await?;
         anyhow::ensure!(
-            options.len() >= 15,
+            options.len() >= 14,
             "expected the preset categories in the dropdown, got {} options",
             options.len()
         );

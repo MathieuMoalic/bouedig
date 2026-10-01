@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Default grocery category for items added without an explicit group.
-pub const DEFAULT_CATEGORY: &str = "Groceries";
+/// Default grocery category for items added without an explicit group —
+/// also the landing spot for items the auto-classifier can't place.
+pub const DEFAULT_CATEGORY: &str = "Other";
 
 /// Preset group suggestions offered in the grocery category dropdowns.
 pub const GROCERY_CATEGORIES: &[&str] = &[
@@ -21,6 +22,22 @@ pub const GROCERY_CATEGORIES: &[&str] = &[
     "Pharmacy",
     "Online",
     "Online Alcohol",
+];
+
+/// The categories the auto-classifier may assign. The manual-only groups
+/// (Non-Food, Pharmacy, Online, Online Alcohol) are excluded — those only
+/// make sense when a person is adding the item themselves.
+pub const CLASSIFIER_CATEGORIES: &[&str] = &[
+    "Other",
+    "Fruits",
+    "Vegetables",
+    "Bakery",
+    "Vegan",
+    "Drinks",
+    "Alcohol",
+    "Seasoning",
+    "Canned",
+    "Pantry",
 ];
 
 /// A recipe as shown in the grid (summary; no ingredients/instructions).

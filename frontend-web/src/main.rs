@@ -2626,6 +2626,42 @@ fn Grocery() -> Element {
         }
     });
 
+    // Background classification flips categories a few seconds after an
+    // add, so re-fetch periodically while the page is open. The loop dies
+    // with the page via the mounted flag (use_drop).
+    let mut mounted = use_signal(|| true);
+    use_drop(move || mounted.set(false));
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                let promise = js_sys::Promise::new(&mut |resolve, _| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 5000);
+                    }
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                if !mounted() {
+                    break;
+                }
+                refresh(items, error).await;
+            }
+        });
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !mounted() {
+                    break;
+                }
+                refresh(items, error).await;
+            }
+        });
+    });
+
     // Plan dates feed the provenance line ("Lentil Loaf in 4 days"): one
     // fetch, mapped client-side so the day math uses the browser's today.
     use_effect(move || {

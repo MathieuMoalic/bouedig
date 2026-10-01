@@ -2279,6 +2279,23 @@ fn Grocery() -> Element {
         }
     });
 
+    // Background classification flips categories a few seconds after an
+    // add, so re-fetch periodically while the page is open. The loop dies
+    // with the page via the mounted flag (use_drop).
+    let mut mounted = use_signal(|| true);
+    use_drop(move || mounted.set(false));
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !mounted() {
+                    break;
+                }
+                refresh(items, error).await;
+            }
+        });
+    });
+
     // Plan dates feed the provenance line ("Lentil Loaf in 4 days"): one
     // fetch, mapped against the device's local today.
     use_effect(move || {
