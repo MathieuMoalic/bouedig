@@ -65,10 +65,14 @@ pub fn category_emoji(name: &str) -> &'static str {
 pub struct Recipe {
     pub id: i64,
     pub name: String,
-    /// URL of the full-resolution photo, if one was uploaded.
+    #[serde(default)]
     pub image: Option<String>,
-    /// URL of the compressed thumbnail shown in the recipe grid.
+    #[serde(default)]
     pub thumb: Option<String>,
+    /// Last modification time, `YYYY-MM-DD HH:MM:SS` (UTC). Feeds the
+    /// "Recently updated" sort; absent from older payloads.
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 /// One structured ingredient line of a recipe.

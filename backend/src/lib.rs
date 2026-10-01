@@ -147,6 +147,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
 pub fn build_router(state: AppState, config: &Config) -> Router {
     let api = Router::new()
         .route("/recipes", get(list_recipes).post(create_recipe))
+        .route("/recipes/search", get(search_recipes))
         .route("/recipes/photo", post(create_recipe_with_photo))
         .route(
             "/recipes/import",
@@ -172,6 +173,10 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
             get(list_meal_plan).post(add_meal_plan_entry),
         )
         .route("/meal-plan/{id}", delete(delete_meal_plan_entry))
+        .route(
+            "/settings/{key}",
+            get(get_setting).put(put_setting),
+        )
         .route("/images/{*path}", get(serve_image))
         // Photo uploads can be several megabytes.
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
@@ -344,6 +349,7 @@ fn row_to_joined_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
             name: row.get::<String, _>("recipe_name"),
             image: url(row.get::<Option<String>, _>("image_path")),
             thumb: url(row.get::<Option<String>, _>("thumb_path")),
+            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
         }
     });
     GroceryItem {
@@ -358,7 +364,7 @@ fn row_to_joined_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
 /// The grocery SELECT with provenance joined in; `r.id` aliases as
 /// `recipe_id` so it never collides with `g.id`.
 const GROCERY_SELECT: &str = "SELECT g.id, g.name, g.bought, g.category, \
-     r.id AS recipe_id, r.name AS recipe_name, r.image_path, r.thumb_path \
+     r.id AS recipe_id, r.name AS recipe_name, r.image_path, r.thumb_path, r.updated_at \
      FROM grocery_items g LEFT JOIN recipes r ON r.id = g.recipe_id";
 
 /// DB stores relative paths under the image dir; expose them as URLs.
@@ -379,6 +385,7 @@ fn row_to_recipe(row: &sqlx::sqlite::SqliteRow) -> Recipe {
         name: row.get::<String, _>("name"),
         image,
         thumb,
+        updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
     }
 }
 
@@ -496,8 +503,8 @@ async fn insert_recipe(
     );
     let mut tx = db.begin().await?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO recipes (name, notes, yield_amount, source, image_path, thumb_path) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO recipes (name, notes, yield_amount, source, image_path, thumb_path, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now')) RETURNING id",
     )
     .bind(input.name.trim())
     .bind(input.notes.trim())
@@ -546,6 +553,8 @@ async fn insert_recipe(
         name: input.name.trim().to_string(),
         image: image_path.map(|p| format!("/api/images/{p}")),
         thumb: thumb_path.map(|p| format!("/api/images/{p}")),
+        // Mirrors the column default; nothing sorts the just-created recipe.
+        updated_at: String::new(),
     })
 }
 
@@ -882,7 +891,8 @@ async fn update_recipe(
     };
     let updated = sqlx::query(
         "UPDATE recipes SET name = ?, notes = ?, yield_amount = ?, source = ?, \
-         image_path = ?, thumb_path = ? WHERE id = ? RETURNING id",
+         image_path = ?, thumb_path = ?, updated_at = datetime('now') \
+         WHERE id = ? RETURNING id",
     )
     .bind(input.name.trim())
     .bind(input.notes.trim())
@@ -992,11 +1002,119 @@ async fn list_recipes(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<Vec<Recipe>>, ApiError> {
     let rows = sqlx::query(
-        "SELECT id, name, image_path, thumb_path FROM recipes ORDER BY id DESC",
+        "SELECT id, name, image_path, thumb_path, updated_at FROM recipes ORDER BY id DESC",
     )
     .fetch_all(&state.db)
     .await?;
     Ok(Json(rows.iter().map(row_to_recipe).collect()))
+}
+
+/// Ranked recipe search: exact-ish name matches first (prefix, then
+/// substring, then fuzzy ≤ 2 edits), recipes whose *ingredients* contain
+/// the query after that. Ties keep the newest recipe first.
+async fn search_recipes(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<Recipe>>, ApiError> {
+    let query = params.get("q").map(|q| q.trim()).unwrap_or_default();
+    if query.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let needle = query.to_lowercase();
+    let rows = sqlx::query(
+        "SELECT r.id, r.name, r.image_path, r.thumb_path, r.updated_at, \
+                (SELECT GROUP_CONCAT(i.name, ' ') FROM recipe_ingredients i \
+                 WHERE i.recipe_id = r.id) AS ingredient_names \
+         FROM recipes r ORDER BY r.updated_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut ranked: Vec<(u8, Recipe)> = Vec::new();
+    for row in &rows {
+        let recipe = row_to_recipe(row);
+        let name = recipe.name.to_lowercase();
+        let ingredients = {
+            use sqlx::Row;
+            row.get::<Option<String>, _>("ingredient_names")
+                .unwrap_or_default()
+                .to_lowercase()
+        };
+        let tier = if name.starts_with(&needle) {
+            0
+        } else if name.contains(&needle) {
+            1
+        } else if name.split_whitespace().any(|word| {
+            levenshtein_within(word, &needle, 2) || levenshtein_within(&name, &needle, 2)
+        }) {
+            2
+        } else if ingredients.contains(&needle) {
+            3
+        } else {
+            continue;
+        };
+        ranked.push((tier, recipe));
+    }
+    ranked.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Json(ranked.into_iter().map(|(_, r)| r).collect()))
+}
+
+/// Character-based Levenshtein distance (multibyte-safe), `true` when the
+/// two names are within `max` edits of each other.
+fn levenshtein_within(a: &str, b: &str, max: usize) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()] <= max
+}
+
+/// Read one UI preference (`404` when unset — the client keeps its default).
+async fn get_setting(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key.trim())
+            .fetch_optional(&state.db)
+            .await?;
+    match value {
+        Some(value) => Ok(Json(serde_json::json!({ "key": key, "value": value }))),
+        None => Err(ApiError((StatusCode::NOT_FOUND, "no such setting").into_response())),
+    }
+}
+
+/// Write one UI preference. Blank values are rejected; keys are trimmed.
+async fn put_setting(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let value = payload["value"].as_str().unwrap_or_default().trim();
+    if value.is_empty() {
+        return Err(ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "setting value must not be empty").into_response(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key.trim())
+    .bind(value)
+    .execute(&state.db)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_grocery(
@@ -1090,7 +1208,7 @@ async fn add_grocery_batch(
     // batch instead of failing halfway through the inserts.
     let recipe = match batch.recipe_id {
         Some(id) => {
-            let row = sqlx::query("SELECT id, name, image_path, thumb_path FROM recipes WHERE id = ?")
+            let row = sqlx::query("SELECT id, name, image_path, thumb_path, updated_at FROM recipes WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&state.db)
                 .await?
@@ -1237,12 +1355,13 @@ fn row_to_meal_plan_entry(row: &sqlx::sqlite::SqliteRow) -> MealPlanEntry {
             name: row.get::<String, _>("name"),
             image,
             thumb,
+            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
         },
     }
 }
 
 const MEAL_PLAN_SELECT: &str = "SELECT m.id, m.date, r.id AS recipe_id, r.name, \
-     r.image_path, r.thumb_path \
+     r.image_path, r.thumb_path, r.updated_at \
      FROM meal_plan_entries m JOIN recipes r ON r.id = m.recipe_id";
 
 /// `GET /api/meal-plan`: every entry, ordered by day then insertion order.
@@ -1868,6 +1987,115 @@ pub(crate) mod tests {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
             .as_i64()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recipe_search_ranks_names_over_ingredients_over_fuzzy() {
+        let app = test_router(None).await;
+        // Soupb (fuzzy name), "Pea Soup" (prefix), "Lentil Soup" (substring),
+        // and a recipe whose *ingredient* says soup but whose name doesn't.
+        for name in ["Soupb Stew", "Pea Soup", "Lentil Soup", "Green Bowl"] {
+            let payload = format!(
+                r#"{{"name":"{name}","sections":[],"ingredients":[{{"quantity":null,"unit":null,"name":"{}","prep":null,"section":null}}],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}}"#,
+                if name == "Green Bowl" { "soup greens" } else { "water" }
+            );
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/recipes", Some(&payload)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (_, body) =
+            json_response(app.clone(), "GET", "/api/recipes/search?q=soup", None).await;
+        let found: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let names: Vec<&str> = found
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        // Prefix before substring; the ingredient-only match last.
+        // "Soupb Stew" literally starts with "soup", so it leads.
+        assert_eq!(
+            names,
+            vec!["Soupb Stew", "Pea Soup", "Lentil Soup", "Green Bowl"],
+            "search ranking wrong: {body}"
+        );
+
+        // A typo'd query still finds the soups via the fuzzy tier.
+        let (_, body) =
+            json_response(app.clone(), "GET", "/api/recipes/search?q=soop", None).await;
+        let found: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let names: Vec<&str> = found
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"Pea Soup") && names.contains(&"Lentil Soup"),
+            "fuzzy search missed the soups: {body}"
+        );
+
+        // Empty query: no results, no error.
+        let (status, body) =
+            json_response(app, "GET", "/api/recipes/search?q=", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_and_validation() {
+        let app = test_router(None).await;
+        // Unset keys read as 404 so the client keeps its default.
+        let (status, _) =
+            json_response(app.clone(), "GET", "/api/settings/recipes_sort", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = json_response(
+            app.clone(),
+            "PUT",
+            "/api/settings/recipes_sort",
+            Some(r#"{"value":"name_asc"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) =
+            json_response(app.clone(), "GET", "/api/settings/recipes_sort", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let setting: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(setting["value"], "name_asc", "{body}");
+
+        // Overwrite, blank rejected, unknown key untouched.
+        let (status, _) = json_response(
+            app.clone(),
+            "PUT",
+            "/api/settings/recipes_sort",
+            Some(r#"{"value":"random"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = json_response(
+            app.clone(),
+            "PUT",
+            "/api/settings/recipes_sort",
+            Some(r#"{"value":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (_, body) =
+            json_response(app, "GET", "/api/settings/recipes_sort", None).await;
+        let setting: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(setting["value"], "random", "blank must not clobber: {body}");
+    }
+
+    #[test]
+    fn levenshtein_within_matches_tolerantly() {
+        assert!(levenshtein_within("soupb", "soup", 2));
+        assert!(levenshtein_within("pancakes", "pancake", 2));
+        assert!(!levenshtein_within("curry", "pasta", 2));
+        // Multibyte characters count per character, not per byte.
+        assert!(levenshtein_within("café", "cafe", 1));
     }
 
     #[tokio::test]

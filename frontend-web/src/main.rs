@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use shared::{
     GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry,
@@ -278,6 +279,29 @@ fn IconTrash() -> Element {
     }
 }
 
+#[component]
+fn IconSort() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round",
+            path { d: "M4 7h10M18 7h2M4 12h4M12 12h8M4 17h10M18 17h2" }
+            circle { cx: "16", cy: "7", r: "2" }
+            circle { cx: "10", cy: "12", r: "2" }
+            circle { cx: "16", cy: "17", r: "2" }
+        }
+    }
+}
+
+#[component]
+fn IconImage() -> Element {
+    rsx! {
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round",
+            rect { x: "3", y: "4", width: "18", height: "16", rx: "2" }
+            circle { cx: "9", cy: "10", r: "1.6" }
+            path { d: "M5 19l5.5-6 4 4.5L18 14l3 5" }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // API helpers
 // ---------------------------------------------------------------------------
@@ -370,6 +394,115 @@ fn build_multipart(
 // Tab: Recipes (photo grid)
 // ---------------------------------------------------------------------------
 
+/// Grid sort modes; the active one persists through the settings API.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SortMode {
+    NameAsc,
+    NameDesc,
+    Updated,
+    Random,
+}
+
+impl SortMode {
+    fn setting_value(self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "name_asc",
+            SortMode::NameDesc => "name_desc",
+            SortMode::Updated => "updated",
+            SortMode::Random => "random",
+        }
+    }
+
+    fn from_setting(value: &str) -> Option<Self> {
+        match value {
+            "name_asc" => Some(SortMode::NameAsc),
+            "name_desc" => Some(SortMode::NameDesc),
+            "updated" => Some(SortMode::Updated),
+            "random" => Some(SortMode::Random),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "Name (A–Z)",
+            SortMode::NameDesc => "Name (Z–A)",
+            SortMode::Updated => "Recently updated",
+            SortMode::Random => "Random",
+        }
+    }
+}
+
+/// Body of `GET/PUT /api/settings/{key}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettingValue {
+    value: String,
+}
+
+/// Milliseconds since the epoch — random seeds and nothing else.
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+/// Deterministic in-place shuffle (xorshift): stable across re-renders for
+/// one seed, and every seed press is a brand-new order.
+fn seeded_shuffle(list: &mut [Recipe], seed: u64) {
+    if list.len() < 2 {
+        return;
+    }
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for i in (1..list.len()).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        list.swap(i, j);
+    }
+}
+
+/// Sleep that works on wasm (js timer) and natively (tokio).
+#[cfg(target_arch = "wasm32")]
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Best-effort clipboard write (the async clipboard API); `false` when the
+/// browser refuses (permissions, non-secure context).
+#[cfg(target_arch = "wasm32")]
+async fn copy_clipboard(text: String) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Ok(navigator) = js_sys::Reflect::get(&window.into(), &"navigator".into()) else {
+        return false;
+    };
+    let Ok(clipboard) = js_sys::Reflect::get(&navigator, &"clipboard".into()) else {
+        return false;
+    };
+    let Ok(write_text) = js_sys::Reflect::get(&clipboard, &"writeText".into()) else {
+        return false;
+    };
+    let Ok(write_text) = write_text.dyn_into::<js_sys::Function>() else {
+        return false;
+    };
+    match write_text.call1(&clipboard, &text.into()) {
+        Ok(promise) => {
+            let promise: js_sys::Promise = promise.into();
+            wasm_bindgen_futures::JsFuture::from(promise).await.is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 #[component]
 fn Recipes() -> Element {
     let mut recipes = use_signal(Vec::<Recipe>::new);
@@ -377,9 +510,20 @@ fn Recipes() -> Element {
     let mut loaded = use_signal(|| false);
     let navigator = use_navigator();
 
+    let mut sort_mode = use_signal(|| SortMode::Updated);
+    let mut random_seed = use_signal(|| 0u64);
+    let mut add_menu = use_signal(|| false);
+    let mut sort_menu = use_signal(|| false);
+    let mut search_open = use_signal(|| false);
+    let mut search_text = use_signal(|| String::new());
+    let mut search_results = use_signal(|| None::<Vec<Recipe>>);
+    let mut search_generation = use_signal(|| 0u64);
+
     use_effect(move || {
         if !loaded() {
             loaded.set(true);
+            // Fresh random seed per mount; Random presses bump it again.
+            random_seed.set(now_millis());
             spawn(async move {
                 match api_get::<Vec<Recipe>>("/api/recipes").await {
                     Ok(list) => {
@@ -392,41 +536,203 @@ fn Recipes() -> Element {
                         error.set(err.to_string());
                     }
                 }
+                // Restore the persisted sort choice (404 = keep the default).
+                if let Ok(mode) = api_get::<SettingValue>("/api/settings/recipes_sort").await {
+                    if let Some(mode) = SortMode::from_setting(&mode.value) {
+                        sort_mode.set(mode);
+                    }
+                }
             });
         }
     });
 
-    let list = recipes.read().clone();
+    // Live search: debounce 300 ms, then fetch ranked matches. Stale
+    // generations are dropped so typing fast never shows old results.
+    use_effect(move || {
+        let text = search_text.read().trim().to_string();
+        if text.is_empty() {
+            search_results.set(None);
+            return;
+        }
+        search_generation += 1;
+        let generation = search_generation();
+        spawn(async move {
+            sleep_ms(300).await;
+            if generation != search_generation() {
+                return;
+            }
+            let client = reqwest::Client::new();
+            let url = format!("{}/api/recipes/search", api_base());
+            if let Ok(response) = client.get(&url).query(&[("q", &text)]).send().await {
+                if response.status().is_success() {
+                    if let Ok(list) = response.json::<Vec<Recipe>>().await {
+                        if generation == search_generation() {
+                            search_results.set(Some(list));
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    let display = use_memo(move || {
+        let mut list = recipes.read().clone();
+        match sort_mode() {
+            SortMode::NameAsc => list.sort_by(|a, b| {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            }),
+            SortMode::NameDesc => list.sort_by(|a, b| {
+                b.name.to_lowercase().cmp(&a.name.to_lowercase())
+            }),
+            SortMode::Updated => list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+            SortMode::Random => seeded_shuffle(&mut list, random_seed()),
+        }
+        list
+    });
+    let searching = search_text.read().trim().is_empty();
+    let list = if searching {
+        display.read().clone()
+    } else {
+        search_results.read().clone().unwrap_or_default()
+    };
+
+    let mut persist_sort = move |mode: SortMode| {
+        sort_mode.set(mode);
+        let payload = SettingValue {
+            value: mode.setting_value().to_string(),
+        };
+        spawn(async move {
+            let client = reqwest::Client::new();
+            let url = format!("{}/api/settings/recipes_sort", api_base());
+            let _ = client.put(&url).json(&payload).send().await;
+        });
+    };
+    let sort_options: Vec<(SortMode, &'static str, &'static str, bool)> = [
+        SortMode::NameAsc,
+        SortMode::NameDesc,
+        SortMode::Updated,
+        SortMode::Random,
+    ]
+    .iter()
+    .map(|mode| {
+        (
+            *mode,
+            mode.setting_value(),
+            mode.label(),
+            *mode == sort_mode(),
+        )
+    })
+    .collect();
 
     rsx! {
         div { class: "page",
-            if list.is_empty() {
+            if search_open() {
+                div { class: "search-bar",
+                    input {
+                        id: "recipe-search",
+                        r#type: "text",
+                        placeholder: "Search recipes…",
+                        value: "{search_text}",
+                        oninput: move |e: FormEvent| search_text.set(e.value()),
+                    }
+                    button {
+                        id: "search-close",
+                        class: "grocery-remove",
+                        title: "Close search",
+                        onclick: move |_| {
+                            search_text.set(String::new());
+                            search_results.set(None);
+                            search_open.set(false);
+                        },
+                        IconX {}
+                    }
+                }
+            }
+            if list.is_empty() && !search_open() {
                 p { class: "empty", "No recipes yet. Tap + to add your first one." }
+            }
+            if search_open() && list.is_empty() && !searching {
+                p { class: "empty", "Nothing matches." }
             }
             div { id: "recipe-grid", class: "recipe-grid",
                 for recipe in list {
                     RecipeCard { key: "{recipe.id}", recipe: recipe }
                 }
             }
+            if add_menu() {
+                div { class: "menu-backdrop", onclick: move |_| add_menu.set(false) }
+                div { class: "fab-menu fab-menu-add",
+                    button {
+                        id: "fab-menu-manual",
+                        onclick: move |_| {
+                            add_menu.set(false);
+                            navigator.push(Route::AddRecipe {});
+                        },
+                        IconPlus {}
+                        span { "Add manually" }
+                    }
+                    button {
+                        id: "fab-menu-import-url",
+                        onclick: move |_| {
+                            add_menu.set(false);
+                            navigator.push(Route::ImportRecipe {});
+                        },
+                        IconGlobe {}
+                        span { "Import from URL" }
+                    }
+                    button {
+                        class: "disabled",
+                        title: "Coming soon",
+                        IconImage {}
+                        span { "Import from image — soon" }
+                    }
+                }
+            }
+            if sort_menu() {
+                div { class: "menu-backdrop", onclick: move |_| sort_menu.set(false) }
+                div { class: "fab-menu fab-menu-sort",
+                    for (mode, value, label, selected) in sort_options.clone().into_iter() {
+                        button {
+                            id: "sort-{value}",
+                            class: if selected { "selected" } else { "" },
+                            onclick: move |_| {
+                                sort_menu.set(false);
+                                if mode == SortMode::Random {
+                                    random_seed.set(now_millis());
+                                }
+                                persist_sort(mode);
+                            },
+                            span { class: "menu-check", if selected { "✓" } else { "" } }
+                            span { "{label}" }
+                        }
+                    }
+                }
+            }
             div { class: "fab-stack",
-                button { class: "fab small", title: "Search", IconSearch {} }
                 button {
-                    id: "fab-import-recipe",
+                    id: "fab-search",
                     class: "fab small",
-                    title: "Import from URL",
+                    title: "Search",
+                    onclick: move |_| search_open.set(true),
+                    IconSearch {}
+                }
+                button {
+                    id: "fab-sort",
+                    class: "fab small",
+                    title: "Sort recipes",
                     onclick: move |_| {
-                        tracing::info!("import FAB clicked, opening the import form");
-                        navigator.push(Route::ImportRecipe {});
+                        add_menu.set(false);
+                        sort_menu.set(!sort_menu());
                     },
-                    IconGlobe {}
+                    IconSort {}
                 }
                 button {
                     id: "fab-add-recipe",
                     class: "fab",
                     title: "Add recipe",
                     onclick: move |_| {
-                        tracing::info!("+ FAB clicked, opening the add-recipe form");
-                        navigator.push(Route::AddRecipe {});
+                        sort_menu.set(false);
+                        add_menu.set(!add_menu());
                     },
                     IconPlus {}
                 }
@@ -2087,6 +2393,7 @@ fn RecipeDetail(id: i64) -> Element {
     let mut confirm_delete = use_signal(|| false);
     let mut scale_text = use_signal(|| String::from("1"));
     let mut cart_sheet = use_signal(|| false);
+    let mut day_chooser = use_signal(|| false);
     let mut added_note = use_signal(|| String::new());
     let navigator = use_navigator();
 
@@ -2205,9 +2512,32 @@ fn RecipeDetail(id: i64) -> Element {
                     IconBack {}
                 }
                 div { class: "hdr-spacer" }
-                button { class: "hdr-btn ph", title: "Timer", IconTimer {} }
-                button { class: "hdr-btn ph", title: "Share", IconShare {} }
-                button { class: "hdr-btn ph", title: "Add to meal plan", IconCalendar {} }
+                button {
+                    id: "hdr-share",
+                    class: "hdr-btn",
+                    title: "Share link",
+                    onclick: move |_| {
+                        let url = format!("{}/recipe/{id}", api_base());
+                        spawn(async move {
+                            if copy_clipboard(url.clone()).await {
+                                added_note.set("Link copied to clipboard".into());
+                            } else {
+                                added_note.set(url);
+                            }
+                        });
+                    },
+                    IconShare {}
+                }
+                button {
+                    id: "hdr-mealplan",
+                    class: "hdr-btn",
+                    title: "Add to meal plan",
+                    onclick: move |_| {
+                        added_note.set(String::new());
+                        day_chooser.set(true);
+                    },
+                    IconCalendar {}
+                }
                 button {
                     id: "hdr-cart",
                     class: if has_ingredients { "hdr-btn" } else { "hdr-btn ph" },
@@ -2424,6 +2754,84 @@ fn RecipeDetail(id: i64) -> Element {
                         });
                     },
                     on_cancel: move |_| cart_sheet.set(false),
+                }
+            }
+
+            if day_chooser() {
+                DayChooser {
+                    on_pick: move |(date, label): (String, String)| {
+                        day_chooser.set(false);
+                        let recipe_id = id;
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/meal-plan", api_base());
+                            let payload = serde_json::json!({
+                                "date": date,
+                                "recipe_id": recipe_id,
+                            });
+                            match client.post(&url).json(&payload).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    added_note.set(format!("Added to {label}"));
+                                }
+                                Ok(r) => {
+                                    tracing::error!("meal-plan add failed: {}", r.status());
+                                    error.set(format!("Could not add to meal plan: {}", r.status()));
+                                }
+                                Err(err) => {
+                                    tracing::error!("meal-plan add request failed: {err:#}");
+                                    error.set(format!("Could not add to meal plan: {err}"));
+                                }
+                            }
+                        });
+                    },
+                    on_cancel: move |_| day_chooser.set(false),
+                }
+            }
+        }
+    }
+}
+
+/// Bottom sheet listing the next two weeks; picking a day schedules the
+/// recipe for it.
+#[component]
+fn DayChooser(
+    on_pick: EventHandler<(String, String)>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    let today = today_iso();
+    let days: Vec<(String, String)> = (0..14)
+        .map(|offset| {
+            let date = shift_iso(&today, offset);
+            let label = day_label(&date, &today);
+            (date, label)
+        })
+        .collect();
+
+    rsx! {
+        div { class: "sheet-backdrop",
+            onclick: move |_| on_cancel.call(()),
+            div { class: "sheet", role: "dialog",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
+                h2 { class: "sheet-title", "Add to meal plan" }
+                p { class: "sheet-subtitle", "Pick a day" }
+                div { class: "sheet-list day-list",
+                    for (date, label) in days {
+                        button {
+                            class: "day-btn",
+                            onclick: move |_| {
+                                on_pick.call((date.clone(), label.clone()));
+                            },
+                            span { class: "day-label", "{label}" }
+                        }
+                    }
+                }
+                div { class: "sheet-actions",
+                    button {
+                        id: "day-cancel",
+                        class: "dialog-btn",
+                        onclick: move |_| on_cancel.call(()),
+                        "Cancel"
+                    }
                 }
             }
         }

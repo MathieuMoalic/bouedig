@@ -92,8 +92,14 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         .await
         .context("recipes grid did not render")?;
 
-    // -- 2. The + FAB opens the structured add form. ------------------------
+    // -- 2. The + FAB opens a menu; "Add manually" opens the add form. ------
     driver.find(By::Id("fab-add-recipe")).await?.click().await?;
+    driver
+        .find(By::Id("fab-menu-manual"))
+        .await
+        .context("+ menu did not open")?
+        .click()
+        .await?;
     wait_for_url_path(driver, "/add").await?;
     let name_input = driver
         .find(By::Id("recipe-name"))
@@ -378,6 +384,7 @@ async fn photo_upload_reaches_detail_and_database() -> anyhow::Result<()> {
     let result = (|| async {
         driver.goto(format!("{base}/")).await?;
         driver.find(By::Id("fab-add-recipe")).await?.click().await?;
+        driver.find(By::Id("fab-menu-manual")).await?.click().await?;
         driver
             .find(By::Id("recipe-name"))
             .await?
@@ -1111,6 +1118,160 @@ async fn grocery_edit_provenance_and_bought_flow() -> anyhow::Result<()> {
     result
 }
 
+/// Recipes tab: live fuzzy search filters the grid, the sort menu orders it
+/// (A–Z, then Random twice with fresh orders and a persisted choice), and
+/// the detail header actions work — the meal-plan day chooser schedules the
+/// recipe and Share surfaces the link.
+#[tokio::test(flavor = "multi_thread")]
+async fn recipes_search_sort_and_detail_actions_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    for (name, ingredient) in [
+        ("Alpha Pancakes", "soy milk"),
+        ("Beta Curry", "rice"),
+        ("Gamma Soup", "soup greens"),
+        ("Delta Loaf", "flour"),
+        ("Epsilon Stew", "lentils"),
+    ] {
+        let payload = format!(
+            r#"{{"name":"{name}","sections":[],"ingredients":[{{"quantity":1.0,"unit":"g","name":"{ingredient}","prep":null,"section":null}}],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}}"#
+        );
+        let status = http
+            .post(format!("{base}/api/recipes"))
+            .body(payload)
+            .header("content-type", "application/json")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, 201);
+    }
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/")).await?;
+        wait_for_url_path(&driver, "/").await?;
+        driver.find(By::Id("recipe-grid")).await?;
+
+        let card_names = || async {
+            let names = driver
+                .find_all(By::Css(".recipe-card-name"))
+                .await?;
+            let mut texts = Vec::new();
+            for name in &names {
+                texts.push(name.text().await?);
+            }
+            Ok::<Vec<String>, anyhow::Error>(texts)
+        };
+
+        // -- Search: a typo'd query fuzzy-matches "Soup". --------------------
+        driver.find(By::Id("fab-search")).await?.click().await?;
+        let input = driver.find(By::Id("recipe-search")).await
+            .context("search bar did not open")?;
+        input.send_keys("soop").await?;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let texts = card_names().await?;
+        anyhow::ensure!(
+            texts == ["Gamma Soup"],
+            "fuzzy search should leave only Gamma Soup: {texts:?}"
+        );
+
+        // Closing search restores the full grid.
+        driver.find(By::Id("search-close")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        anyhow::ensure!(card_names().await?.len() == 5, "closing search must restore the grid");
+
+        // -- Sort: A–Z, then Random twice (fresh order, persisted). ----------
+        driver.find(By::Id("fab-sort")).await?.click().await?;
+        driver
+            .find(By::Id("sort-name_asc"))
+            .await
+            .context("sort menu did not open")?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        anyhow::ensure!(
+            card_names().await?.first().context("empty grid")? == "Alpha Pancakes",
+            "A–Z sort must put Alpha Pancakes first"
+        );
+
+        driver.find(By::Id("fab-sort")).await?.click().await?;
+        driver.find(By::Id("sort-random")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let first_random = card_names().await?;
+        driver.find(By::Id("fab-sort")).await?.click().await?;
+        driver.find(By::Id("sort-random")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let second_random = card_names().await?;
+        anyhow::ensure!(
+            first_random != second_random,
+            "two Random presses must reshuffle: {first_random:?} vs {second_random:?}"
+        );
+        let sort_setting: serde_json::Value = http
+            .get(format!("{base}/api/settings/recipes_sort"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            sort_setting["value"] == "random",
+            "sort choice must persist: {sort_setting:?}"
+        );
+
+        // -- Detail: day chooser adds the recipe to tomorrow. ----------------
+        driver
+            .find(By::XPath(
+                "//div[contains(@class, 'recipe-card-name') and contains(., 'Alpha Pancakes')]",
+            ))
+            .await?
+            .click()
+            .await?;
+        wait_for_url_path_prefix(&driver, "/recipe/").await?;
+        driver.find(By::Id("hdr-mealplan")).await?.click().await?;
+        let day_buttons = driver
+            .find_all(By::Css(".sheet .day-btn"))
+            .await
+            .context("day chooser did not open")?;
+        anyhow::ensure!(day_buttons.len() == 14, "expected 14 day buttons");
+        day_buttons[1].click().await?; // Tomorrow
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let entries: Vec<serde_json::Value> = http
+            .get(format!("{base}/api/meal-plan"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            entries.len() == 1
+                && entries[0]["date"] == tomorrow
+                && entries[0]["recipe"]["name"] == "Alpha Pancakes",
+            "meal-plan entry for tomorrow missing: {entries:?}"
+        );
+
+        // -- Share: surfaces the link note. ----------------------------------
+        driver.find(By::Id("hdr-share")).await?.click().await?;
+        let note = driver
+            .find(By::Css(".added-note"))
+            .await
+            .context("share note missing")?
+            .text()
+            .await?;
+        anyhow::ensure!(
+            note.contains("copied") || note.contains("http"),
+            "share note wrong: '{note}'"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 /// Poll until no element matches `selector` (e.g. a dialog has closed).
 async fn wait_for_gone(driver: &WebDriver, selector: &str) -> anyhow::Result<()> {
     for _ in 0..50 {
@@ -1329,7 +1490,13 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
     let driver = open_headless_firefox().await?;
     let result = (|| async {
         driver.goto(format!("{base}/")).await?;
-        driver.find(By::Id("fab-import-recipe")).await?.click().await?;
+        driver.find(By::Id("fab-add-recipe")).await?.click().await?;
+        driver
+            .find(By::Id("fab-menu-import-url"))
+            .await
+            .context("+ menu did not open")?
+            .click()
+            .await?;
         wait_for_url_path(&driver, "/import").await?;
         driver
             .find(By::Id("import-url"))
@@ -1771,11 +1938,21 @@ async fn assert_detail_view(
     let h1 = driver.find(By::Css(".detail-name")).await?;
     let shown = h1.text().await?;
     anyhow::ensure!(shown == name, "detail shows '{shown}', expected '{name}'");
-    // Header bar: real actions + placeholders.
+    // Header bar: all actions wired, no placeholders left.
     driver.find(By::Id("hdr-back")).await?;
+    driver.find(By::Id("hdr-share")).await?;
+    driver.find(By::Id("hdr-mealplan")).await?;
+    driver.find(By::Id("hdr-cart")).await?;
     driver.find(By::Id("hdr-edit")).await?;
     driver.find(By::Id("hdr-delete")).await?;
-    driver.find(By::Css(".detail-header .hdr-btn.ph")).await?;
+    let placeholders = driver
+        .find_all(By::Css(".detail-header .hdr-btn.ph"))
+        .await?;
+    anyhow::ensure!(
+        placeholders.is_empty(),
+        "detail header still has {} placeholder buttons",
+        placeholders.len()
+    );
     // Grouped ingredient list with bullet items.
     let list = driver
         .find(By::Id("ingredient-list"))
