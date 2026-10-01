@@ -43,6 +43,8 @@
     users.users.bouedig.homeMode = "0750";
     services.bouedig = {
       enable = true;
+      # NOTE: no corsOrigin (unlike blaz) — the backend serves the web client
+      # itself, same-origin behind Caddy, and has no CORS support at all.
       package = inputs.bouedig.packages.${pkgs.stdenv.hostPlatform.system}.prebuilt;
       bindAddr = "127.0.0.1:${toString port}";
 
