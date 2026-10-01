@@ -25,7 +25,7 @@
 
     s = config.sops.secrets;
     passwordFile = s."bouedig/password".path;
-    llmApiKeyFile = s."bouedig/llm-api-key".path;
+    openrouterKeyFile = s."bouedig/llm-api-key".path;
   in {
     sops.secrets = {
       "bouedig/password" = {
@@ -50,7 +50,7 @@
 
       inherit
         passwordFile
-        llmApiKeyFile
+        openrouterKeyFile
         ;
     };
 
