@@ -15,3 +15,4 @@ result
 # local release artifacts (scripts/release.py)
 release/
 __pycache__/
+.direnv/

@@ -25,7 +25,16 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
 
       pkgsFor = system:
-        import nixpkgs { inherit system; overlays = [ (import rust-overlay) ]; };
+        import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+          # Mirror blaz: the Android SDK components are unfree and need the
+          # licenses accepted for `androidenv.composeAndroidPackages` to work.
+          config = {
+            allowUnfree = true;
+            android_sdk.accept_license = true;
+          };
+        };
 
       # The web bundle needs a big filter anyway, and cargo wants the whole
       # workspace (root Cargo.toml/lock + every member) to resolve.
@@ -393,6 +402,20 @@
     // flake-utils.lib.eachSystem systems (system:
       let
         pkgs = pkgsFor system;
+
+        # Same provisioning as blaz: the SDK (incl. NDK + build-tools) comes
+        # from nixpkgs' androidenv so APK builds work with no local setup.
+        androidSdk = (pkgs.androidenv.composeAndroidPackages {
+          platformVersions = [ "36" "35" "34" ];
+          buildToolsVersions = [ "36.0.0" "35.0.0" "34.0.0" ];
+          ndkVersions = [ "27.0.12077973" ];
+          includeNDK = true;
+          cmakeVersions = [ "3.22.1" ];
+          includeCmake = true;
+          includeEmulator = false;
+        }).androidsdk;
+        sdkRoot = "${androidSdk}/libexec/android-sdk";
+        ndkRoot = "${sdkRoot}/ndk/27.0.12077973";
       in
       {
         devShells.default = pkgs.mkShell {
@@ -421,10 +444,18 @@
             pkgs.binaryen # wasm-opt, required by `dx build --release`
             pkgs.python3 # scripts/release.py
             pkgs.gh # GitHub release publishing (`just release`)
+            androidSdk # Android SDK + NDK for `dx build --platform android`
+            pkgs.jdk17 # gradle, driven by the Android build
           ];
 
           # Let geckodriver locate the Nix firefox and write to its profile dir.
-          env = { };
+          env = {
+            ANDROID_SDK_ROOT = sdkRoot;
+            ANDROID_HOME = sdkRoot;
+            ANDROID_NDK_HOME = ndkRoot;
+            ANDROID_NDK_ROOT = ndkRoot;
+            JAVA_HOME = "${pkgs.jdk17}/lib/openjdk";
+          };
 
           shellHook = ''
             export MOZ_HEADLESS=1
