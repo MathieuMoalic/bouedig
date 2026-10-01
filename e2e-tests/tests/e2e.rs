@@ -1221,6 +1221,27 @@ async fn recipes_search_sort_and_detail_actions_flow() -> anyhow::Result<()> {
         );
 
         // -- Detail: day chooser adds the recipe to tomorrow. ----------------
+        // Another recipe is already planned for today: the chooser must show
+        // it (blaz-style thumbnails), and picking tomorrow schedules Alpha.
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let recipes: Vec<serde_json::Value> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let gamma = recipes
+            .iter()
+            .find(|r| r["name"] == "Gamma Soup")
+            .context("Gamma Soup missing")?;
+        let status = http
+            .post(format!("{base}/api/meal-plan"))
+            .json(&serde_json::json!({ "date": today, "recipe_id": gamma["id"] }))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, 201);
+
         driver
             .find(By::XPath(
                 "//div[contains(@class, 'recipe-card-name') and contains(., 'Alpha Pancakes')]",
@@ -1230,11 +1251,23 @@ async fn recipes_search_sort_and_detail_actions_flow() -> anyhow::Result<()> {
             .await?;
         wait_for_url_path_prefix(&driver, "/recipe/").await?;
         driver.find(By::Id("hdr-mealplan")).await?.click().await?;
-        let day_buttons = driver
-            .find_all(By::Css(".sheet .day-btn"))
-            .await
+        let sheet = driver.find(By::Css(".sheet")).await
             .context("day chooser did not open")?;
+        let sheet_text = sheet.text().await?;
+        anyhow::ensure!(
+            sheet_text.contains("Assign \u{201c}Alpha Pancakes\u{201d} to"),
+            "chooser must name the recipe: {sheet_text}"
+        );
+        let day_buttons = driver.find_all(By::Css(".sheet .day-btn")).await?;
         anyhow::ensure!(day_buttons.len() == 14, "expected 14 day buttons");
+        anyhow::ensure!(
+            day_buttons[0].text().await?.contains("Gamma Soup"),
+            "today's row must show the planned recipe"
+        );
+        anyhow::ensure!(
+            day_buttons[1].text().await?.contains("Nothing planned"),
+            "tomorrow's row should start empty"
+        );
         day_buttons[1].click().await?; // Tomorrow
         tokio::time::sleep(Duration::from_millis(800)).await;
         let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1))
@@ -1247,9 +1280,14 @@ async fn recipes_search_sort_and_detail_actions_flow() -> anyhow::Result<()> {
             .json()
             .await?;
         anyhow::ensure!(
-            entries.len() == 1
-                && entries[0]["date"] == tomorrow
-                && entries[0]["recipe"]["name"] == "Alpha Pancakes",
+            entries.len() == 2,
+            "expected the alpha entry alongside today's: {entries:?}"
+        );
+        anyhow::ensure!(
+            entries
+                .iter()
+                .any(|e| e["date"] == tomorrow
+                    && e["recipe"]["name"] == "Alpha Pancakes"),
             "meal-plan entry for tomorrow missing: {entries:?}"
         );
 

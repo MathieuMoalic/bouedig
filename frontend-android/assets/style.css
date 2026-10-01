@@ -963,29 +963,114 @@ ol.instruction-list li {
     border-color: var(--accent-bright);
 }
 
-/* Day chooser sheet. */
+/* Day chooser sheet: blaz-style rows with planned thumbnails. */
 .day-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    max-height: 50vh;
+    gap: 4px;
+    max-height: 52vh;
     padding-right: 2px;
 }
 
 .day-btn {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     text-align: left;
     padding: 10px 12px;
-    background: var(--pill);
-    border: 1px solid transparent;
-    border-radius: 10px;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--divider);
     color: var(--text);
     font: inherit;
     font-size: 14px;
     cursor: pointer;
 }
 
+.day-btn:last-child {
+    border-bottom: none;
+}
+
 .day-btn:hover {
-    border-color: var(--accent-bright);
+    background: var(--pill);
+}
+
+.day-main {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+}
+
+.day-label {
+    font-weight: 700;
+}
+
+.day-none {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.day-thumbs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.day-thumb {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    width: 56px;
+}
+
+.day-thumb img {
+    width: 56px;
+    height: 56px;
+    object-fit: cover;
+    border-radius: 8px;
+}
+
+.day-thumb-placeholder {
+    width: 56px;
+    height: 56px;
+    border-radius: 8px;
+    background: var(--pill);
+    display: grid;
+    place-content: center;
+    font-weight: 700;
+    color: var(--muted);
+}
+
+.day-thumb-name {
+    font-size: 10px;
+    color: var(--text);
+    line-height: 1.2;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+
+.day-chevron {
+    color: var(--muted);
+    font-size: 20px;
+    line-height: 1;
+}
+
+.day-actions {
+    justify-content: stretch;
+}
+
+.day-actions .day-cancel {
+    flex: 1;
+    justify-content: center;
+    border-radius: 999px;
 }
 
 /* ------------------------------------------------------------------ */

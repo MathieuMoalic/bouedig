@@ -515,6 +515,8 @@ fn Recipes() -> Element {
     let mut search_text = use_signal(|| String::new());
     let mut search_results = use_signal(|| None::<Vec<Recipe>>);
     let mut search_generation = use_signal(|| 0u64);
+    let mut card_chooser = use_signal(|| None::<Recipe>);
+    let mut grid_note = use_signal(|| String::new());
 
     use_effect(move || {
         if !loaded() {
@@ -622,6 +624,12 @@ fn Recipes() -> Element {
 
     rsx! {
         div { class: "page",
+            if !grid_note.read().is_empty() {
+                p { class: "added-note", "{grid_note}" }
+            }
+            if !error.read().is_empty() {
+                p { class: "status-error", "{error}" }
+            }
             if search_open() {
                 div { class: "search-bar",
                     input {
@@ -652,7 +660,46 @@ fn Recipes() -> Element {
             }
             div { id: "recipe-grid", class: "recipe-grid",
                 for recipe in list {
-                    RecipeCard { key: "{recipe.id}", recipe: recipe }
+                    RecipeCard {
+                        key: "{recipe.id}",
+                        recipe: recipe,
+                        on_mealplan: move |recipe: Recipe| {
+                            card_chooser.set(Some(recipe));
+                        },
+                    }
+                }
+            }
+
+            if let Some(recipe) = card_chooser.read().clone() {
+                DayChooser {
+                    key: "card-chooser-{recipe.id}",
+                    recipe_name: recipe.name.clone(),
+                    on_pick: move |(date, label): (String, String)| {
+                        card_chooser.set(None);
+                        let recipe_id = recipe.id;
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/meal-plan", api_base());
+                            let payload = serde_json::json!({
+                                "date": date,
+                                "recipe_id": recipe_id,
+                            });
+                            match client.post(&url).json(&payload).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    grid_note.set(format!("Added to {label}"));
+                                }
+                                Ok(r) => {
+                                    tracing::error!("meal-plan add failed: {}", r.status());
+                                    error.set(format!("Could not add to meal plan: {}", r.status()));
+                                }
+                                Err(err) => {
+                                    tracing::error!("meal-plan add request failed: {err:#}");
+                                    error.set(format!("Could not add to meal plan: {err}"));
+                                }
+                            }
+                        });
+                    },
+                    on_cancel: move |_| card_chooser.set(None),
                 }
             }
             if add_menu() {
@@ -738,7 +785,7 @@ fn Recipes() -> Element {
 }
 
 #[component]
-fn RecipeCard(recipe: Recipe) -> Element {
+fn RecipeCard(recipe: Recipe, on_mealplan: EventHandler<Recipe>) -> Element {
     let navigator = use_navigator();
     let initials: String = recipe
         .name
@@ -764,7 +811,15 @@ fn RecipeCard(recipe: Recipe) -> Element {
                 } else {
                     div { class: "recipe-placeholder", "{initials}" }
                 }
-                button { class: "card-fab", title: "Add to meal plan", onclick: move |e: MouseEvent| e.stop_propagation(), IconCalendar {} }
+                button {
+                    class: "card-fab",
+                    title: "Add to meal plan",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        on_mealplan.call(recipe.clone());
+                    },
+                    IconCalendar {}
+                }
             }
             div { class: "recipe-card-name", "{recipe.name}" }
         }
@@ -2577,6 +2632,10 @@ fn RecipeDetail(id: i64) -> Element {
 
             if day_chooser() {
                 DayChooser {
+                    recipe_name: loaded
+                        .as_ref()
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default(),
                     on_pick: move |(date, label): (String, String)| {
                         day_chooser.set(false);
                         let recipe_id = id;
@@ -2609,19 +2668,40 @@ fn RecipeDetail(id: i64) -> Element {
     }
 }
 
-/// Bottom sheet listing the next two weeks; picking a day schedules the
-/// recipe for it.
+/// Bottom sheet listing the next two weeks, blaz style: every day shows the
+/// recipes already planned on it (thumbnails), or "Nothing planned". Picking
+/// a day schedules the recipe for it.
 #[component]
 fn DayChooser(
+    recipe_name: String,
     on_pick: EventHandler<(String, String)>,
     on_cancel: EventHandler<()>,
 ) -> Element {
+    let mut entries = use_signal(Vec::<MealPlanEntry>::new);
+    let mut loaded = use_signal(|| false);
+    use_effect(move || {
+        if !loaded() {
+            loaded.set(true);
+            spawn(async move {
+                if let Ok(list) = api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                    entries.set(list);
+                }
+            });
+        }
+    });
+
     let today = today_local_iso();
-    let days: Vec<(String, String)> = (0..14)
+    let entries_snapshot = entries.read().clone();
+    let days: Vec<(String, String, Vec<MealPlanEntry>)> = (0..14)
         .map(|offset| {
             let date = shift_local_iso(&today, offset);
             let label = day_label(&date, &today);
-            (date, label)
+            let planned: Vec<MealPlanEntry> = entries_snapshot
+                .iter()
+                .filter(|e| e.date == date)
+                .cloned()
+                .collect();
+            (date, label, planned)
         })
         .collect();
 
@@ -2630,23 +2710,43 @@ fn DayChooser(
             onclick: move |_| on_cancel.call(()),
             div { class: "sheet", role: "dialog",
                 onclick: move |e: MouseEvent| e.stop_propagation(),
-                h2 { class: "sheet-title", "Add to meal plan" }
-                p { class: "sheet-subtitle", "Pick a day" }
+                h2 { class: "sheet-title", "Assign \u{201c}{recipe_name}\u{201d} to…" }
                 div { class: "sheet-list day-list",
-                    for (date, label) in days {
+                    for (date, label, planned) in days {
                         button {
                             class: "day-btn",
                             onclick: move |_| {
                                 on_pick.call((date.clone(), label.clone()));
                             },
-                            span { class: "day-label", "{label}" }
+                            div { class: "day-main",
+                                span { class: "day-label", "{label}" }
+                                if planned.is_empty() {
+                                    span { class: "day-none", "Nothing planned" }
+                                } else {
+                                    div { class: "day-thumbs",
+                                        for entry in planned.iter() {
+                                            div { class: "day-thumb",
+                                                if let Some(thumb) = entry.recipe.thumb.as_ref().map(|t| absolutize(t)) {
+                                                    img { src: "{thumb}", alt: "{entry.recipe.name}" }
+                                                } else {
+                                                    div { class: "day-thumb-placeholder",
+                                                        {entry.recipe.name.chars().next().unwrap_or('?').to_string()}
+                                                    }
+                                                }
+                                                span { class: "day-thumb-name", "{entry.recipe.name}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            span { class: "day-chevron", "›" }
                         }
                     }
                 }
-                div { class: "sheet-actions",
+                div { class: "sheet-actions day-actions",
                     button {
                         id: "day-cancel",
-                        class: "dialog-btn",
+                        class: "dialog-btn day-cancel",
                         onclick: move |_| on_cancel.call(()),
                         "Cancel"
                     }
