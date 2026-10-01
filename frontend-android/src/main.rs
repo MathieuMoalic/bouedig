@@ -2602,8 +2602,9 @@ fn GroceryRow(
     }
 }
 
-/// Bottom sheet for editing one grocery item: name and group are editable,
-/// the provenance recipe ("Lentil Loaf in 4 days") is read-only.
+/// Bottom sheet for editing one grocery item: name and group are editable
+/// (group is a real dropdown over the preset + existing categories), the
+/// provenance recipe ("Lentil Loaf in 4 days") is read-only.
 #[component]
 fn GroceryEditSheet(
     item: GroceryItem,
@@ -2615,6 +2616,12 @@ fn GroceryEditSheet(
     let mut name = use_signal(|| item.name.clone());
     let mut group = use_signal(|| item.category.clone());
     let name_value = name.read().trim().to_string();
+    // The item's own group is always selectable, even if it somehow fell
+    // out of the merged option list.
+    let mut options = groups;
+    if !options.iter().any(|g| g == &item.category) {
+        options.insert(0, item.category.clone());
+    }
 
     rsx! {
         div { class: "sheet-backdrop",
@@ -2637,16 +2644,15 @@ fn GroceryEditSheet(
                     }
                     label { class: "sheet-field",
                         span { "Group" }
-                        input {
+                        select {
                             id: "sheet-item-group",
-                            r#type: "text",
-                            value: "{group}",
-                            list: "edit-group-options",
-                            oninput: move |e: FormEvent| group.set(e.value()),
-                        }
-                        datalist { id: "edit-group-options",
-                            for group_name in groups {
-                                option { value: "{group_name}" }
+                            onchange: move |e: FormEvent| group.set(e.value()),
+                            for group_name in options {
+                                option {
+                                    value: "{group_name}",
+                                    selected: if group_name == item.category { "true" } else { "false" },
+                                    "{group_name}"
+                                }
                             }
                         }
                     }

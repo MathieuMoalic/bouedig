@@ -813,7 +813,8 @@ ol.instruction-list li {
     font-weight: 600;
 }
 
-.sheet-field input {
+.sheet-field input,
+.sheet-field select {
     font: inherit;
     font-size: 14px;
     color: var(--text);
@@ -823,9 +824,15 @@ ol.instruction-list li {
     padding: 10px 12px;
 }
 
-.sheet-field input:focus {
+.sheet-field input:focus,
+.sheet-field select:focus {
     outline: none;
     border-color: var(--accent-bright);
+}
+
+.sheet-field select option {
+    background: var(--surface-solid);
+    color: var(--text);
 }
 
 /* Confirmation shown under the detail header after a successful add. */

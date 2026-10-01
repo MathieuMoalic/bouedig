@@ -1034,13 +1034,41 @@ async fn grocery_edit_provenance_and_bought_flow() -> anyhow::Result<()> {
             "provenance line wrong: '{source}'"
         );
 
-        // Rename and move to a named group.
+        // Rename and move to a named group. The group control must be a
+        // real <select> dropdown (it used to be a datalist text field that
+        // never opened) offering the preset categories.
         let name_input = driver.find(By::Id("sheet-item-name")).await?;
         name_input.clear().await?;
         name_input.send_keys("Red lentils").await?;
-        let group_input = driver.find(By::Id("sheet-item-group")).await?;
-        group_input.clear().await?;
-        group_input.send_keys("Pantry").await?;
+        let group_select = driver.find(By::Id("sheet-item-group")).await?;
+        anyhow::ensure!(
+            group_select.tag_name().await?.eq_ignore_ascii_case("select"),
+            "group control must render as a dropdown, got {:?}",
+            group_select.tag_name().await?
+        );
+        let options = driver
+            .find_all(By::Css("#sheet-item-group option"))
+            .await?;
+        anyhow::ensure!(
+            options.len() >= 15,
+            "expected the preset categories in the dropdown, got {} options",
+            options.len()
+        );
+        let values: Vec<String> = {
+            let mut values = Vec::new();
+            for option in &options {
+                values.push(option.attr("value").await?.unwrap_or_default());
+            }
+            values
+        };
+        for preset in ["Other", "Fruits", "Pantry", "Online Alcohol"] {
+            anyhow::ensure!(
+                values.iter().any(|v| v == preset),
+                "preset '{preset}' missing from the group dropdown: {values:?}"
+            );
+        }
+        let select = thirtyfour::components::SelectElement::new(&group_select).await?;
+        select.select_by_value("Pantry").await?;
         driver.find(By::Id("sheet-item-save")).await?.click().await?;
         wait_for_gone(&driver, ".sheet").await?;
 
