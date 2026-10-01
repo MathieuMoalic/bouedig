@@ -2145,15 +2145,11 @@ fn RecipeDetail(id: i64) -> Element {
         .as_ref()
         .is_some_and(|d| !d.ingredients.is_empty());
 
-    // Shopping-list sheet lines: base quantities (scale ignored on purpose).
+    // Shopping-list sheet lines: base quantities without prep text (scale
+    // ignored on purpose) — the sheet shows exactly what will be added.
     let cart_lines: Vec<String> = loaded
         .as_ref()
-        .map(|d| {
-            d.ingredients
-                .iter()
-                .map(|ingredient| ingredient_line(ingredient, 1.0))
-                .collect()
-        })
+        .map(|d| d.ingredients.iter().map(grocery_line).collect())
         .unwrap_or_default();
 
     // Detail view instruction grouping: unsectioned steps first, then one
@@ -2451,6 +2447,22 @@ fn ingredient_line(ingredient: &Ingredient, scale: f64) -> String {
         line.push_str(", ");
         line.push_str(prep);
     }
+    line
+}
+
+/// Shopping-list line for an ingredient: quantity + unit + name only —
+/// the prep detail is recipe-cooking information, not shopping information.
+fn grocery_line(ingredient: &Ingredient) -> String {
+    let mut line = String::new();
+    if let Some(q) = ingredient.quantity {
+        line.push_str(&fmt_qty(q));
+        line.push(' ');
+    }
+    if let Some(unit) = &ingredient.unit {
+        line.push_str(unit);
+        line.push(' ');
+    }
+    line.push_str(&ingredient.name);
     line
 }
 

@@ -822,7 +822,7 @@ async fn recipe_add_to_shopping_list_flow() -> anyhow::Result<()> {
                     quantity: Some(2.0),
                     unit: Some("tbsp".into()),
                     name: "Soy sauce".into(),
-                    prep: None,
+                    prep: Some("thinly sliced".into()),
                     section: None,
                 },
                 Ingredient {
@@ -874,6 +874,11 @@ async fn recipe_add_to_shopping_list_flow() -> anyhow::Result<()> {
         anyhow::ensure!(
             !texts.contains("400 g Flour"),
             "sheet must show base quantities, not scaled: {texts}"
+        );
+        // Prep text is cooking information — it must not reach the list.
+        anyhow::ensure!(
+            !texts.contains("thinly sliced"),
+            "sheet must not include prep text: {texts}"
         );
         for row in &rows {
             let checkbox = row.find(By::Css("input[type=checkbox]")).await?;
