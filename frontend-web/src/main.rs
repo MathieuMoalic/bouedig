@@ -440,14 +440,22 @@ struct SettingValue {
 }
 
 /// Milliseconds since the epoch — random seeds and nothing else.
-#[cfg(target_arch = "wasm32")]
 fn now_millis() -> u64 {
-    js_sys::Date::now() as u64
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// `GET /api/session` → am I authenticated? 401 and network errors both mean
 /// "no" (with auth off the endpoint always says yes).
-#[cfg(target_arch = "wasm32")]
 async fn session_authenticated() -> bool {
     match reqwest::get(format!("{}/api/session", api_base())).await {
         Ok(response) => response.status().is_success(),
@@ -562,15 +570,23 @@ fn seeded_shuffle(list: &mut [Recipe], seed: u64) {
     }
 }
 
-/// Sleep that works on wasm (js timer) and natively (tokio).
-#[cfg(target_arch = "wasm32")]
+/// Sleep that works on wasm (js timer) and natively (thread sleep — the web
+/// client never actually runs natively, this exists so the crate compiles
+/// and its unit tests run on the host).
 async fn sleep_ms(ms: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
-        }
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
+    }
 }
 
 /// Best-effort clipboard write (the async clipboard API); `false` when the
@@ -599,6 +615,13 @@ async fn copy_clipboard(text: String) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Native fallback so the crate compiles on the host (for unit tests); the
+/// web client only ever runs as wasm.
+#[cfg(not(target_arch = "wasm32"))]
+async fn copy_clipboard(_text: String) -> bool {
+    false
 }
 
 #[component]
@@ -3234,7 +3257,10 @@ fn Grocery() -> Element {
 fn GroceryContent() -> Element {
     let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
-    let mut new_category = use_signal(String::new);
+    // Every name ever seen on this list (server: /api/grocery/names) so the
+    // add-row suggestions also cover past recipe additions, which are gone
+    // from the live list once ticked off.
+    let name_history = use_signal(Vec::<String>::new);
     let mut error = use_signal(|| String::new());
     let mut focused = use_signal(|| false);
     let collapsed = use_signal(|| HashSet::<String>::new());
@@ -3248,6 +3274,7 @@ fn GroceryContent() -> Element {
             loaded.set(true);
             spawn(async move {
                 refresh(items, error).await;
+                refresh_names(name_history).await;
             });
         }
     });
@@ -3257,33 +3284,15 @@ fn GroceryContent() -> Element {
     // with the page via the mounted flag (use_drop).
     let mut mounted = use_signal(|| true);
     use_drop(move || mounted.set(false));
-    #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         spawn(async move {
             loop {
-                let promise = js_sys::Promise::new(&mut |resolve, _| {
-                    if let Some(window) = web_sys::window() {
-                        let _ = window
-                            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 5000);
-                    }
-                });
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                sleep_ms(5000).await;
                 if !mounted() {
                     break;
                 }
                 refresh(items, error).await;
-            }
-        });
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    use_effect(move || {
-        spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if !mounted() {
-                    break;
-                }
-                refresh(items, error).await;
+                refresh_names(name_history).await;
             }
         });
     });
@@ -3313,10 +3322,22 @@ fn GroceryContent() -> Element {
     }
 
     // Past entries = unique names of items that have ever been added.
+    // Suggestion pool: the live list first (its casing wins), then the
+    // ever-added history. History names come back lowercased from the
+    // classifier cache, so give cache-only names a display capital.
     let mut past_names: Vec<String> = Vec::new();
     for item in &list {
-        if !past_names.contains(&item.name) {
+        if !past_names.iter().any(|n| n.eq_ignore_ascii_case(&item.name)) {
             past_names.push(item.name.clone());
+        }
+    }
+    for name in name_history.read().iter() {
+        if !past_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            let mut display = name.clone();
+            if let Some(first) = display.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            past_names.push(display);
         }
     }
 
@@ -3363,6 +3384,11 @@ fn GroceryContent() -> Element {
                         oninput: move |e: FormEvent| new_item.set(e.value()),
                         onfocus: move |_| focused.set(true),
                         onblur: move |_| focused.set(false),
+                        onkeydown: move |e: KeyboardEvent| {
+                            if e.key() == Key::Enter {
+                                submit_grocery_item(new_item, items, name_history, error);
+                            }
+                        },
                         autocomplete: "off",
                     }
                     if focused() && !new_item.read().trim().is_empty() && !suggestions.is_empty() {
@@ -3383,59 +3409,9 @@ fn GroceryContent() -> Element {
                         }
                     }
                 }
-                input {
-                    id: "grocery-category",
-                    r#type: "text",
-                    value: "{new_category}",
-                    placeholder: "Group…",
-                    list: "category-options",
-                    oninput: move |e: FormEvent| new_category.set(e.value()),
-                }
-                datalist { id: "category-options",
-                    for option in category_options.clone() {
-                        option { value: "{option}" }
-                    }
-                }
                 button {
                     id: "grocery-add",
-                    onclick: move |_| {
-                        let item = NewGroceryItem {
-                            name: new_item.read().clone(),
-                            category: {
-                                let c = new_category.read().trim().to_string();
-                                (!c.is_empty()).then_some(c)
-                            },
-                        };
-                        if item.name.trim().is_empty() {
-                            return;
-                        }
-                        new_item.set(String::new());
-                        spawn(async move {
-                            let client = reqwest::Client::new();
-                            let url = format!("{}/api/grocery", api_base());
-                            tracing::info!("Grocery Add button: POST {url} (name={:?}, category={:?})", item.name, item.category);
-                            match client.post(url).json(&item).send().await {
-                                Ok(r) if r.status().is_success() => match r.json::<GroceryItem>().await {
-                                    // Append the created item to the local
-                                    // state instead of re-fetching: the list
-                                    // keeps whatever the user just removed.
-                                    Ok(created) => items.with_mut(|v| v.push(created)),
-                                    Err(err) => {
-                                        tracing::error!("POST /api/grocery returned an unreadable body: {err:#}");
-                                        refresh(items, error).await;
-                                    }
-                                },
-                                Ok(r) => {
-                                    tracing::error!("POST /api/grocery failed: {}", r.status());
-                                    error.set("Failed to add item.".into());
-                                }
-                                Err(err) => {
-                                    tracing::error!("POST /api/grocery request failed: {err:#}");
-                                    error.set("Failed to add item.".into());
-                                }
-                            }
-                        });
-                    },
+                    onclick: move |_| submit_grocery_item(new_item, items, name_history, error),
                     "Add"
                 }
             }
@@ -3737,6 +3713,60 @@ async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>)
             error.set(err.to_string());
         }
     }
+}
+
+/// Re-fetch the ever-added name history for the add-row suggestions
+/// (live items plus everything the classifier has ever seen).
+async fn refresh_names(mut history: Signal<Vec<String>>) {
+    match api_get::<Vec<String>>("/api/grocery/names").await {
+        Ok(names) => history.set(names),
+        Err(err) => tracing::error!("grocery name history refresh failed: {err:#}"),
+    }
+}
+
+/// Add a manually typed item (Add button + Enter key). All signals are Copy,
+/// so both handlers can call this freely. The category is always None: JEV
+/// classifies new items, and manual category changes happen in the edit
+/// sheet, which pins them.
+fn submit_grocery_item(
+    mut new_item: Signal<String>,
+    mut items: Signal<Vec<GroceryItem>>,
+    name_history: Signal<Vec<String>>,
+    mut error: Signal<String>,
+) {
+    let name = new_item.read().trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    new_item.set(String::new());
+    spawn(async move {
+        let item = NewGroceryItem { name, category: None };
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/grocery", api_base());
+        tracing::info!("Grocery add: POST {url} (name={:?})", item.name);
+        match client.post(url).json(&item).send().await {
+            Ok(r) if r.status().is_success() => match r.json::<GroceryItem>().await {
+                // Append the created item to the local state instead of
+                // re-fetching: the list keeps whatever the user just removed.
+                Ok(created) => {
+                    items.with_mut(|v| v.push(created));
+                    refresh_names(name_history).await;
+                }
+                Err(err) => {
+                    tracing::error!("POST /api/grocery returned an unreadable body: {err:#}");
+                    refresh(items, error).await;
+                }
+            },
+            Ok(r) => {
+                tracing::error!("POST /api/grocery failed: {}", r.status());
+                error.set("Failed to add item.".into());
+            }
+            Err(err) => {
+                tracing::error!("POST /api/grocery request failed: {err:#}");
+                error.set("Failed to add item.".into());
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -169,6 +169,7 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
             "/grocery",
             get(list_grocery).post(add_grocery_item),
         )
+        .route("/grocery/names", get(grocery_names))
         .route("/grocery/batch", post(add_grocery_batch))
         .route(
             "/grocery/{id}",
@@ -1308,6 +1309,24 @@ async fn list_grocery(
     Ok(Json(rows.iter().map(row_to_joined_item).collect()))
 }
 
+/// Every name ever seen on this list for the manual add-row suggestions:
+/// items currently on it plus everything the classifier has ever classified
+/// or the user pinned (i.e. past recipe additions, which are deleted from
+/// `grocery_items` once ticked off).
+async fn grocery_names(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM \
+         (SELECT DISTINCT name FROM grocery_items \
+          UNION SELECT name FROM ingredient_categories) \
+         WHERE name != '' ORDER BY name COLLATE NOCASE",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(names))
+}
+
 /// Resolve the category for a newly added item: an explicitly typed group
 /// always wins; otherwise the cached classification applies instantly; only
 /// a cache miss lands in "Other" and is queued for background classification.
@@ -1724,6 +1743,23 @@ pub(crate) mod tests {
         build_router(AppState::from_config(pool, &config), &config)
     }
 
+    /// Like [`test_router_with_config`] but returns the pool so tests can
+    /// seed rows directly (the router's pool is in-memory and private).
+    pub(crate) async fn test_router_with_pool(base_path: Option<&str>) -> (Router, SqlitePool) {
+        let config = test_config(base_path, None);
+        ensure_data_dirs(&config.data_dir).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        (
+            build_router(AppState::from_config(pool.clone(), &config), &config),
+            pool,
+        )
+    }
+
     pub(crate) async fn test_router_with_config(base_path: Option<&str>) -> (Router, Config) {
         let config = test_config(base_path, None);
         ensure_data_dirs(&config.data_dir).unwrap();
@@ -1931,6 +1967,52 @@ pub(crate) mod tests {
         // Item should no longer be in the list
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         assert_eq!(body.trim(), "[]", "grocery list must be empty after toggle: {body}");
+    }
+
+    #[tokio::test]
+    async fn grocery_names_suggests_current_and_historical_items() {
+        let (app, pool) = test_router_with_pool(None).await;
+
+        // One item added with an explicit category (skips the classifier
+        // cache entirely) and one left to JEV.
+        let (status, _) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery",
+            Some(r#"{"name":"Bananas","category":"Fruits"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Seitan"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // A bought item is deleted from the list...
+        let (status, body) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Milk"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, _) = json_response(
+            app.clone(),
+            "PATCH",
+            &format!("/api/grocery/{}", id["id"].as_i64().unwrap()),
+            Some(r#"{"bought":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // ...but its cached classification from an earlier add survives and
+        // must still show up as a suggestion.
+        sqlx::query("INSERT INTO ingredient_categories (name, category) VALUES ('milk', 'Vegan') ON CONFLICT (name) DO NOTHING")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (_, body) = json_response(app, "GET", "/api/grocery/names", None).await;
+        let names: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            names,
+            vec!["Bananas".to_string(), "milk".to_string(), "Seitan".to_string()],
+            "union of live items and classification history, case-insensitive order"
+        );
     }
 
     #[tokio::test]

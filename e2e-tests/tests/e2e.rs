@@ -293,23 +293,64 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         "recipe ingredients must not be auto-added; source:\n{src}"
     );
 
-    // Manual add still works and creates a group.
-    driver
-        .find(By::Id("grocery-input"))
-        .await?
-        .send_keys("Bananas")
-        .await?;
-    driver
-        .find(By::Id("grocery-category"))
-        .await?
-        .send_keys("Fresh")
-        .await?;
-    driver.find(By::Id("grocery-add")).await?.click().await?;
+    // Manual add: Enter submits; the add row has no group field anymore.
+    let input = driver.find(By::Id("grocery-input")).await?;
+    input.send_keys("Bananas").await?;
+    input.send_keys("\u{E007}").await?;
     driver
         .find(By::XPath("//li[contains(., 'Bananas')]"))
         .await
         .context("manually added item did not appear in the UI")?;
     poll_grocery(&http, base, "Bananas", None).await?;
+
+    // Suggestions: typing a prefix of an on-list item offers it in the
+    // dropdown; picking it fills the input and Enter adds a second line.
+    let input = driver.find(By::Id("grocery-input")).await?;
+    input.send_keys("Bana").await?;
+    let mut suggestion = None;
+    for _ in 0..25 {
+        if let Ok(el) = driver.find(By::Css(".suggestions .suggestion")).await {
+            suggestion = Some(el);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let suggestion =
+        suggestion.context("no suggestion dropdown for a typed prefix")?;
+    let text = suggestion.text().await?;
+    anyhow::ensure!(
+        text.to_lowercase().contains("banana"),
+        "unexpected suggestion text: {text}"
+    );
+    suggestion.click().await?;
+    let picked = input
+        .prop("value")
+        .await?
+        .context("input lost while picking a suggestion")?;
+    anyhow::ensure!(
+        picked.eq_ignore_ascii_case("Bananas"),
+        "picking a suggestion must fill the input, got {picked:?}"
+    );
+    input.send_keys("\u{E007}").await?;
+    // The pick added a second "Bananas" line (separate lines by design).
+    let mut bananas = 0usize;
+    for _ in 0..50 {
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        bananas = items.iter().filter(|i| i.name == "Bananas").count();
+        if bananas >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::ensure!(
+        bananas >= 2,
+        "picking the suggestion + Enter did not add a second Bananas line"
+    );
 
     // -- 6. Confirm-delete removes the recipe. ------------------------------
     driver
