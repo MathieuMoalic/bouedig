@@ -11,3 +11,7 @@ result
 
 # NixOS VM disk images (nixos-rebuild build-vm)
 *.qcow2
+
+# local release artifacts (scripts/release.py)
+release/
+__pycache__/

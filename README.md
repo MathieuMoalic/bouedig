@@ -30,8 +30,8 @@ The flake provides everything needed to run Bouedig on a server:
 
     nix build .#bouedig          # backend + migrate binaries, web bundle under share/bouedig/web
     nix build .#web              # just the release web bundle
-    nix build .#release-tarball  # tarball published by CI on tag push
-    nix build .#prebuilt         # same tarball fetched from GitHub releases (needs prebuiltHash set)
+    nix build .#release-tarball  # the server tarball layout `just release` publishes
+    nix build .#prebuilt         # same tarball fetched from GitHub releases (hash set by `just release`)
 
 `nixosModules.bouedig` is a `services.bouedig` NixOS module with a hardened
 systemd service (dedicated user, `/var/lib/bouedig` state):
@@ -69,12 +69,17 @@ lives in [deploy/nixconfig-example.nix](deploy/nixconfig-example.nix).
 
 ### Releases
 
-1. Bump `version` in `Cargo.toml` (`[workspace.package]`) and `flake.nix`.
-2. Commit and tag: `git tag v0.1.0 && git push --tags` — CI builds the
-   tarball and attaches it to the GitHub release.
-3. Paste the `nix hash file` value from the CI job summary into
-   `prebuiltHash` in `flake.nix`; `packages.prebuilt` (used by nixconfig)
-   becomes buildable.
+Releases are cut locally (like blaz) — no CI involved:
+
+    nix develop
+    just release patch   # or minor / major
+
+The script bumps the version (`Cargo.toml` `[workspace.package]` +
+`flake.nix`), builds the web bundle, the backend and the Android APK on this
+machine, packs the server tarball, rewrites the flake's `prebuilt` URL and
+hash, commits, tags `vX.Y.Z`, pushes, and publishes the GitHub release with
+`gh`. Afterwards it runs `just update-server`, which sshes to the homeserver
+and bumps the `bouedig` flake input in your nixconfig.
 
 To try the module locally without touching a server:
 

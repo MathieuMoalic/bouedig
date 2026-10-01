@@ -34,9 +34,9 @@
     users.users.mat.extraGroups = ["bouedig"];
     services.bouedig = {
       enable = true;
-      # `prebuilt` avoids compiling the Rust workspace on the server; it
-      # needs `prebuiltHash` in the flake set to the latest release hash
-      # (CI prints it). Use `packages.bouedig` to build from source instead.
+      # `prebuilt` avoids compiling the Rust workspace on the server; its
+      # URL + hash in the flake are updated automatically by `just release`.
+      # Use `packages.bouedig` to build from source instead.
       package = inputs.bouedig.packages.${pkgs.stdenv.hostPlatform.system}.prebuilt;
       bindAddr = "127.0.0.1:${toString port}";
 

@@ -419,6 +419,8 @@
             pkgs.firefox
             pkgs.android-tools
             pkgs.binaryen # wasm-opt, required by `dx build --release`
+            pkgs.python3 # scripts/release.py
+            pkgs.gh # GitHub release publishing (`just release`)
           ];
 
           # Let geckodriver locate the Nix firefox and write to its profile dir.

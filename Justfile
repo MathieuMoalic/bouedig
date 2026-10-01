@@ -42,6 +42,15 @@ check:
     cargo check -p shared -p backend -p e2e-tests
     cargo check -p frontend-web --target wasm32-unknown-unknown
 
+# Build release artifacts, update flake.nix hash, commit, and tag
+release TYPE:
+    python3 scripts/release.py release "{{TYPE}}"
+    just update-server
+
+# Update the deployed backend on the homeserver
+update-server:
+    ssh homeserver "cd /home/mat/nix; nix flake update bouedig; up"
+
 # Run the live-URL recipe-import regression suite (network required).
 # The URL set lives in backend/tests/live_import.rs (LIVE_URLS).
 test-import-live:
