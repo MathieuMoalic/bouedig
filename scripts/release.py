@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -19,6 +20,8 @@ from pathlib import Path
 APP = "bouedig"
 TARGET = "x86_64-linux"
 REPO = "MathieuMoalic/bouedig"
+ANDROID_TARGET = "aarch64-linux-android"
+PROD_API_BASE = "https://bouedig.matmoa.eu"
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "frontend-web"
@@ -178,7 +181,22 @@ def build_apk(version: str) -> Path:
     tag = f"v{version}"
     artifact = RELEASE_DIR / f"{APP}-{tag}.apk"
 
-    run("dx", "build", "--platform", "android", "--release", cwd=ANDROID)
+    # arm64-only (every modern phone; x86 emulators stay on dev builds) with
+    # the production server baked in — the app has no runtime URL setting.
+    # A previous dx build for another ABI leaves its .so staged under
+    # jniLibs and gradle packages everything it finds, so wipe those first
+    # or the APK ships stale libs for the wrong architecture.
+    app_dir = ROOT / "target" / "dx" / "frontend-android" / "release" / "android" / "app"
+    for jni in app_dir.glob("app/src/main/jniLibs"):
+        shutil.rmtree(jni)
+    env = dict(os.environ, BOUEDIG_API_BASE=PROD_API_BASE)
+    print(f"+ BOUEDIG_API_BASE={PROD_API_BASE} dx build --platform android "
+          f"--release --target {ANDROID_TARGET}", flush=True)
+    subprocess.run(
+        ["dx", "build", "--platform", "android", "--release",
+         "--target", ANDROID_TARGET],
+        cwd=ANDROID, env=env, check=True,
+    )
 
     dx_out = ROOT / "target" / "dx" / "frontend-android"
     candidates = [

@@ -10,9 +10,13 @@ use shared::{
 };
 
 // A phone or emulator has no same-origin, so the backend address is absolute.
-// 10.0.2.2 is the Android emulator alias for the host machine's loopback;
-// change it to your LAN address (or reverse proxy URL) for real devices.
-const API_BASE: &str = "http://10.0.2.2:3000";
+// Dev builds default to 10.0.2.2, the Android emulator alias for the host
+// machine's loopback. Release APKs get the production URL baked in at build
+// time: the release script sets BOUEDIG_API_BASE for the dx build.
+const API_BASE: &str = match option_env!("BOUEDIG_API_BASE") {
+    Some(url) => url,
+    None => "http://10.0.2.2:3000",
+};
 
 const WALLPAPER: Asset = asset!("/assets/background.avif");
 const FAVICON: Asset = asset!("/assets/icon.png");
