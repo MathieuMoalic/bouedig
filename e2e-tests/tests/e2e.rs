@@ -2578,3 +2578,127 @@ fn tiny_png() -> Vec<u8> {
     }
     b64_decode(B64)
 }
+
+/// Dragging a planned card from one day onto another moves the entry
+/// (DELETE + re-add under the hood), does NOT navigate to the recipe, and
+/// the tap-without-drag still opens the recipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    // Seed a recipe and plan it for today+2.
+    let (status, body) = json_post(
+        &http,
+        &base,
+        "/api/recipes",
+        r#"{"name":"Draggable Stew","sections":[],"ingredients":[],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}"#,
+    )
+    .await?;
+    anyhow::ensure!(status == 201, "recipe seed failed: {body}");
+    let recipe_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+        .as_i64()
+        .unwrap();
+    let date_a = (chrono::Local::now().date_naive() + chrono::Duration::days(2))
+        .format("%Y-%m-%d")
+        .to_string();
+    let date_b = (chrono::Local::now().date_naive() + chrono::Duration::days(3))
+        .format("%Y-%m-%d")
+        .to_string();
+    let status = http
+        .post(format!("{base}/api/meal-plan"))
+        .json(&serde_json::json!({ "date": date_a, "recipe_id": recipe_id }))
+        .send()
+        .await?
+        .status();
+    anyhow::ensure!(status.as_u16() == 201, "meal-plan seed failed: {status}");
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/meal-plan")).await?;
+        wait_for_url_path(&driver, "/meal-plan").await?;
+
+        // Synthesize the pointer sequence on the card (bubbles up to the
+        // .plan-days container). Coordinates drive the day hit-test, so the
+        // pointermove/up carry the target day's center.
+        let script = format!(
+            r#"
+            const card = document.querySelector('#plan-day-{date_a} .plan-card');
+            if (!card) throw new Error('source card not found');
+            const cardRect = card.getBoundingClientRect();
+            const target = document.querySelector('#plan-day-{date_b}');
+            if (!target) throw new Error('target day not found');
+            const tr = target.getBoundingClientRect();
+            const opts = {{ bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, pointerType: 'mouse' }};
+            // Dispatch on the card: the container's listeners receive the
+            // events by bubbling (document-dispatched events would not).
+            card.dispatchEvent(new PointerEvent('pointerdown', {{...opts,
+                clientX: cardRect.left + 20, clientY: cardRect.top + 10}}));
+            card.dispatchEvent(new PointerEvent('pointermove', {{...opts,
+                clientX: cardRect.left + 20, clientY: cardRect.top + 10}}));
+            card.dispatchEvent(new PointerEvent('pointermove', {{...opts,
+                clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2}}));
+            card.dispatchEvent(new PointerEvent('pointerup', {{...opts,
+                clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2}}));
+            "#
+        );
+        // The wasm app needs a moment to render the day sections.
+        let mut executed = None;
+        for _ in 0..25 {
+            match driver
+                .execute(&script, Vec::<serde_json::Value>::new())
+                .await
+            {
+                Ok(_) => {
+                    executed = Some(());
+                    break;
+                }
+                Err(err) if err.to_string().contains("not found") => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        executed.context("drag pointer sequence failed (sections never rendered)")?;
+
+        // The entry moved to date_b and left date_a.
+        let mut moved = false;
+        for _ in 0..50 {
+            let entries: Vec<serde_json::Value> = http
+                .get(format!("{base}/api/meal-plan"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            let in_b = entries
+                .iter()
+                .any(|e| e["date"] == serde_json::json!(date_b) && e["recipe"]["id"] == serde_json::json!(recipe_id));
+            let in_a = entries
+                .iter()
+                .any(|e| e["date"] == serde_json::json!(date_a) && e["recipe"]["id"] == serde_json::json!(recipe_id));
+            if in_b && !in_a {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(moved, "drag did not move the entry to {date_b}");
+
+        // A completed drag must not open the recipe page.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let url = driver.current_url().await?;
+        anyhow::ensure!(
+            !url.path().starts_with("/recipe/"),
+            "drag trailing click navigated to {}",
+            url.path()
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}

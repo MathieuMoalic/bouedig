@@ -3681,6 +3681,19 @@ fn MealPlan() -> Element {
     }
 }
 
+/// Day-to-day drag of a planned recipe card on the meal plan. `armed` flips
+/// on once the pointer passes a small threshold, so a plain tap still opens
+/// the recipe.
+#[derive(Clone)]
+struct PlanDrag {
+    entry_id: i64,
+    origin_date: String,
+    recipe_id: i64,
+    recipe_name: String,
+    start_y: f64,
+    armed: bool,
+}
+
 #[component]
 fn MealPlanContent() -> Element {
     let mut entries = use_signal(Vec::<MealPlanEntry>::new);
@@ -3690,6 +3703,11 @@ fn MealPlanContent() -> Element {
     let mut picker = use_signal(|| None::<PickerState>);
     let navigator = use_navigator();
     let today = use_signal(today_local_iso);
+    // In-progress day-to-day card drag + the date currently under the
+    // pointer; `suppress_open` swallows the click that follows a real drag.
+    let mut plan_drag = use_signal(|| None::<PlanDrag>);
+    let mut drag_target = use_signal(|| None::<String>);
+    let mut suppress_open = use_signal(|| false);
 
     use_effect(move || {
         if !loaded() {
@@ -3738,6 +3756,12 @@ fn MealPlanContent() -> Element {
         .collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
 
+    // Bind the drag snapshots before rsx: one read per repaint.
+    let drag_snapshot = plan_drag.read().clone();
+    let drag_target_snapshot = drag_target.read().clone();
+    // Dates only, for the drag hit-test: `days` itself moves into the rsx.
+    let day_dates: Vec<String> = days.iter().map(|d| d.date.clone()).collect();
+
     // Infinite scroll: approaching either end of the rendered range extends
     // it. The scroll flags come from the shared content scroller (Layout)
     // and re-arm as soon as the grown list pushes the end out of reach.
@@ -3762,10 +3786,89 @@ fn MealPlanContent() -> Element {
             // The keyed day list lives in its own container: mixing a keyed
             // list with static siblings panics dioxus's differ when the
             // range grows.
-            div { class: "plan-days", key: "{back_value}-{forward_value}",
+            div {
+                class: "plan-days",
+                key: "{back_value}-{forward_value}",
+                onpointermove: move |ev: PointerEvent| {
+                    let Some(d) = plan_drag.read().clone() else { return };
+                    if !d.armed {
+                        if (ev.client_coordinates().y - d.start_y).abs() < 8.0 {
+                            return;
+                        }
+                        plan_drag.with_mut(|s| if let Some(s) = s { s.armed = true; });
+                    }
+                    // Which rendered day section is under the pointer?
+                    let y = ev.client_coordinates().y;
+                    let mut target: Option<String> = None;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if let Some(window) = web_sys::window() {
+                            if let Some(document) = window.document() {
+                                for date in day_dates.iter() {
+                                    let el = document
+                                        .get_element_by_id(&format!("plan-day-{date}"));
+                                    if let Some(el) = el {
+                                        let rect = el.get_bounding_client_rect();
+                                        if y >= rect.top() && y <= rect.bottom() {
+                                            target = Some(date.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = y;
+                    drag_target.set(target);
+                },
+                onpointerup: move |_ev: PointerEvent| {
+                    let Some(d) = plan_drag.read().clone() else { return };
+                    let target = drag_target.read().clone();
+                    plan_drag.set(None);
+                    drag_target.set(None);
+                    if !d.armed {
+                        // Plain tap: let the card's onclick open the recipe.
+                        return;
+                    }
+                    suppress_open.set(true);
+                    if let Some(date) = target {
+                        if date != d.origin_date {
+                            move_planned_entry(
+                                d.entry_id,
+                                d.recipe_id,
+                                date,
+                                entries,
+                                error,
+                            );
+                        }
+                    }
+                },
+                onpointerleave: move |_ev: PointerEvent| {
+                    plan_drag.set(None);
+                    drag_target.set(None);
+                },
                 for day in days {
                     PlanDaySection {
                         day: day.clone(),
+                        drag_entry: drag_snapshot.as_ref().filter(|d| d.armed).map(|d| d.entry_id),
+                        is_drag_target: drag_target_snapshot.as_deref() == Some(day.date.as_str()),
+                        on_card_down: move |(entry_id, origin_date, recipe_id, recipe_name, y): (
+                            i64,
+                            String,
+                            i64,
+                            String,
+                            f64,
+                        )| {
+                            suppress_open.set(false);
+                            plan_drag.set(Some(PlanDrag {
+                                entry_id,
+                                origin_date,
+                                recipe_id,
+                                recipe_name,
+                                start_y: y,
+                                armed: false,
+                            }));
+                        },
                         on_remove: move |entry_id: i64| {
                             spawn(async move {
                                 let client = http();
@@ -3789,6 +3892,11 @@ fn MealPlanContent() -> Element {
                             }));
                         },
                         on_open: move |recipe_id: i64| {
+                            if suppress_open.read().clone() {
+                                // The click that trails a completed drag.
+                                suppress_open.set(false);
+                                return;
+                            }
                             navigator.push(Route::RecipeDetail { id: recipe_id });
                         },
                     }
@@ -3926,31 +4034,132 @@ struct PlanDay {
     entries: Vec<MealPlanEntry>,
 }
 
+/// Move a planned entry to another day: optimistically re-date it locally,
+/// then DELETE + POST (the move endpoint is a delete and a re-add). Any
+/// failure refreshes from the server and surfaces the error.
+fn move_planned_entry(
+    entry_id: i64,
+    recipe_id: i64,
+    new_date: String,
+    mut entries: Signal<Vec<MealPlanEntry>>,
+    mut error: Signal<String>,
+) {
+    entries.with_mut(|v| {
+        if let Some(e) = v.iter_mut().find(|e| e.id == entry_id) {
+            e.date = new_date.clone();
+        }
+    });
+    spawn(async move {
+        let base = api_base();
+        let deleted = http()
+            .delete(format!("{base}/api/meal-plan/{entry_id}"))
+            .send()
+            .await;
+        match deleted {
+            Ok(r) if r.status().is_success() => {
+                match http()
+                    .post(format!("{base}/api/meal-plan"))
+                    .json(&serde_json::json!({ "date": new_date, "recipe_id": recipe_id }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        // Reconcile ids: swap the optimistically re-dated
+                        // entry for the server's fresh one.
+                        match resp.json::<MealPlanEntry>().await {
+                            Ok(created) => entries.with_mut(|v| {
+                                v.retain(|e| e.id != entry_id);
+                                v.push(created);
+                            }),
+                            Err(err) => {
+                                tracing::error!("meal plan move: unreadable body: {err:#}")
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        tracing::error!("meal plan move re-add failed: {}", resp.status());
+                        error.set("Failed to move the recipe.".into());
+                        if let Ok(list) = api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                            entries.set(list);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("meal plan move request failed: {err:#}");
+                        error.set("Failed to move the recipe.".into());
+                        if let Ok(list) = api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                            entries.set(list);
+                        }
+                    }
+                }
+            }
+            Ok(r) => {
+                tracing::error!("meal plan move delete failed: {}", r.status());
+                error.set("Failed to move the recipe.".into());
+                if let Ok(list) = api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                    entries.set(list);
+                }
+            }
+            Err(err) => {
+                tracing::error!("meal plan move request failed: {err:#}");
+                error.set("Failed to move the recipe.".into());
+                if let Ok(list) = api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                    entries.set(list);
+                }
+            }
+        }
+    });
+}
+
 #[component]
 fn PlanDaySection(
     day: PlanDay,
+    drag_entry: Option<i64>,
+    is_drag_target: bool,
+    on_card_down: EventHandler<(i64, String, i64, String, f64)>,
     on_remove: EventHandler<i64>,
     on_add: EventHandler<String>,
     on_open: EventHandler<i64>,
 ) -> Element {
     let day_is_empty = day.entries.is_empty();
+    let day_date = day.date.clone();
+    let day_id = format!("plan-day-{day_date}");
+    let day_class = if is_drag_target {
+        "plan-day drag-target"
+    } else {
+        "plan-day"
+    };
     rsx! {
-            div { class: "plan-day",
+            div { class: "{day_class}", id: "{day_id}",
             div { class: "plan-day-head",
                 span { class: "plan-day-label", "{day.label}" }
                 button {
                     class: "plan-add",
                     r#type: "button",
                     title: "Add recipe",
-                    onclick: move |_| on_add.call(day.date.clone()),
+                    onclick: move |_| on_add.call(day_date.clone()),
                     IconPlus {}
                 }
             }
             div { class: "plan-cards",
                 for entry in day.entries {
-                    div { class: "plan-card",
+                    div {
+                        class: if drag_entry == Some(entry.id) {
+                            "plan-card dragging"
+                        } else {
+                            "plan-card"
+                        },
                         key: "{entry.id}",
                         onclick: move |_| on_open.call(entry.recipe.id),
+                        onpointerdown: move |ev: PointerEvent| {
+                            ev.stop_propagation();
+                            on_card_down.call((
+                                entry.id,
+                                entry.date.clone(),
+                                entry.recipe.id,
+                                entry.recipe.name.clone(),
+                                ev.client_coordinates().y,
+                            ));
+                        },
                         button {
                             class: "plan-remove",
                             r#type: "button",

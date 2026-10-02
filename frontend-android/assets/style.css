@@ -1665,3 +1665,14 @@ ol.instruction-list li {
     font-size: 13px;
     cursor: pointer;
 }
+
+/* Dragging a planned card between days. */
+.plan-card.dragging {
+    opacity: 0.45;
+}
+
+.plan-day.drag-target {
+    outline: 2px dashed var(--accent-bright);
+    outline-offset: 3px;
+    border-radius: 12px;
+}
