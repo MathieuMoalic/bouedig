@@ -3187,7 +3187,10 @@ fn GroceryContent() -> Element {
                         onblur: move |_| focused.set(false),
                         onkeydown: move |e: KeyboardEvent| {
                             if e.key() == Key::Enter {
-                                submit_grocery_item(new_item, items, name_history, error);
+                                // Bind first: the read guard must be dropped
+                                // before submit calls `new_item.set()`.
+                                let name = new_item.read().clone();
+                                submit_grocery_item(name, new_item, items, name_history, error);
                             }
                         },
                         autocomplete: "off",
@@ -3201,8 +3204,15 @@ fn GroceryContent() -> Element {
                                     // mousedown, not click: the input's blur
                                     // (fired on mousedown) unmounts this
                                     // dropdown before a click could land.
+                                    // Tapping a suggestion adds it outright.
                                     onmousedown: move |_| {
-                                        new_item.set(name.clone());
+                                        submit_grocery_item(
+                                            name.clone(),
+                                            new_item,
+                                            items,
+                                            name_history,
+                                            error,
+                                        );
                                     },
                                     span { class: "suggestion-text", "{name}" }
                                 }
@@ -3212,7 +3222,10 @@ fn GroceryContent() -> Element {
                 }
                 button {
                     id: "grocery-add",
-                    onclick: move |_| submit_grocery_item(new_item, items, name_history, error),
+                    onclick: move |_| {
+                        let name = new_item.read().clone();
+                        submit_grocery_item(name, new_item, items, name_history, error)
+                    },
                     "Add"
                 }
             }
@@ -3518,17 +3531,19 @@ async fn refresh_names(mut history: Signal<Vec<String>>) {
     }
 }
 
-/// Add a manually typed item (Add button + Enter key). All signals are Copy,
-/// so both handlers can call this freely. The category is always None: JEV
-/// classifies new items, and manual category changes happen in the edit
-/// sheet, which pins them.
+/// Add a manually typed item (Add button, Enter key, or a tapped
+/// suggestion). All signals are Copy, so every handler can call this
+/// freely; `new_item` is cleared so the input is ready for the next item.
+/// The category is always None: JEV classifies new items, and manual
+/// category changes happen in the edit sheet, which pins them.
 fn submit_grocery_item(
+    name: String,
     mut new_item: Signal<String>,
     mut items: Signal<Vec<GroceryItem>>,
     name_history: Signal<Vec<String>>,
     mut error: Signal<String>,
 ) {
-    let name = new_item.read().trim().to_string();
+    let name = name.trim().to_string();
     if name.is_empty() {
         return;
     }

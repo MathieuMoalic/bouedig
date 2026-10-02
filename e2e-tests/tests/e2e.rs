@@ -304,7 +304,8 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
     poll_grocery(&http, base, "Bananas", None).await?;
 
     // Suggestions: typing a prefix of an on-list item offers it in the
-    // dropdown; picking it fills the input and Enter adds a second line.
+    // dropdown, and TAPPING the suggestion adds it directly — no Add click,
+    // no Enter — and clears the input.
     let input = driver.find(By::Id("grocery-input")).await?;
     input.send_keys("Bana").await?;
     let mut suggestion = None;
@@ -323,16 +324,8 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         "unexpected suggestion text: {text}"
     );
     suggestion.click().await?;
-    let picked = input
-        .prop("value")
-        .await?
-        .context("input lost while picking a suggestion")?;
-    anyhow::ensure!(
-        picked.eq_ignore_ascii_case("Bananas"),
-        "picking a suggestion must fill the input, got {picked:?}"
-    );
-    input.send_keys("\u{E007}").await?;
-    // The pick added a second "Bananas" line (separate lines by design).
+    // The pick added a second "Bananas" line (separate lines by design) and
+    // emptied the input for the next item.
     let mut bananas = 0usize;
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
@@ -349,7 +342,12 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
     }
     anyhow::ensure!(
         bananas >= 2,
-        "picking the suggestion + Enter did not add a second Bananas line"
+        "tapping the suggestion did not add the item directly"
+    );
+    let cleared = input.prop("value").await?.unwrap_or_default();
+    anyhow::ensure!(
+        cleared.is_empty(),
+        "input must clear after a suggestion tap, got {cleared:?}"
     );
 
     // -- 6. Confirm-delete removes the recipe. ------------------------------
@@ -1535,6 +1533,8 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
         };
         suggestion.click().await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // Tapping the suggestion adds it directly (a second "apple" row)
+        // and clears the input for the next item.
         let value = driver
             .find(By::Id("grocery-input"))
             .await?
@@ -1542,12 +1542,9 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             .await?
             .unwrap_or_default();
         anyhow::ensure!(
-            value == "apple",
-            "suggestion click should fill 'apple', got '{value}'"
+            value.is_empty(),
+            "suggestion tap must add directly and clear the input, got '{value}'"
         );
-        // Accepting the suggestion and adding creates a second "apple" row
-        // (and clears the input again).
-        driver.find(By::Id("grocery-add")).await?.click().await?;
         poll_grocery_count(&http, &base, "apple", 2).await?;
 
         // A second, different item in the same group. The input is empty
