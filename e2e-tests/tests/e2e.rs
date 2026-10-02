@@ -1480,6 +1480,176 @@ async fn wait_for_gone(driver: &WebDriver, selector: &str) -> anyhow::Result<()>
 /// button removes an item, and a removed item never comes back when another
 /// one is added afterwards.
 #[tokio::test(flavor = "multi_thread")]
+/// Ticking an item off shows an undo bar; Undo re-adds it through the batch
+/// endpoint so the category and the recipe provenance come back, and the
+/// bar disappears once its expiry passes.
+async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    // Seed a recipe, then a grocery item with provenance + a fixed category
+    // (explicit categories skip JEV, so undo must restore exactly it).
+    let (status, body) = json_post(
+        &http,
+        &base,
+        "/api/recipes",
+        r#"{"name":"Undo Loaf","sections":[],"ingredients":[],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}"#,
+    )
+    .await?;
+    anyhow::ensure!(status == 201, "recipe seed failed: {body}");
+    let recipe_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+        .as_i64()
+        .unwrap();
+    let seeded = http
+        .post(format!("{base}/api/grocery/batch"))
+        .json(&serde_json::json!({
+            "items": [{"name": "Oat Milk", "category": "Pantry"}],
+            "recipe_id": recipe_id,
+        }))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        seeded.status().as_u16() == 201,
+        "grocery seed failed: {}",
+        seeded.status()
+    );
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+
+        let item_id = poll_first_grocery_id(&http, &base).await?;
+        let row = driver.find(By::Id(format!("grocery-item-{item_id}"))).await?;
+        row.find(By::Css("input[type=checkbox]")).await?.click().await?;
+
+        // The undo bar appears; clicking Undo restores the item with its
+        // category AND its recipe provenance.
+        let mut bar = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Css(".undo-bar .undo-text")).await {
+                bar = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        bar.context("undo bar did not appear after ticking an item")?;
+        driver.find(By::Id("undo-restore")).await?.click().await?;
+        let mut restored = None;
+        for _ in 0..50 {
+            let items: Vec<GroceryItem> = http
+                .get(format!("{base}/api/grocery"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if let Some(item) = items.iter().find(|i| i.name == "Oat Milk") {
+                restored = Some(item.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let restored = restored.context("undo did not restore the item")?;
+        anyhow::ensure!(
+            restored.category == "Pantry",
+            "undo must restore the category, got {:?}",
+            restored.category
+        );
+        let provenance = restored
+            .recipe
+            .as_ref()
+            .map(|r| r.id)
+            .context("undo must restore the recipe provenance")?;
+        anyhow::ensure!(
+            provenance == recipe_id,
+            "provenance points at recipe {provenance}, expected {recipe_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let bars = driver.find_all(By::Css(".undo-bar")).await?;
+        anyhow::ensure!(
+            bars.is_empty(),
+            "undo bar must disappear after restoring"
+        );
+
+        // Expiry: a removal with no undo click fades the bar away.
+        let input = driver.find(By::Id("grocery-input")).await?;
+        input.send_keys("Bread").await?;
+        input.send_keys("\u{E007}").await?;
+        poll_grocery(&http, &base, "Bread", None).await?;
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let bread_id = items
+            .iter()
+            .find(|i| i.name == "Bread")
+            .map(|i| i.id)
+            .context("Bread vanished before its checkbox click")?;
+        let row = driver.find(By::Id(format!("grocery-item-{bread_id}"))).await?;
+        row.find(By::Css("input[type=checkbox]")).await?.click().await?;
+        let mut bar = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Css(".undo-bar")).await {
+                bar = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        bar.context("undo bar missing for the second removal")?;
+        tokio::time::sleep(Duration::from_millis(6800)).await;
+        let bars = driver.find_all(By::Css(".undo-bar")).await?;
+        anyhow::ensure!(
+            bars.is_empty(),
+            "undo bar must expire after ~6s without a click"
+        );
+        poll_grocery_gone(&http, &base, "Bread").await?;
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+async fn poll_first_grocery_id(http: &reqwest::Client, base: &str) -> anyhow::Result<i64> {
+    for _ in 0..50 {
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(item) = items.first() {
+            return Ok(item.id);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("no grocery item appeared")
+}
+
+async fn json_post(
+    http: &reqwest::Client,
+    base: &str,
+    path: &str,
+    body: &str,
+) -> anyhow::Result<(u16, String)> {
+    let response = http
+        .post(format!("{base}{path}"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let text = response.text().await?;
+    Ok((status, text))
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
     let base = format!("http://{addr}");

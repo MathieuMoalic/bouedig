@@ -3268,6 +3268,10 @@ fn GroceryContent() -> Element {
     let mut plan_loaded = use_signal(|| false);
     let mut plan_entries = use_signal(Vec::<MealPlanEntry>::new);
     let mut edit_item = use_signal(|| None::<GroceryItem>);
+    // The last item ticked off, kept around briefly so a mis-tick can be
+    // undone; `undo_gen` invalidates the timer when a newer removal lands.
+    let undo_item = use_signal(|| None::<GroceryItem>);
+    let mut undo_gen = use_signal(|| 0u64);
 
     use_effect(move || {
         if !loaded() {
@@ -3372,6 +3376,9 @@ fn GroceryContent() -> Element {
         })
         .unwrap_or_default();
 
+    // Bind before rsx: the render reads the undo slot once per repaint.
+    let undo_snapshot = undo_item.read().clone();
+
     rsx! {
         div { class: "page",
             div { class: "add-row",
@@ -3428,6 +3435,19 @@ fn GroceryContent() -> Element {
                     "Add"
                 }
             }
+            if let Some(removed) = undo_snapshot {
+                div { class: "undo-bar",
+                    span { class: "undo-text", "Removed \"{removed.name}\"" }
+                    button {
+                        id: "undo-restore",
+                        r#type: "button",
+                        onclick: move |_| {
+                            restore_removed_item(removed.clone(), items, undo_item, error);
+                        },
+                        "Undo"
+                    }
+                }
+            }
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
@@ -3444,6 +3464,9 @@ fn GroceryContent() -> Element {
                             items_sig: items,
                             error: error,
                             on_edit: move |item: GroceryItem| edit_item.set(Some(item)),
+                            on_bought: move |item: GroceryItem| {
+                                record_removed_item(item, undo_item, undo_gen, mounted);
+                            },
                         }
                     }
                 }
@@ -3529,6 +3552,7 @@ fn GroupSection(
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
     on_edit: EventHandler<GroceryItem>,
+    on_bought: EventHandler<GroceryItem>,
 ) -> Element {
     let is_collapsed = collapsed.read().contains(&name);
     let key = name.clone();
@@ -3560,6 +3584,7 @@ fn GroupSection(
                             items_sig: items_sig,
                             error: error,
                             on_edit: on_edit.clone(),
+                            on_bought: on_bought.clone(),
                         }
                     }
                 }
@@ -3574,8 +3599,10 @@ fn GroceryRow(
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
     on_edit: EventHandler<GroceryItem>,
+    on_bought: EventHandler<GroceryItem>,
 ) -> Element {
     let item_id = item.id;
+    let item_for_bought = item.clone();
     rsx! {
         li {
             id: "grocery-item-{item.id}",
@@ -3590,6 +3617,7 @@ fn GroceryRow(
                 onclick: move |e: MouseEvent| e.stop_propagation(),
                 onchange: move |_| {
                     let id = item_id;
+                    let bought_item = item_for_bought.clone();
                     spawn(async move {
                         let client = reqwest::Client::new();
                         let url = format!("{}/api/grocery/{id}", api_base());
@@ -3601,6 +3629,7 @@ fn GroceryRow(
                         {
                             Ok(r) if r.status().is_success() => {
                                 items_sig.with_mut(|v| v.retain(|i| i.id != id));
+                                on_bought.call(bought_item);
                             }
                             Ok(r) => {
                                 tracing::error!("PATCH /api/grocery/{id} failed: {}", r.status());
@@ -3735,6 +3764,65 @@ async fn refresh_names(mut history: Signal<Vec<String>>) {
         Ok(names) => history.set(names),
         Err(err) => tracing::error!("grocery name history refresh failed: {err:#}"),
     }
+}
+
+/// Park the just-removed item in the undo slot and start its expiry timer.
+/// A newer removal bumps the generation, invalidating the older timer.
+fn record_removed_item(
+    item: GroceryItem,
+    mut undo_item: Signal<Option<GroceryItem>>,
+    mut undo_gen: Signal<u64>,
+    mounted: Signal<bool>,
+) {
+    undo_item.set(Some(item));
+    undo_gen.with_mut(|g| *g += 1);
+    let gen = undo_gen.read().clone();
+    spawn(async move {
+        sleep_ms(6000).await;
+        if mounted() && undo_gen.read().clone() == gen {
+            undo_item.set(None);
+        }
+    });
+}
+
+/// Undo a ticked-off item: re-add it through the batch endpoint so the
+/// explicit category (which skips JEV) and the recipe provenance come back.
+fn restore_removed_item(
+    item: GroceryItem,
+    mut items_sig: Signal<Vec<GroceryItem>>,
+    mut undo_item: Signal<Option<GroceryItem>>,
+    mut error: Signal<String>,
+) {
+    undo_item.set(None);
+    spawn(async move {
+        let payload = NewGroceryBatch {
+            items: vec![NewGroceryItem {
+                name: item.name.clone(),
+                category: Some(item.category.clone()),
+            }],
+            recipe_id: item.recipe.as_ref().map(|r| r.id),
+        };
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/grocery/batch", api_base());
+        tracing::info!("Grocery undo: POST {url} (name={:?})", payload.items[0].name);
+        match client.post(url).json(&payload).send().await {
+            Ok(r) if r.status().is_success() => match r.json::<Vec<GroceryItem>>().await {
+                Ok(created) => items_sig.with_mut(|v| v.extend(created)),
+                Err(err) => {
+                    tracing::error!("grocery restore returned an unreadable body: {err:#}");
+                    error.set("Failed to restore item.".into());
+                }
+            },
+            Ok(r) => {
+                tracing::error!("grocery restore failed: {}", r.status());
+                error.set("Failed to restore item.".into());
+            }
+            Err(err) => {
+                tracing::error!("grocery restore request failed: {err:#}");
+                error.set("Failed to restore item.".into());
+            }
+        }
+    });
 }
 
 /// Add a manually typed item (Add button, Enter key, or a tapped

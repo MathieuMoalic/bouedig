@@ -1799,3 +1799,35 @@ ol.instruction-list li {
 }
 
 
+
+/* Undo bar for just-ticked-off grocery items. */
+.undo-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 12px;
+    padding: 8px 12px;
+    background: var(--raised);
+    border: 1px solid var(--divider);
+    border-radius: 12px;
+    font-size: 14px;
+}
+
+.undo-bar .undo-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+}
+
+.undo-bar #undo-restore {
+    background: var(--accent);
+    color: var(--text);
+    border: none;
+    border-radius: 10px;
+    padding: 7px 14px;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
