@@ -51,6 +51,7 @@ async fn spawn_test_backend_with_password(password: Option<&str>) -> anyhow::Res
         classifier_model: None,
         classifier_endpoint: None,
         password: password.map(str::to_string),
+        secure_cookies: false,
     };
     let addr = backend::spawn_server(config).await?;
     // Keep the tempdirs alive for the rest of the process.

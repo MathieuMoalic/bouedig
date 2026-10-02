@@ -63,6 +63,10 @@ pub struct Config {
     /// stays public but every other API call needs a session cookie; unset
     /// disables auth entirely (dev/test default).
     pub password: Option<String>,
+    /// Append `; Secure` to session cookies (`BOUEDIG_SECURE_COOKIES=1`).
+    /// On in production behind TLS; off in dev (plain HTTP would drop the
+    /// cookie and break login).
+    pub secure_cookies: bool,
 }
 
 impl Config {
@@ -94,6 +98,9 @@ impl Config {
             classifier_model: std::env::var("BOUEDIG_CLASSIFIER_MODEL").ok(),
             classifier_endpoint: std::env::var("BOUEDIG_CLASSIFIER_ENDPOINT").ok(),
             password: std::env::var("BOUEDIG_PASSWORD").ok().filter(|p| !p.is_empty()),
+            secure_cookies: std::env::var("BOUEDIG_SECURE_COOKIES")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }
@@ -108,6 +115,8 @@ pub struct AppState {
     classifier: Option<classifier::Classifier>,
     /// Household password; `None` disables auth entirely.
     password: Option<String>,
+    /// Append `; Secure` to session cookies (production behind TLS).
+    secure_cookies: bool,
 }
 
 impl AppState {
@@ -122,6 +131,7 @@ impl AppState {
                 config.classifier_endpoint.clone(),
             ),
             password: config.password.clone(),
+            secure_cookies: config.secure_cookies,
         }
     }
 }
@@ -1087,8 +1097,9 @@ async fn login(
         .bind(&token)
         .execute(&state.db)
         .await?;
+    let secure = if state.secure_cookies { "; Secure" } else { "" };
     let cookie = format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax"
+        "{SESSION_COOKIE}={token}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax{secure}"
     );
     Ok((
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -1112,7 +1123,8 @@ async fn logout(
             .execute(&state.db)
             .await;
     }
-    let cookie = format!("{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
+    let secure = if state.secure_cookies { "; Secure" } else { "" };
+    let cookie = format!("{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax{secure}");
     (
         [(axum::http::header::SET_COOKIE, cookie)],
         StatusCode::NO_CONTENT,
@@ -1656,6 +1668,7 @@ pub(crate) mod tests {
             classifier_model: None,
             classifier_endpoint: None,
             password: None,
+            secure_cookies: false,
         }
     }
 
@@ -1681,6 +1694,7 @@ pub(crate) mod tests {
             data_dir: config.data_dir.clone(),
             import_allow_private: true,
             password: None,
+            secure_cookies: false,
             classifier: classifier::Classifier::from_parts(
                 Some("test-key".into()),
                 Some("typesafe-ai/jev".into()),
@@ -2381,6 +2395,63 @@ pub(crate) mod tests {
         (app, pool)
     }
 
+    /// Like [`test_router_with_password`] but session cookies carry the
+    /// `Secure` attribute (production-behind-TLS mode).
+    async fn test_router_with_secure_cookies(password: &str) -> (Router, SqlitePool) {
+        let config = Config {
+            password: Some(password.to_string()),
+            secure_cookies: true,
+            ..test_config(None, None)
+        };
+        ensure_data_dirs(&config.data_dir).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let app = build_router(AppState::from_config(pool.clone(), &config), &config);
+        (app, pool)
+    }
+
+    /// Full `SET_COOKIE` value of a successful login (attributes included).
+    async fn login_set_cookie(app: Router, password: &str) -> String {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"password":"{password}"}}"#)))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Full `SET_COOKIE` value of a logout for `cookie`.
+    async fn logout_set_cookie(app: Router, cookie: String) -> String {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/logout")
+            .header(axum::http::header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
     /// Log in against `app` and return the bare session cookie pair.
     async fn login_cookie(app: Router, password: &str) -> String {
         use axum::body::Body;
@@ -2523,6 +2594,40 @@ pub(crate) mod tests {
             "GET", "/api/grocery", None,
         ).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "logged-out session must be rejected");
+    }
+
+    #[tokio::test]
+    async fn auth_secure_cookies_flag_controls_cookie_attribute() {
+        // Dev default: no Secure attribute (plain HTTP would drop it).
+        let (app, _pool) = test_router_with_password("fondue").await;
+        let cookie = login_set_cookie(app, "fondue").await;
+        assert!(
+            !cookie.contains("Secure"),
+            "dev cookie must not be Secure: {cookie}"
+        );
+
+        // Production mode: Secure appended on login…
+        let (app, pool) = test_router_with_secure_cookies("fondue").await;
+        let cookie = login_set_cookie(app.clone(), "fondue").await;
+        assert!(
+            cookie.contains("; Secure"),
+            "production cookie must be Secure: {cookie}"
+        );
+
+        // …and on the logout expiry cookie.
+        let token: String = sqlx::query_scalar("SELECT token FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cookie = logout_set_cookie(
+            app,
+            format!("{SESSION_COOKIE}={token}"),
+        )
+        .await;
+        assert!(
+            cookie.contains("; Secure"),
+            "logout cookie must be Secure: {cookie}"
+        );
     }
 
     #[tokio::test]

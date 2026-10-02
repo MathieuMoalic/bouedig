@@ -266,6 +266,16 @@
               description = "Path to a file with the password (for sops-nix).";
             };
 
+            secureCookies = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = ''
+                Add the `Secure` attribute to session cookies. Keep this on
+                when the app is served over TLS (Caddy); plain-HTTP deploys
+                must turn it off or login breaks.
+              '';
+            };
+
             openrouterKey = lib.mkOption {
               type = lib.types.nullOr lib.types.str;
               default = null;
@@ -338,6 +348,7 @@
               }
               // lib.optionalAttrs (cfg.basePath != null) { BOUEDIG_BASE_PATH = cfg.basePath; }
               // lib.optionalAttrs (cfg.password != null) { BOUEDIG_PASSWORD = cfg.password; }
+              // lib.optionalAttrs cfg.secureCookies { BOUEDIG_SECURE_COOKIES = "1"; }
               // lib.optionalAttrs (cfg.openrouterKey != null) { BOUEDIG_OPENROUTER_KEY = cfg.openrouterKey; }
               // lib.optionalAttrs (cfg.classifierModel != null) { BOUEDIG_CLASSIFIER_MODEL = cfg.classifierModel; }
               // lib.optionalAttrs (cfg.classifierEndpoint != null) { BOUEDIG_CLASSIFIER_ENDPOINT = cfg.classifierEndpoint; }
