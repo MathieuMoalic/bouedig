@@ -14,7 +14,6 @@
 //! ingredient line, and no undecoded HTML entities. When a site changes or a
 //! new site is added, edit `LIVE_URLS` and run the suite locally.
 
-use backend::recipe_import;
 
 /// The live acceptance set. Paywalled endpoints (e.g. tollbit.bbcgoodfood.com,
 /// HTTP 402) are deliberately excluded — the importer reports them as clean

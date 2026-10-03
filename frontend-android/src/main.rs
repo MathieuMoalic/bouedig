@@ -3077,7 +3077,7 @@ fn GroceryContent() -> Element {
     // The last item ticked off, kept around briefly so a mis-tick can be
     // undone; `undo_gen` invalidates the timer when a newer removal lands.
     let undo_item = use_signal(|| None::<GroceryItem>);
-    let mut undo_gen = use_signal(|| 0u64);
+    let undo_gen = use_signal(|| 0u64);
 
     use_effect(move || {
         if !loaded() {
@@ -3689,7 +3689,6 @@ struct PlanDrag {
     entry_id: i64,
     origin_date: String,
     recipe_id: i64,
-    recipe_name: String,
     start_y: f64,
     armed: bool,
 }
@@ -3799,26 +3798,7 @@ fn MealPlanContent() -> Element {
                     }
                     // Which rendered day section is under the pointer?
                     let y = ev.client_coordinates().y;
-                    let mut target: Option<String> = None;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        if let Some(window) = web_sys::window() {
-                            if let Some(document) = window.document() {
-                                for date in day_dates.iter() {
-                                    let el = document
-                                        .get_element_by_id(&format!("plan-day-{date}"));
-                                    if let Some(el) = el {
-                                        let rect = el.get_bounding_client_rect();
-                                        if y >= rect.top() && y <= rect.bottom() {
-                                            target = Some(date.clone());
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let _ = y;
+                    let target = hit_test_plan_day(&day_dates, y);
                     drag_target.set(target);
                 },
                 onpointerup: move |_ev: PointerEvent| {
@@ -3852,11 +3832,10 @@ fn MealPlanContent() -> Element {
                         day: day.clone(),
                         drag_entry: drag_snapshot.as_ref().filter(|d| d.armed).map(|d| d.entry_id),
                         is_drag_target: drag_target_snapshot.as_deref() == Some(day.date.as_str()),
-                        on_card_down: move |(entry_id, origin_date, recipe_id, recipe_name, y): (
+                        on_card_down: move |(entry_id, origin_date, recipe_id, y): (
                             i64,
                             String,
                             i64,
-                            String,
                             f64,
                         )| {
                             suppress_open.set(false);
@@ -3864,7 +3843,6 @@ fn MealPlanContent() -> Element {
                                 entry_id,
                                 origin_date,
                                 recipe_id,
-                                recipe_name,
                                 start_y: y,
                                 armed: false,
                             }));
@@ -4034,6 +4012,30 @@ struct PlanDay {
     entries: Vec<MealPlanEntry>,
 }
 
+/// Which rendered day section contains the vertical position `y`?
+/// (wasm/webview only — the native shell never renders the UI.)
+fn hit_test_plan_day(dates: &[String], y: f64) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let window = web_sys::window()?;
+        let document = window.document()?;
+        for date in dates {
+            if let Some(el) = document.get_element_by_id(&format!("plan-day-{date}")) {
+                let rect = el.get_bounding_client_rect();
+                if y >= rect.top() && y <= rect.bottom() {
+                    return Some(date.clone());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (dates, y);
+        None
+    }
+}
+
 /// Move a planned entry to another day: optimistically re-date it locally,
 /// then DELETE + POST (the move endpoint is a delete and a re-add). Any
 /// failure refreshes from the server and surfaces the error.
@@ -4115,7 +4117,7 @@ fn PlanDaySection(
     day: PlanDay,
     drag_entry: Option<i64>,
     is_drag_target: bool,
-    on_card_down: EventHandler<(i64, String, i64, String, f64)>,
+    on_card_down: EventHandler<(i64, String, i64, f64)>,
     on_remove: EventHandler<i64>,
     on_add: EventHandler<String>,
     on_open: EventHandler<i64>,
@@ -4156,7 +4158,6 @@ fn PlanDaySection(
                                 entry.id,
                                 entry.date.clone(),
                                 entry.recipe.id,
-                                entry.recipe.name.clone(),
                                 ev.client_coordinates().y,
                             ));
                         },

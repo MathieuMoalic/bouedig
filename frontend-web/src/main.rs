@@ -1586,7 +1586,7 @@ fn RecipeFormFields(
     let mut drag = use_signal(|| None::<DragState>);
     let mut suppress_click = use_signal(|| false);
     let mut photo = use_signal(|| None::<(String, Vec<u8>)>);
-    let mut import_image_url = use_signal(|| initial_image_url);
+    let import_image_url = use_signal(|| initial_image_url);
     let mut status = use_signal(|| String::new());
     let mut status_error = use_signal(|| false);
     let navigator = use_navigator();
@@ -3271,7 +3271,7 @@ fn GroceryContent() -> Element {
     // The last item ticked off, kept around briefly so a mis-tick can be
     // undone; `undo_gen` invalidates the timer when a newer removal lands.
     let undo_item = use_signal(|| None::<GroceryItem>);
-    let mut undo_gen = use_signal(|| 0u64);
+    let undo_gen = use_signal(|| 0u64);
 
     use_effect(move || {
         if !loaded() {
@@ -4005,7 +4005,6 @@ struct PlanDrag {
     entry_id: i64,
     origin_date: String,
     recipe_id: i64,
-    recipe_name: String,
     start_y: f64,
     armed: bool,
 }
@@ -4046,8 +4045,8 @@ fn MealPlanContent() -> Element {
 
     // The rendered day range. It starts small (3 days back, 3 weeks ahead)
     // and grows a week at a time as the reader scrolls toward either end.
-    let mut back = use_signal(|| 3i64);
-    let mut forward = use_signal(|| 21i64);
+    let back = use_signal(|| 3i64);
+    let forward = use_signal(|| 21i64);
 
     // Group every day in the range: entries grouped per day, empty days
     // render with their ⊕ so any day is plannable.
@@ -4083,55 +4082,7 @@ fn MealPlanContent() -> Element {
     // so the view stays put. Polling (instead of scroll events) works in
     // every webview, including ones that swallow programmatic scroll events.
     #[cfg(target_arch = "wasm32")]
-    use_effect(move || {
-        spawn(async move {
-            let mut last_top: i64 = 0;
-            let mut pending: Option<(i64, i64)> = None; // (pre-extension height, user's scroll pos)
-            loop {
-                let promise = js_sys::Promise::new(&mut |resolve, _| {
-                    if let Some(window) = web_sys::window() {
-                        let _ = window
-                            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                &resolve,
-                                250,
-                            );
-                    }
-                });
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-                let Some(window) = web_sys::window() else { continue };
-                let Some(document) = window.document() else { continue };
-                let Some(element) = document
-                    .get_element_by_id("content-scroller")
-                    .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
-                else {
-                    continue;
-                };
-
-                // A backward extension rendered since the last tick: restore
-                // the reader's viewport over the prepended days.
-                if let Some((pre_height, user_top)) = pending.take() {
-                    let delta = element.scroll_height() as i64 - pre_height;
-                    if delta > 0 {
-                        element.set_scroll_top((user_top + delta) as i32);
-                    }
-                }
-
-                let top = element.scroll_top() as i64;
-                let height = element.scroll_height() as i64;
-                let client = element.client_height() as i64;
-                let bottom_dist = height - (top + client);
-                let moving_up = top < last_top;
-
-                if bottom_dist < 400 && forward() < 370 {
-                    forward.set((forward() + 7).min(370));
-                } else if moving_up && top < 400 && back() < 365 {
-                    back.set(back + 7);
-                    pending = Some((height, top));
-                }
-                last_top = top;
-            }
-        });
-    });
+    extend_plan_range_on_scroll(back, forward);
 
     rsx! {
         div { class: "page",
@@ -4154,26 +4105,7 @@ fn MealPlanContent() -> Element {
                     }
                     // Which rendered day section is under the pointer?
                     let y = ev.client_coordinates().y;
-                    let mut target: Option<String> = None;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        if let Some(window) = web_sys::window() {
-                            if let Some(document) = window.document() {
-                                for date in day_dates.iter() {
-                                    let el = document
-                                        .get_element_by_id(&format!("plan-day-{date}"));
-                                    if let Some(el) = el {
-                                        let rect = el.get_bounding_client_rect();
-                                        if y >= rect.top() && y <= rect.bottom() {
-                                            target = Some(date.clone());
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let _ = y;
+                    let target = hit_test_plan_day(&day_dates, y);
                     drag_target.set(target);
                 },
                 onpointerup: move |_ev: PointerEvent| {
@@ -4207,11 +4139,10 @@ fn MealPlanContent() -> Element {
                         day: day.clone(),
                         drag_entry: drag_snapshot.as_ref().filter(|d| d.armed).map(|d| d.entry_id),
                         is_drag_target: drag_target_snapshot.as_deref() == Some(day.date.as_str()),
-                        on_card_down: move |(entry_id, origin_date, recipe_id, recipe_name, y): (
+                        on_card_down: move |(entry_id, origin_date, recipe_id, y): (
                             i64,
                             String,
                             i64,
-                            String,
                             f64,
                         )| {
                             suppress_open.set(false);
@@ -4219,7 +4150,6 @@ fn MealPlanContent() -> Element {
                                 entry_id,
                                 origin_date,
                                 recipe_id,
-                                recipe_name,
                                 start_y: y,
                                 armed: false,
                             }));
@@ -4294,6 +4224,84 @@ fn MealPlanContent() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Watch the content scroller and grow the rendered plan range toward
+/// whichever end the reader approaches (wasm only — the UI runs in the
+/// webview; the native shell never renders, so this is compiled out there).
+#[cfg(target_arch = "wasm32")]
+fn extend_plan_range_on_scroll(mut back: Signal<i64>, mut forward: Signal<i64>) {
+    spawn(async move {
+        let mut last_top: i64 = 0;
+        let mut pending: Option<(i64, i64)> = None; // (pre-extension height, user's scroll pos)
+        loop {
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            250,
+                        );
+                }
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            let Some(window) = web_sys::window() else { continue };
+            let Some(document) = window.document() else { continue };
+            let Some(element) = document
+                .get_element_by_id("content-scroller")
+                .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
+            else {
+                continue;
+            };
+
+            // A backward extension rendered since the last tick: restore
+            // the reader's viewport over the prepended days.
+            if let Some((pre_height, user_top)) = pending.take() {
+                let delta = element.scroll_height() as i64 - pre_height;
+                if delta > 0 {
+                    element.set_scroll_top((user_top + delta) as i32);
+                }
+            }
+
+            let top = element.scroll_top() as i64;
+            let height = element.scroll_height() as i64;
+            let client = element.client_height() as i64;
+            let bottom_dist = height - (top + client);
+            let moving_up = top < last_top;
+
+            if bottom_dist < 400 && forward() < 370 {
+                forward.set((forward() + 7).min(370));
+            } else if moving_up && top < 400 && back() < 365 {
+                back.set(back + 7);
+                pending = Some((height, top));
+            }
+            last_top = top;
+        }
+    });
+}
+
+/// Which rendered day section contains the vertical position `y`?
+/// (wasm/webview only — the native shell never renders the UI.)
+fn hit_test_plan_day(dates: &[String], y: f64) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let window = web_sys::window()?;
+        let document = window.document()?;
+        for date in dates {
+            if let Some(el) = document.get_element_by_id(&format!("plan-day-{date}")) {
+                let rect = el.get_bounding_client_rect();
+                if y >= rect.top() && y <= rect.bottom() {
+                    return Some(date.clone());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (dates, y);
+        None
     }
 }
 
@@ -4381,7 +4389,7 @@ fn PlanDaySection(
     day: PlanDay,
     drag_entry: Option<i64>,
     is_drag_target: bool,
-    on_card_down: EventHandler<(i64, String, i64, String, f64)>,
+    on_card_down: EventHandler<(i64, String, i64, f64)>,
     on_remove: EventHandler<i64>,
     on_add: EventHandler<String>,
     on_open: EventHandler<i64>,
@@ -4425,7 +4433,6 @@ fn PlanDaySection(
                                 entry.id,
                                 entry.date.clone(),
                                 entry.recipe.id,
-                                entry.recipe.name.clone(),
                                 ev.client_coordinates().y,
                             ));
                         },

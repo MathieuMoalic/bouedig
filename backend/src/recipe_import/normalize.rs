@@ -1054,7 +1054,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn unicode_fraction() {
         // ½ cup converts to 120 ml.
         let i = parse_ingredient_line("½ cup milk");
@@ -1476,7 +1475,6 @@ mod tests {
         assert_balanced(&i);
     }
 
-    #[test]
     #[test]
     fn imperial_units_convert_to_metric() {
         let i = parse_ingredient_line("2 lb potatoes");
