@@ -1,3 +1,12 @@
 [application]
-name = "frontend-android"
+# NOTE: the Android launcher label comes from the package name (dx
+# Pascal-cases it: "bouedig" -> "Bouedig"); this field is not used for it.
+name = "bouedig"
 default_platform = "android"
+# The source PNG for the launcher icons (stamped in by the release script;
+# see scripts/release.py build_apk).
+icon = "assets/icon.png"
+
+[bundle]
+# Fresh identifier: the old default was com.example.FrontendAndroid.
+identifier = "eu.matmoa.bouedig"

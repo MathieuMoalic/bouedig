@@ -186,7 +186,7 @@ def build_apk(version: str) -> Path:
     # A previous dx build for another ABI leaves its .so staged under
     # jniLibs and gradle packages everything it finds, so wipe those first
     # or the APK ships stale libs for the wrong architecture.
-    app_dir = ROOT / "target" / "dx" / "frontend-android" / "release" / "android" / "app"
+    app_dir = ROOT / "target" / "dx" / "bouedig" / "release" / "android" / "app"
     for jni in app_dir.glob("app/src/main/jniLibs"):
         shutil.rmtree(jni)
     env = dict(os.environ, BOUEDIG_API_BASE=PROD_API_BASE)
@@ -198,7 +198,18 @@ def build_apk(version: str) -> Path:
         cwd=ANDROID, env=env, check=True,
     )
 
-    dx_out = ROOT / "target" / "dx" / "frontend-android"
+    # dx copies its stock dioxus launcher icons into res/ on every build;
+    # stamp ours over them (generated once into frontend-android/launcher/).
+    res_dir = app_dir / "app" / "src" / "main" / "res"
+    launcher_src = ANDROID / "launcher"
+    for src in launcher_src.rglob("*"):
+        if src.is_file():
+            rel = src.relative_to(launcher_src)
+            dest = res_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+
+    dx_out = ROOT / "target" / "dx" / "bouedig"
     candidates = [
         p for p in dx_out.rglob("*.apk")
         if "release" in p.parts and "-unsigned" not in p.name
