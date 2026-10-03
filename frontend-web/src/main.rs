@@ -3555,12 +3555,13 @@ fn GroupSection(
     on_bought: EventHandler<GroceryItem>,
 ) -> Element {
     let is_collapsed = collapsed.read().contains(&name);
-    let key = name.clone();
 
     rsx! {
         div { class: "grocery-card",
             button {
-                key: "group-{key}",
+                // No variable binding here: dioxus strips `key:` from plain
+                // elements in release builds, which would strand it unused.
+                key: "group-{name}",
                 class: "grocery-group",
                 onclick: move |_| {
                     let name = name.clone();

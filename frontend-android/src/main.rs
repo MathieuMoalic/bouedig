@@ -3353,12 +3353,11 @@ fn GroupSection(
     on_bought: EventHandler<GroceryItem>,
 ) -> Element {
     let is_collapsed = collapsed.read().contains(&name);
-    let key = name.clone();
 
     rsx! {
         div { class: "grocery-card",
             button {
-                key: "group-{key}",
+                key: "group-{name}",
                 class: "grocery-group",
                 onclick: move |_| {
                     let name = name.clone();
