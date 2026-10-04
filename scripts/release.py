@@ -198,9 +198,13 @@ def build_apk(version: str) -> Path:
         cwd=ANDROID, env=env, check=True,
     )
 
-    # dx copies its stock dioxus launcher icons into res/ on every build;
-    # stamp ours over them (generated once into frontend-android/launcher/).
+    # dx copies its stock dioxus launcher icons into res/mipmap-<density>/
+    # on every build; ours live in mipmap-<density>-v4/ (plus an adaptive
+    # mipmap-anydpi-v26). Wipe every mipmap dir first — gradle's resource
+    # merger aborts on two definitions of ic_launcher — then install ours.
     res_dir = app_dir / "app" / "src" / "main" / "res"
+    for mipmap in res_dir.glob("mipmap-*"):
+        shutil.rmtree(mipmap, ignore_errors=True)
     launcher_src = ANDROID / "launcher"
     for src in launcher_src.rglob("*"):
         if src.is_file():
