@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "backend"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "bouedig"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1765,7 +1765,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "e2e-tests"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "backend",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "frontend-web"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -5533,7 +5533,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
 ]
