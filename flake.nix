@@ -20,7 +20,7 @@
     let
       # Keep in sync with [workspace.package] version in Cargo.toml; bump
       # together with the `vX.Y.Z` release tag.
-      version = "0.1.5";
+      version = "0.1.6";
 
       systems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -156,7 +156,7 @@
 
       # sri hash of the latest release tarball; CI prints `nix hash file` for
       # every release — paste it here to make `packages.prebuilt` buildable.
-      prebuiltHash = "sha256-ZnlBliZO3zWnTySPfLsbQjzr1Q3lfH2BiQkf6WxMy14=";
+      prebuiltHash = "sha256-mzVOxUFpIL3FL5+o+M240jkqf4qctfmSWpq1f4m3TtI=";
 
       # Same trick blaz uses: the release tarball carries stale /nix/store
       # references from the build machine, so the fetchurl's references are
