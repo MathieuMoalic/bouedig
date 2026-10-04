@@ -187,6 +187,27 @@ def build_apk(version: str) -> Path:
     # jniLibs and gradle packages everything it finds, so wipe those first
     # or the APK ships stale libs for the wrong architecture.
     app_dir = ROOT / "target" / "dx" / "bouedig" / "release" / "android" / "app"
+    res_dir = app_dir / "app" / "src" / "main" / "res"
+
+    def wipe_mipmaps() -> None:
+        # dx copies its stock dioxus launcher icons into
+        # res/mipmap-<density>/ on every build, while ours live under
+        # mipmap-<density>-v4/. Two definitions of ic_launcher make
+        # gradle's resource merger abort, so this runs both before dx
+        # build (clearing previous stamps) and after it (clearing stock).
+        for mipmap in res_dir.glob("mipmap-*"):
+            shutil.rmtree(mipmap, ignore_errors=True)
+
+    def stamp_icons() -> None:
+        launcher_src = ANDROID / "launcher"
+        for src in launcher_src.rglob("*"):
+            if src.is_file():
+                rel = src.relative_to(launcher_src)
+                dest = res_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+
+    wipe_mipmaps()
     for jni in app_dir.glob("app/src/main/jniLibs"):
         shutil.rmtree(jni)
     env = dict(os.environ, BOUEDIG_API_BASE=PROD_API_BASE)
@@ -198,20 +219,14 @@ def build_apk(version: str) -> Path:
         cwd=ANDROID, env=env, check=True,
     )
 
-    # dx copies its stock dioxus launcher icons into res/mipmap-<density>/
-    # on every build; ours live in mipmap-<density>-v4/ (plus an adaptive
-    # mipmap-anydpi-v26). Wipe every mipmap dir first — gradle's resource
-    # merger aborts on two definitions of ic_launcher — then install ours.
-    res_dir = app_dir / "app" / "src" / "main" / "res"
-    for mipmap in res_dir.glob("mipmap-*"):
-        shutil.rmtree(mipmap, ignore_errors=True)
-    launcher_src = ANDROID / "launcher"
-    for src in launcher_src.rglob("*"):
-        if src.is_file():
-            rel = src.relative_to(launcher_src)
-            dest = res_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+    # dx packaged the APK with its stock icons; swap in ours and re-run
+    # gradle so the artifact carries the real launcher icon set.
+    wipe_mipmaps()
+    stamp_icons()
+    subprocess.run(
+        ["./gradlew", ":app:assembleDebug"],
+        cwd=app_dir, env=dict(os.environ), check=True,
+    )
 
     dx_out = ROOT / "target" / "dx" / "bouedig"
     candidates = [
