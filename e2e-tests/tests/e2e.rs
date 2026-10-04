@@ -1873,7 +1873,7 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
             .await?;
         driver.find(By::Id("import-fetch")).await?.click().await?;
 
-        // The preview summary shows method + confidence and the editor is
+        // The preview summary names the extraction method and the editor is
         // prefilled with the imported data.
         let summary = driver
             .find(By::Id("import-summary"))
@@ -2209,11 +2209,24 @@ async fn add_step_modal(
 ) -> anyhow::Result<()> {
     click_scrolled(driver, "add-step").await?;
     if let Some(section) = section {
-        // The select defaults to the last section; only interact with it when
-        // an explicit different section is requested.
-        let select_elem = driver.find(By::Id("modal-step-section")).await?;
-        let select = thirtyfour::components::SelectElement::new(&select_elem).await?;
-        select.select_by_value(section).await?;
+        // The section picker is a button row; tap the named section (retry:
+        // the row renders a beat after the modal opens).
+        let mut button = None;
+        let xpath = format!(
+            "//div[contains(@class, 'section-options')]//button[normalize-space()='{}']",
+            section
+        );
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::XPath(&xpath)).await {
+                button = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        button
+            .with_context(|| format!("section button '{section}' never appeared"))?
+            .click()
+            .await?;
     }
     driver
         .find(By::Id("modal-step-text"))

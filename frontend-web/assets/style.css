@@ -1327,8 +1327,8 @@ ol.instruction-list li {
     min-width: 0;
 }
 
-#editor-modal input[type="text"],
-#editor-modal textarea {
+.dialog input[type="text"],
+.dialog textarea {
     width: 100%;
     margin-bottom: 10px;
     background: #101512;
@@ -1339,7 +1339,7 @@ ol.instruction-list li {
     font: inherit;
 }
 
-#editor-modal textarea {
+.dialog textarea {
     min-height: 90px;
     resize: vertical;
 }
@@ -1351,7 +1351,7 @@ ol.instruction-list li {
     margin: 2px 0 6px;
 }
 
-#editor-modal select {
+.dialog select {
     width: 100%;
     background: #101512;
     border: 1px solid var(--divider);
@@ -1437,7 +1437,7 @@ ol.instruction-list li {
 }
 
 /* Validation state inside the ingredient modal */
-#editor-modal input.invalid {
+.dialog input.invalid {
     border-color: var(--error);
 }
 
@@ -1849,4 +1849,34 @@ ol.instruction-list li {
 .settings-version {
     color: var(--muted);
     font-size: 14px;
+}
+
+/* No square webview touch highlights over rounded buttons. */
+* {
+    -webkit-tap-highlight-color: transparent;
+}
+
+.fab:active {
+    background: var(--accent-bright);
+}
+
+/* Section picker buttons inside the ingredient dialog. */
+.section-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 10px;
+}
+
+.section-options .cat-btn {
+    flex-direction: row;
+    padding: 8px 12px;
+    font-size: 13px;
+    border-radius: 12px;
+}
+
+.section-options .section-add {
+    background: none;
+    color: var(--accent-bright);
+    border-color: var(--divider);
 }

@@ -538,6 +538,8 @@ async fn session_authenticated() -> bool {
 #[component]
 fn LoginGate(children: Element) -> Element {
     let mut authed = use_signal(|| None::<bool>);
+    // Children (Settings) get the login state so they can log out.
+    provide_context(authed);
     let mut password = use_signal(String::new);
     let mut error = use_signal(|| String::new());
     let mut busy = use_signal(|| false);
@@ -1062,7 +1064,6 @@ fn AddRecipe() -> Element {
 struct ImportPreview {
     recipe: RecipeInput,
     method: String,
-    confidence: f32,
     warnings: Vec<String>,
     #[serde(default)]
     image_url: Option<String>,
@@ -1156,7 +1157,6 @@ fn ImportRecipe() -> Element {
             }
         },
         Some(p) => {
-            let confidence_pct = (p.confidence * 100.0) as u64;
             let detail = RecipeDetailModel {
                 id: 0,
                 name: p.recipe.name.clone(),
@@ -1174,9 +1174,11 @@ fn ImportRecipe() -> Element {
             rsx! {
                 div { class: "page",
                     div { class: "card import-summary", id: "import-summary",
+                        if let Some(image) = &p.image_url {
+                            img { class: "import-photo", src: "{image}", alt: "{p.recipe.name}", referrerpolicy: "no-referrer" }
+                        }
                         div { class: "import-summary-head",
                             span { class: "import-badge", "{p.method}" }
-                            span { class: "muted", "confidence {confidence_pct}%" }
                         }
                         if !p.warnings.is_empty() {
                             div { class: "import-warnings",
@@ -1187,16 +1189,6 @@ fn ImportRecipe() -> Element {
                                     }
                                 }
                             }
-                        }
-                        button {
-                            id: "import-restart",
-                            class: "btn-ghost",
-                            r#type: "button",
-                            onclick: move |_| {
-                                preview.set(None);
-                                url.set(String::new());
-                            },
-                            "Import a different URL"
                         }
                     }
                     RecipeFormFields {
@@ -1408,6 +1400,9 @@ fn RecipeFormFields(
     let yield_value = yield_amount.read().clone();
     let source_value = source.read().clone();
     let notes_value = notes.read().clone();
+    // Layered "new section" dialog for the ingredient modal.
+    let mut new_section_dialog = use_signal(|| false);
+    let mut new_section_name = use_signal(String::new);
 
     // Live quantity validation for the open ingredient modal: empty is
     // allowed ("–"); otherwise it must parse as a positive, finite number.
@@ -2098,6 +2093,56 @@ fn RecipeFormFields(
             }
             p { id: "recipe-status", class: if status_error() { "error" } else { "" }, "{status}" }
 
+            // Layered on top of the ingredient modal: create a section and
+            // assign it without losing what is already typed.
+            if new_section_dialog() {
+                div {
+                    class: "dialog-backdrop",
+                    onclick: move |_| new_section_dialog.set(false),
+                    div { class: "dialog", role: "dialog", onclick: move |e: MouseEvent| e.stop_propagation(),
+                        h3 { "New section" }
+                        input {
+                            id: "modal-new-section-name",
+                            r#type: "text",
+                            placeholder: "Section name",
+                            value: "{new_section_name}",
+                            oninput: move |e: FormEvent| new_section_name.set(e.value()),
+                        }
+                        div { class: "dialog-actions",
+                            button {
+                                class: "dialog-btn",
+                                onclick: move |_| {
+                                    new_section_dialog.set(false);
+                                    new_section_name.set(String::new());
+                                },
+                                "Cancel"
+                            }
+                            button {
+                                id: "modal-new-section-ok",
+                                class: "dialog-btn primary",
+                                onclick: move |_| {
+                                    let name = new_section_name.read().trim().to_string();
+                                    if name.is_empty() {
+                                        return;
+                                    }
+                                    let id = *next_id.read();
+                                    sections.with_mut(|s| s.push(SectionRow { id, name: name.clone() }));
+                                    next_id.set(id + 1);
+                                    modal.with_mut(|m| {
+                                        if let Some(Modal::Ingredient { section_id, .. }) = m {
+                                            *section_id = Some(id);
+                                        }
+                                    });
+                                    new_section_dialog.set(false);
+                                    new_section_name.set(String::new());
+                                },
+                                "Create"
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(m) = modal_snapshot {
                 div {
                     class: "dialog-backdrop",
@@ -2165,23 +2210,40 @@ fn RecipeFormFields(
                                     },
                                 }
                                 label { class: "modal-label", "Section" }
-                                select {
-                                    id: "modal-section",
-                                    onchange: move |e: FormEvent| {
-                                        let v = e.value();
-                                        modal.with_mut(|m| {
-                                            if let Some(Modal::Ingredient { section_id, .. }) = m {
-                                                *section_id = v.parse().ok();
-                                            }
-                                        });
-                                    },
-                                    option { value: "", selected: if section_id.is_none() { "true" } else { "false" }, "No section" }
-                                    for s in &sections_snapshot {
-                                        option {
-                                            value: "{s.id}",
-                                            selected: if section_id == Some(s.id) { "true" } else { "false" },
+                                div { class: "section-options",
+                                    button {
+                                        class: if section_id.is_none() { "cat-btn selected" } else { "cat-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            modal.with_mut(|m| {
+                                                if let Some(Modal::Ingredient { section_id, .. }) = m {
+                                                    *section_id = None;
+                                                }
+                                            });
+                                        },
+                                        "Main"
+                                    }
+                                    for s in sections_snapshot.iter().cloned() {
+                                        button {
+                                            key: "{s.id}",
+                                            class: if section_id == Some(s.id) { "cat-btn selected" } else { "cat-btn" },
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let id = s.id;
+                                                modal.with_mut(|m| {
+                                                    if let Some(Modal::Ingredient { section_id, .. }) = m {
+                                                        *section_id = Some(id);
+                                                    }
+                                                });
+                                            },
                                             "{s.name}"
                                         }
+                                    }
+                                    button {
+                                        class: "cat-btn section-add",
+                                        r#type: "button",
+                                        onclick: move |_| new_section_dialog.set(true),
+                                        "+ Add section"
                                     }
                                 }
                                 div { class: "dialog-actions",
@@ -2300,21 +2362,32 @@ fn RecipeFormFields(
                                     },
                                 }
                                 label { class: "modal-label", "Section" }
-                                select {
-                                    id: "modal-step-section",
-                                    onchange: move |e: FormEvent| {
-                                        let v = e.value();
-                                        modal.with_mut(|m| {
-                                            if let Some(Modal::Step { section_id, .. }) = m {
-                                                *section_id = v.parse().ok();
-                                            }
-                                        });
-                                    },
-                                    option { value: "", selected: if section_id.is_none() { "true" } else { "false" }, "No section" }
-                                    for s in &step_sections_snapshot {
-                                        option {
-                                            value: "{s.id}",
-                                            selected: if section_id == Some(s.id) { "true" } else { "false" },
+                                div { class: "section-options",
+                                    button {
+                                        class: if section_id.is_none() { "cat-btn selected" } else { "cat-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            modal.with_mut(|m| {
+                                                if let Some(Modal::Step { section_id, .. }) = m {
+                                                    *section_id = None;
+                                                }
+                                            });
+                                        },
+                                        "Main"
+                                    }
+                                    for s in step_sections_snapshot.iter().cloned() {
+                                        button {
+                                            key: "{s.id}",
+                                            class: if section_id == Some(s.id) { "cat-btn selected" } else { "cat-btn" },
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let id = s.id;
+                                                modal.with_mut(|m| {
+                                                    if let Some(Modal::Step { section_id, .. }) = m {
+                                                        *section_id = Some(id);
+                                                    }
+                                                });
+                                            },
                                             "{s.name}"
                                         }
                                     }
@@ -4252,6 +4325,7 @@ fn PlanPickerRow(
 
 #[component]
 fn Settings() -> Element {
+    let mut authed = use_context::<Signal<Option<bool>>>();
     let mut server_version = use_signal(|| String::from("…"));
     use_effect(move || {
         spawn(async move {
@@ -4272,7 +4346,22 @@ fn Settings() -> Element {
                     p { class: "settings-version",
                         "App v{env!(\"CARGO_PKG_VERSION\")} — Server v{server_version}"
                     }
-                    p { "Theme, account and server settings — coming soon." }
+                    button {
+                        id: "logout",
+                        class: "btn-primary",
+                        r#type: "button",
+                        onclick: move |_| {
+                            spawn(async move {
+                                let _ = http()
+                                    .post(format!("{}/api/logout", api_base()))
+                                    .send()
+                                    .await;
+                                let _ = std::fs::remove_file(session_token_path());
+                                authed.set(Some(false));
+                            });
+                        },
+                        "Log out"
+                    }
                 }
             }
         }
