@@ -421,14 +421,20 @@
 
         # Same provisioning as blaz: the SDK (incl. NDK + build-tools) comes
         # from nixpkgs' androidenv so APK builds work with no local setup.
+        # Same provisioning as blaz (SDK incl. NDK + build-tools, no local
+        # setup), plus an emulator and an x86_64 system image (KVM-
+        # accelerated) so APKs can be installed and debugged locally.
         androidSdk = (pkgs.androidenv.composeAndroidPackages {
-          platformVersions = [ "36" "35" "34" ];
-          buildToolsVersions = [ "36.0.0" "35.0.0" "34.0.0" ];
+          platformVersions = [ "34" ];
+          buildToolsVersions = [ "34.0.0" ];
           ndkVersions = [ "27.0.12077973" ];
           includeNDK = true;
           cmakeVersions = [ "3.22.1" ];
           includeCmake = true;
-          includeEmulator = false;
+          includeEmulator = true;
+          includeSystemImages = true;
+          systemImageTypes = [ "google_apis" ];
+          abiVersions = [ "x86_64" ];
         }).androidsdk;
         sdkRoot = "${androidSdk}/libexec/android-sdk";
         ndkRoot = "${sdkRoot}/ndk/27.0.12077973";

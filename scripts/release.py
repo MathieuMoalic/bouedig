@@ -198,16 +198,23 @@ def build_apk(version: str) -> Path:
         for mipmap in res_dir.glob("mipmap-*"):
             shutil.rmtree(mipmap, ignore_errors=True)
 
-    def stamp_icons() -> None:
+    def stamp_launcher(values_only: bool) -> None:
         launcher_src = ANDROID / "launcher"
         for src in launcher_src.rglob("*"):
-            if src.is_file():
-                rel = src.relative_to(launcher_src)
-                dest = res_dir / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
+            if not src.is_file():
+                continue
+            rel = src.relative_to(launcher_src)
+            if values_only and not rel.startswith("values"):
+                continue
+            dest = res_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
 
     wipe_mipmaps()
+    # The manifest references @style/BouedigTheme, so the values file must
+    # exist before dx's own gradle run — values only, because the full set
+    # would collide with the stock mipmaps dx re-copies during the build.
+    stamp_launcher(values_only=True)
     for jni in app_dir.glob("app/src/main/jniLibs"):
         shutil.rmtree(jni)
     env = dict(os.environ, BOUEDIG_API_BASE=PROD_API_BASE)
@@ -219,10 +226,10 @@ def build_apk(version: str) -> Path:
         cwd=ANDROID, env=env, check=True,
     )
 
-    # dx packaged the APK with its stock icons; swap in ours and re-run
-    # gradle so the artifact carries the real launcher icon set.
+    # dx packaged the APK with its stock icons; swap in ours (full set incl.
+    # the launcher mipmaps) and re-run gradle so the artifact carries them.
     wipe_mipmaps()
-    stamp_icons()
+    stamp_launcher(values_only=False)
     subprocess.run(
         ["./gradlew", ":app:assembleDebug"],
         cwd=app_dir, env=dict(os.environ), check=True,

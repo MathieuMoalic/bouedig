@@ -3,9 +3,11 @@
     <!-- Dark green from the app palette: launcher-icon background, window
          background while the webview loads, and the status bar treatment
          (translucent, content draws behind it so the wallpaper image
-         extends up behind the clock). -->
+         extends up behind the clock). MUST parent on a Theme.AppCompat
+         descendant: dx's MainActivity is an AppCompatActivity and crashes
+         on launch with anything else. -->
     <color name="bouedig_launcher_background">#0E1310</color>
-    <style name="BouedigTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+    <style name="BouedigTheme" parent="@style/Theme.AppCompat.NoActionBar">
         <item name="android:windowBackground">#0E1310</item>
         <item name="android:windowTranslucentStatus">true</item>
         <item name="android:windowLightStatusBar">false</item>
