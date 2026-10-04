@@ -639,8 +639,6 @@ fn Recipes() -> Element {
     let mut search_text = use_signal(|| String::new());
     let mut search_results = use_signal(|| None::<Vec<Recipe>>);
     let mut search_generation = use_signal(|| 0u64);
-    let mut card_chooser = use_signal(|| None::<Recipe>);
-    let mut grid_note = use_signal(|| String::new());
 
     use_effect(move || {
         if !loaded() {
@@ -749,9 +747,6 @@ fn Recipes() -> Element {
 
     rsx! {
         div { class: "page",
-            if !grid_note.read().is_empty() {
-                p { class: "added-note", "{grid_note}" }
-            }
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
@@ -788,45 +783,10 @@ fn Recipes() -> Element {
                     RecipeCard {
                         key: "{recipe.id}",
                         recipe: recipe,
-                        on_mealplan: move |recipe: Recipe| {
-                            card_chooser.set(Some(recipe));
-                        },
                     }
                 }
             }
 
-            if let Some(recipe) = card_chooser.read().clone() {
-                DayChooser {
-                    key: "card-chooser-{recipe.id}",
-                    recipe_name: recipe.name.clone(),
-                    on_pick: move |(date, label): (String, String)| {
-                        card_chooser.set(None);
-                        let recipe_id = recipe.id;
-                        spawn(async move {
-                            let client = reqwest::Client::new();
-                            let url = format!("{}/api/meal-plan", api_base());
-                            let payload = serde_json::json!({
-                                "date": date,
-                                "recipe_id": recipe_id,
-                            });
-                            match client.post(&url).json(&payload).send().await {
-                                Ok(r) if r.status().is_success() => {
-                                    grid_note.set(format!("Added to {label}"));
-                                }
-                                Ok(r) => {
-                                    tracing::error!("meal-plan add failed: {}", r.status());
-                                    error.set(format!("Could not add to meal plan: {}", r.status()));
-                                }
-                                Err(err) => {
-                                    tracing::error!("meal-plan add request failed: {err:#}");
-                                    error.set(format!("Could not add to meal plan: {err}"));
-                                }
-                            }
-                        });
-                    },
-                    on_cancel: move |_| card_chooser.set(None),
-                }
-            }
             if add_menu() {
                 div { class: "menu-backdrop", onclick: move |_| add_menu.set(false) }
                 div { class: "fab-menu fab-menu-add",
@@ -910,7 +870,7 @@ fn Recipes() -> Element {
 }
 
 #[component]
-fn RecipeCard(recipe: Recipe, on_mealplan: EventHandler<Recipe>) -> Element {
+fn RecipeCard(recipe: Recipe) -> Element {
     let navigator = use_navigator();
     let initials: String = recipe
         .name
@@ -935,15 +895,6 @@ fn RecipeCard(recipe: Recipe, on_mealplan: EventHandler<Recipe>) -> Element {
                     img { src: "{thumb}", loading: "lazy", alt: "{recipe.name}" }
                 } else {
                     div { class: "recipe-placeholder", "{initials}" }
-                }
-                button {
-                    class: "card-fab",
-                    title: "Add to meal plan",
-                    onclick: move |e: MouseEvent| {
-                        e.stop_propagation();
-                        on_mealplan.call(recipe.clone());
-                    },
-                    IconCalendar {}
                 }
             }
             div { class: "recipe-card-name", "{recipe.name}" }
@@ -4525,11 +4476,28 @@ fn PlanPicker(
 
 #[component]
 fn Settings() -> Element {
+    let mut server_version = use_signal(|| String::from("…"));
+    use_effect(move || {
+        spawn(async move {
+            match api_get::<serde_json::Value>("/api/version").await {
+                Ok(v) => {
+                    let version = v["version"].as_str().unwrap_or("?").to_string();
+                    server_version.set(version);
+                }
+                Err(err) => tracing::error!("server version fetch failed: {err:#}"),
+            }
+        });
+    });
     rsx! {
         LoginGate {
-            PlaceholderPage {
-                title: "Settings",
-                text: "Theme, account and server settings — coming soon.",
+            div { class: "page",
+                div { class: "card placeholder-card",
+                    h1 { "Settings" }
+                    p { class: "settings-version",
+                        "App v{env!(\"CARGO_PKG_VERSION\")} — Server v{server_version}"
+                    }
+                    p { "Theme, account and server settings — coming soon." }
+                }
             }
         }
     }

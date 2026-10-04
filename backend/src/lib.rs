@@ -199,6 +199,7 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/session", get(session_status))
+        .route("/version", get(server_version))
         .route("/images/{*path}", get(serve_image))
         // Photo uploads can be several megabytes.
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
@@ -1006,7 +1007,7 @@ const SESSION_COOKIE: &str = "bouedig_session";
 /// sits inside the nest, which strips it.
 fn is_public_api(method: &axum::http::Method, path: &str) -> bool {
     let path = path.strip_prefix("/api").unwrap_or(path);
-    if path == "/login" || path == "/logout" || path == "/session" {
+    if path == "/login" || path == "/logout" || path == "/session" || path == "/version" {
         return true;
     }
     if method == axum::http::Method::GET {
@@ -1106,6 +1107,12 @@ async fn login(
         StatusCode::NO_CONTENT,
     )
         .into_response())
+}
+
+/// `GET /api/version`: the server's build version (public — the clients'
+/// settings page shows it next to their own version).
+async fn server_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
 /// `POST /api/logout`: invalidate the session and expire the cookie.
@@ -1216,6 +1223,7 @@ async fn search_recipes(
         return Ok(Json(Vec::new()));
     }
     let needle = query.to_lowercase();
+    let needle_words: Vec<&str> = needle.split_whitespace().collect();
     let rows = sqlx::query(
         "SELECT r.id, r.name, r.image_path, r.thumb_path, r.updated_at, \
                 (SELECT GROUP_CONCAT(i.name, ' ') FROM recipe_ingredients i \
@@ -1224,25 +1232,40 @@ async fn search_recipes(
     )
     .fetch_all(&state.db)
     .await?;
+    // Very lenient: edits allowed scale with word length (3 chars → 2,
+    // 9 chars → 3, 12+ chars → 4), so typos in long words still match.
+    let lenient = |a: &str, b: &str| {
+        let max = (a.chars().count().max(b.chars().count()) / 3).max(2);
+        levenshtein_within(a, b, max)
+    };
     let mut ranked: Vec<(u8, Recipe)> = Vec::new();
     for row in &rows {
         let recipe = row_to_recipe(row);
         let name = recipe.name.to_lowercase();
+        let name_words: Vec<&str> = name.split_whitespace().collect();
         let ingredients = {
             use sqlx::Row;
             row.get::<Option<String>, _>("ingredient_names")
                 .unwrap_or_default()
                 .to_lowercase()
         };
+        let ingredient_words: Vec<&str> = ingredients.split_whitespace().collect();
+        // Every needle word leniently matches some name word (order
+        // irrelevant), or the whole needle leniently matches the name.
+        let name_fuzzy = needle_words.iter().all(|n| {
+            name_words.iter().any(|w| lenient(w, n))
+        }) && !needle_words.is_empty()
+            || lenient(&name, &needle);
+        let ingredient_fuzzy = needle_words.iter().any(|n| {
+            ingredient_words.iter().any(|w| lenient(w, n))
+        });
         let tier = if name.starts_with(&needle) {
             0
         } else if name.contains(&needle) {
             1
-        } else if name.split_whitespace().any(|word| {
-            levenshtein_within(word, &needle, 2) || levenshtein_within(&name, &needle, 2)
-        }) {
+        } else if name_fuzzy {
             2
-        } else if ingredients.contains(&needle) {
+        } else if ingredients.contains(&needle) || ingredient_fuzzy {
             3
         } else {
             continue;
@@ -2321,6 +2344,78 @@ pub(crate) mod tests {
             json_response(app, "GET", "/api/recipes/search?q=", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn recipe_search_is_very_lenient() {
+        let app = test_router(None).await;
+        for (name, ingredient) in [
+            ("Vegan Lasagna", "pasta sheets"),
+            ("Creamy Peanut Stew", "sweet potato"),
+            ("Tofu Curry", "coconut milk"),
+        ] {
+            let payload = format!(
+                r#"{{"name":"{name}","sections":[],"ingredients":[{{"quantity":null,"unit":null,"name":"{ingredient}","prep":null,"section":null}}],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}}"#
+            );
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/recipes", Some(&payload)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        // Flipped word order still matches.
+        let (_, body) = json_response(
+            app.clone(),
+            "GET",
+            "/api/recipes/search?q=stew%20peanut",
+            None,
+        )
+        .await;
+        assert!(body.contains("Peanut Stew"), "flipped words missed: {body}");
+
+        // A typo inside a partial word.
+        let (_, body) = json_response(
+            app.clone(),
+            "GET",
+            "/api/recipes/search?q=lasgna",
+            None,
+        )
+        .await;
+        assert!(body.contains("Vegan Lasagna"), "typo'd word missed: {body}");
+
+        // An inner fragment that is not a prefix and not a substring.
+        let (_, body) =
+            json_response(app.clone(), "GET", "/api/recipes/search?q=ofu", None).await;
+        assert!(body.contains("Tofu Curry"), "inner fragment missed: {body}");
+
+        // An ingredient word, typo'd, with zero name match.
+        let (_, body) = json_response(
+            app.clone(),
+            "GET",
+            "/api/recipes/search?q=cocnut",
+            None,
+        )
+        .await;
+        assert!(body.contains("Tofu Curry"), "typo'd ingredient missed: {body}");
+
+        // One exact word plus one typo'd word in the same query.
+        let (_, body) = json_response(
+            app.clone(),
+            "GET",
+            "/api/recipes/search?q=creamy%20stue",
+            None,
+        )
+        .await;
+        assert!(body.contains("Peanut Stew"), "mixed exact+fuzzy missed: {body}");
+
+        // Nonsense still returns nothing.
+        let (_, body) = json_response(
+            app,
+            "GET",
+            "/api/recipes/search?q=zzzzqqqq",
+            None,
+        )
+        .await;
+        assert_eq!(body.trim(), "[]", "garbage query must not match: {body}");
     }
 
     #[tokio::test]

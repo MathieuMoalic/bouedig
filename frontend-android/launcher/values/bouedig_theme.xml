@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark green from the app palette: launcher-icon background, window
+         background while the webview loads, and the status bar treatment
+         (translucent, content draws behind it so the wallpaper image
+         extends up behind the clock). -->
+    <color name="bouedig_launcher_background">#0E1310</color>
+    <style name="BouedigTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">#0E1310</item>
+        <item name="android:windowTranslucentStatus">true</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

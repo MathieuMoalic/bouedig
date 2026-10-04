@@ -10,3 +10,9 @@ icon = "assets/icon.png"
 [bundle]
 # Fresh identifier: the old default was com.example.FrontendAndroid.
 identifier = "eu.matmoa.bouedig"
+
+[android.application]
+# Dark theme (stamped in from frontend-android/launcher/values/): dark
+# green window while loading, translucent status bar so the wallpaper
+# image runs up behind the clock.
+theme = "@style/BouedigTheme"

@@ -26,12 +26,37 @@ fn api_base() -> String {
 }
 
 /// One shared HTTP client with a cookie jar: the auth session cookie must
+/// Where the session token mirrors to disk. The in-memory cookie jar dies
+/// with the process; this file brings the login back on the next start.
+/// Android sets TMPDIR to the app's cache dir; fall back to the package's
+/// cache path derived from the identifier in Dioxus.toml.
+fn session_token_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("TMPDIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir).join("bouedig-session-token");
+        }
+    }
+    std::path::PathBuf::from("/data/data/eu.matmoa.bouedig/cache/bouedig-session-token")
+}
+
+/// One shared HTTP client with a cookie jar: the auth session cookie must
 /// survive across every call, so `reqwest::Client::new()` is never used.
+/// A session token mirrored to disk (see `session_token_path`) is injected
+/// into the jar at startup, so a login outlives an app restart.
 fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
+        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+        if let Ok(token) = std::fs::read_to_string(session_token_path()) {
+            let token = token.trim();
+            if !token.is_empty() {
+                if let Ok(url) = format!("{API_BASE}/").parse() {
+                    jar.add_cookie_str(&format!("bouedig_session={token}; Path=/"), &url);
+                }
+            }
+        }
         reqwest::Client::builder()
-            .cookie_store(true)
+            .cookie_provider(jar)
             .build()
             .expect("failed to build the HTTP client")
     })
@@ -539,6 +564,17 @@ fn LoginGate(children: Element) -> Element {
                 .await
             {
                 Ok(r) if r.status().is_success() => {
+                    // Mirror the session token to disk: the cookie jar dies
+                    // with the process, the file brings the login back.
+                    for c in r.cookies() {
+                        if c.name() == "bouedig_session" {
+                            let path = session_token_path();
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(path, c.value());
+                        }
+                    }
                     authed.set(Some(true));
                     password.set(String::new());
                 }
@@ -624,8 +660,6 @@ fn Recipes() -> Element {
     let mut search_text = use_signal(|| String::new());
     let mut search_results = use_signal(|| None::<Vec<Recipe>>);
     let mut search_generation = use_signal(|| 0u64);
-    let mut card_chooser = use_signal(|| None::<Recipe>);
-    let mut grid_note = use_signal(|| String::new());
 
     use_effect(move || {
         if !loaded() {
@@ -733,9 +767,6 @@ fn Recipes() -> Element {
 
     rsx! {
         div { class: "page",
-            if !grid_note.read().is_empty() {
-                p { class: "added-note", "{grid_note}" }
-            }
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
@@ -772,45 +803,10 @@ fn Recipes() -> Element {
                     RecipeCard {
                         key: "{recipe.id}",
                         recipe: recipe,
-                        on_mealplan: move |recipe: Recipe| {
-                            card_chooser.set(Some(recipe));
-                        },
                     }
                 }
             }
 
-            if let Some(recipe) = card_chooser.read().clone() {
-                DayChooser {
-                    key: "card-chooser-{recipe.id}",
-                    recipe_name: recipe.name.clone(),
-                    on_pick: move |(date, label): (String, String)| {
-                        card_chooser.set(None);
-                        let recipe_id = recipe.id;
-                        spawn(async move {
-                            let client = http();
-                            let url = format!("{}/api/meal-plan", api_base());
-                            let payload = serde_json::json!({
-                                "date": date,
-                                "recipe_id": recipe_id,
-                            });
-                            match client.post(&url).json(&payload).send().await {
-                                Ok(r) if r.status().is_success() => {
-                                    grid_note.set(format!("Added to {label}"));
-                                }
-                                Ok(r) => {
-                                    tracing::error!("meal-plan add failed: {}", r.status());
-                                    error.set(format!("Could not add to meal plan: {}", r.status()));
-                                }
-                                Err(err) => {
-                                    tracing::error!("meal-plan add request failed: {err:#}");
-                                    error.set(format!("Could not add to meal plan: {err}"));
-                                }
-                            }
-                        });
-                    },
-                    on_cancel: move |_| card_chooser.set(None),
-                }
-            }
             if add_menu() {
                 div { class: "menu-backdrop", onclick: move |_| add_menu.set(false) }
                 div { class: "fab-menu fab-menu-add",
@@ -894,7 +890,7 @@ fn Recipes() -> Element {
 }
 
 #[component]
-fn RecipeCard(recipe: Recipe, on_mealplan: EventHandler<Recipe>) -> Element {
+fn RecipeCard(recipe: Recipe) -> Element {
     let navigator = use_navigator();
     let initials: String = recipe
         .name
@@ -919,15 +915,6 @@ fn RecipeCard(recipe: Recipe, on_mealplan: EventHandler<Recipe>) -> Element {
                     img { src: "{thumb}", loading: "lazy", alt: "{recipe.name}" }
                 } else {
                     div { class: "recipe-placeholder", "{initials}" }
-                }
-                button {
-                    class: "card-fab",
-                    title: "Add to meal plan",
-                    onclick: move |e: MouseEvent| {
-                        e.stop_propagation();
-                        on_mealplan.call(recipe.clone());
-                    },
-                    IconCalendar {}
                 }
             }
             div { class: "recipe-card-name", "{recipe.name}" }
@@ -4171,10 +4158,10 @@ fn PlanDaySection(
                             IconX {}
                         }
                         div { class: "plan-card-media",
-                            if let Some(thumb) = &entry.recipe.thumb {
+                            if let Some(thumb) = entry.recipe.thumb.as_ref().map(|t| absolutize(t)) {
                                 img { src: "{thumb}", alt: "{entry.recipe.name}" }
                             } else if let Some(image) = &entry.recipe.image {
-                                img { src: "{image}", alt: "{entry.recipe.name}" }
+                                img { src: "{absolutize(image)}", alt: "{entry.recipe.name}" }
                             } else {
                                 div { class: "plan-card-initials",
                                     {entry.recipe.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase()}
@@ -4255,7 +4242,7 @@ fn PlanPickerRow(
             class: "plan-picker-row",
             r#type: "button",
             onclick: move |_| on_add.call((date.clone(), recipe.id)),
-            if let Some(thumb) = &recipe.thumb {
+            if let Some(thumb) = recipe.thumb.as_ref().map(|t| absolutize(t)) {
                 img { src: "{thumb}", alt: "" }
             }
             span { "{recipe.name}" }
@@ -4265,11 +4252,28 @@ fn PlanPickerRow(
 
 #[component]
 fn Settings() -> Element {
+    let mut server_version = use_signal(|| String::from("…"));
+    use_effect(move || {
+        spawn(async move {
+            match api_get::<serde_json::Value>("/api/version").await {
+                Ok(v) => {
+                    let version = v["version"].as_str().unwrap_or("?").to_string();
+                    server_version.set(version);
+                }
+                Err(err) => tracing::error!("server version fetch failed: {err:#}"),
+            }
+        });
+    });
     rsx! {
         LoginGate {
-            PlaceholderPage {
-                title: "Settings",
-                text: "Theme, account and server settings — coming soon.",
+            div { class: "page",
+                div { class: "card placeholder-card",
+                    h1 { "Settings" }
+                    p { class: "settings-version",
+                        "App v{env!(\"CARGO_PKG_VERSION\")} — Server v{server_version}"
+                    }
+                    p { "Theme, account and server settings — coming soon." }
+                }
             }
         }
     }
