@@ -1907,3 +1907,10 @@ ol.instruction-list li {
     width: 14px;
     height: 14px;
 }
+
+/* The meal plan grows backward by prepending days and compensating the
+   scroll position itself; the browser's scroll anchoring would double-
+   correct and make upward scrolling jump around. */
+#content-scroller {
+    overflow-anchor: none;
+}
