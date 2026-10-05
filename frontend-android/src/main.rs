@@ -1063,7 +1063,6 @@ fn AddRecipe() -> Element {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ImportPreview {
     recipe: RecipeInput,
-    method: String,
     warnings: Vec<String>,
     #[serde(default)]
     image_url: Option<String>,
@@ -1176,9 +1175,6 @@ fn ImportRecipe() -> Element {
                     div { class: "card import-summary", id: "import-summary",
                         if let Some(image) = &p.image_url {
                             img { class: "import-photo", src: "{image}", alt: "{p.recipe.name}", referrerpolicy: "no-referrer" }
-                        }
-                        div { class: "import-summary-head",
-                            span { class: "import-badge", "{p.method}" }
                         }
                         if !p.warnings.is_empty() {
                             div { class: "import-warnings",
@@ -2097,7 +2093,8 @@ fn RecipeFormFields(
             // assign it without losing what is already typed.
             if new_section_dialog() {
                 div {
-                    class: "dialog-backdrop",
+                    // z-index above the ingredient dialog it layers over.
+                    class: "dialog-backdrop section-dialog",
                     onclick: move |_| new_section_dialog.set(false),
                     div { class: "dialog", role: "dialog", onclick: move |e: MouseEvent| e.stop_propagation(),
                         h3 { "New section" }
@@ -2712,7 +2709,7 @@ fn RecipeDetail(id: i64) -> Element {
                     if !d.source.trim().is_empty() {
                         div { class: "card meta-card", id: "detail-source",
                             h2 { "Source" }
-                            p { "{d.source}" }
+                            a { class: "source-link", href: "{d.source}", target: "_blank", rel: "noopener", "{d.source}" }
                         }
                     }
                     if !d.notes.trim().is_empty() {
@@ -4325,6 +4322,15 @@ fn PlanPickerRow(
 
 #[component]
 fn Settings() -> Element {
+    rsx! {
+        LoginGate { SettingsContent {} }
+    }
+}
+
+/// The Settings UI itself — rendered INSIDE LoginGate so the authed signal
+/// context provided there is reachable from here.
+#[component]
+fn SettingsContent() -> Element {
     let mut authed = use_context::<Signal<Option<bool>>>();
     let mut server_version = use_signal(|| String::from("…"));
     use_effect(move || {
@@ -4339,8 +4345,7 @@ fn Settings() -> Element {
         });
     });
     rsx! {
-        LoginGate {
-            div { class: "page",
+        div { class: "page",
                 div { class: "card placeholder-card",
                     h1 { "Settings" }
                     p { class: "settings-version",
@@ -4364,7 +4369,6 @@ fn Settings() -> Element {
                     }
                 }
             }
-        }
     }
 }
 

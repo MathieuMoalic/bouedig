@@ -1340,7 +1340,7 @@ ol.instruction-list li {
 }
 
 .dialog textarea {
-    min-height: 90px;
+    min-height: 60vh;
     resize: vertical;
 }
 
@@ -1741,16 +1741,6 @@ ol.instruction-list li {
     padding: 14px 16px;
 }
 
-.import-badge {
-    background: var(--pill);
-    color: var(--text);
-    border-radius: 8px;
-    padding: 3px 10px;
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
 .import-summary-head {
     display: flex;
     align-items: center;
@@ -1821,7 +1811,7 @@ ol.instruction-list li {
 .import-photo {
     display: block;
     width: 100%;
-    max-height: 220px;
+    aspect-ratio: 1 / 1;
     object-fit: cover;
     border-radius: 12px;
     margin-bottom: 8px;
@@ -1872,4 +1862,14 @@ body {
     background: none;
     color: var(--accent-bright);
     border-color: var(--divider);
+}
+
+.source-link {
+    color: var(--accent-bright);
+    word-break: break-all;
+}
+
+/* The layered new-section dialog sits above the ingredient dialog. */
+.section-dialog {
+    z-index: 60;
 }
