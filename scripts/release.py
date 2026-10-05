@@ -204,7 +204,7 @@ def build_apk(version: str) -> Path:
             if not src.is_file():
                 continue
             rel = src.relative_to(launcher_src)
-            if values_only and not rel.startswith("values"):
+            if values_only and rel.parts[0] != "values":
                 continue
             dest = res_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
