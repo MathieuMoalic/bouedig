@@ -1880,3 +1880,30 @@ ol.instruction-list li {
 .section-dialog {
     z-index: 60;
 }
+
+.plan-drag-handle {
+    position: absolute;
+    left: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 2;
+    background: none;
+    border: none;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 2px;
+    cursor: grab;
+    /* The handle owns the whole gesture: touches on it never scroll. */
+    touch-action: none;
+}
+
+.plan-drag-handle:active {
+    color: var(--text);
+}
+
+.plan-drag-handle .icon {
+    width: 14px;
+    height: 14px;
+}

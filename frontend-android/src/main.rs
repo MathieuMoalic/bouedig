@@ -3883,6 +3883,11 @@ fn MealPlanContent() -> Element {
                     plan_drag.set(None);
                     drag_target.set(None);
                 },
+                // The OS claims the gesture for scrolling mid-drag.
+                onpointercancel: move |_ev: PointerEvent| {
+                    plan_drag.set(None);
+                    drag_target.set(None);
+                },
                 for day in days {
                     PlanDaySection {
                         day: day.clone(),
@@ -4208,14 +4213,20 @@ fn PlanDaySection(
                         },
                         key: "{entry.id}",
                         onclick: move |_| on_open.call(entry.recipe.id),
-                        onpointerdown: move |ev: PointerEvent| {
-                            ev.stop_propagation();
-                            on_card_down.call((
-                                entry.id,
-                                entry.date.clone(),
-                                entry.recipe.id,
-                                ev.client_coordinates().y,
-                            ));
+                        button {
+                            class: "plan-drag-handle",
+                            r#type: "button",
+                            title: "Drag to another day",
+                            onpointerdown: move |ev: PointerEvent| {
+                                ev.stop_propagation();
+                                on_card_down.call((
+                                    entry.id,
+                                    entry.date.clone(),
+                                    entry.recipe.id,
+                                    ev.client_coordinates().y,
+                                ));
+                            },
+                            IconMenu {}
                         },
                         button {
                             class: "plan-remove",

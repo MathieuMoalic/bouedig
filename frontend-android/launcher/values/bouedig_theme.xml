@@ -1,15 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark green from the app palette: launcher-icon background, window
-         background while the webview loads, and the status bar treatment
-         (translucent, content draws behind it so the wallpaper image
-         extends up behind the clock). MUST parent on a Theme.AppCompat
-         descendant: dx's MainActivity is an AppCompatActivity and crashes
-         on launch with anything else. -->
+    <!-- Launcher-icon background (dark green from the app palette). The
+         status bar is left at the platform default: a translucent/overlay
+         status bar was tried and reverted (it broke the meal-plan scroll
+         gesture handling and shifted the bottom nav). -->
     <color name="bouedig_launcher_background">#0E1310</color>
     <style name="BouedigTheme" parent="@style/Theme.AppCompat.NoActionBar">
         <item name="android:windowBackground">#0E1310</item>
-        <item name="android:windowTranslucentStatus">true</item>
-        <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

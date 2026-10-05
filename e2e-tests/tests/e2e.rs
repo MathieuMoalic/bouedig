@@ -2647,22 +2647,23 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
         // pointermove/up carry the target day's center.
         let script = format!(
             r#"
-            const card = document.querySelector('#plan-day-{date_a} .plan-card');
-            if (!card) throw new Error('source card not found');
+            const handle = document.querySelector('#plan-day-{date_a} .plan-drag-handle');
+            if (!handle) throw new Error('drag handle not found');
+            const card = handle.closest('.plan-card');
             const cardRect = card.getBoundingClientRect();
             const target = document.querySelector('#plan-day-{date_b}');
             if (!target) throw new Error('target day not found');
             const tr = target.getBoundingClientRect();
             const opts = {{ bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, pointerType: 'mouse' }};
-            // Dispatch on the card: the container's listeners receive the
+            // Dispatch on the handle: the container's listeners receive the
             // events by bubbling (document-dispatched events would not).
-            card.dispatchEvent(new PointerEvent('pointerdown', {{...opts,
-                clientX: cardRect.left + 20, clientY: cardRect.top + 10}}));
-            card.dispatchEvent(new PointerEvent('pointermove', {{...opts,
-                clientX: cardRect.left + 20, clientY: cardRect.top + 10}}));
-            card.dispatchEvent(new PointerEvent('pointermove', {{...opts,
+            handle.dispatchEvent(new PointerEvent('pointerdown', {{...opts,
+                clientX: cardRect.left + 8, clientY: cardRect.top + 10}}));
+            handle.dispatchEvent(new PointerEvent('pointermove', {{...opts,
+                clientX: cardRect.left + 8, clientY: cardRect.top + 10}}));
+            handle.dispatchEvent(new PointerEvent('pointermove', {{...opts,
                 clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2}}));
-            card.dispatchEvent(new PointerEvent('pointerup', {{...opts,
+            handle.dispatchEvent(new PointerEvent('pointerup', {{...opts,
                 clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2}}));
             "#
         );

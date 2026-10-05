@@ -1828,12 +1828,6 @@ ol.instruction-list li {
     cursor: pointer;
 }
 
-/* Translucent status bar: the wallpaper shows behind the clock, so the
-   app content starts below it (density-independent px). */
-body {
-    padding-top: 30px;
-}
-
 /* No square webview touch highlights over rounded buttons. */
 * {
     -webkit-tap-highlight-color: transparent;
@@ -1872,4 +1866,31 @@ body {
 /* The layered new-section dialog sits above the ingredient dialog. */
 .section-dialog {
     z-index: 60;
+}
+
+.plan-drag-handle {
+    position: absolute;
+    left: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 2;
+    background: none;
+    border: none;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 2px;
+    cursor: grab;
+    /* The handle owns the whole gesture: touches on it never scroll. */
+    touch-action: none;
+}
+
+.plan-drag-handle:active {
+    color: var(--text);
+}
+
+.plan-drag-handle .icon {
+    width: 14px;
+    height: 14px;
 }
