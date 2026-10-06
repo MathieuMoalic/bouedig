@@ -4024,6 +4024,7 @@ struct PlanDrag {
     origin_date: String,
     recipe_id: i64,
     start_y: f64,
+    last_y: f64,
     armed: bool,
 }
 
@@ -4063,8 +4064,12 @@ fn MealPlanContent() -> Element {
 
     // The rendered day range. It starts small (3 days back, 3 weeks ahead)
     // and grows a week at a time as the reader scrolls toward either end.
-    let back = use_signal(|| 3i64);
+    // A week of history preloaded above today.
+    let back = use_signal(|| 7i64);
     let forward = use_signal(|| 21i64);
+    // Day-section viewport rects for the drag hit-test, captured through
+    // the eval bridge when a drag arms.
+    let mut scroll_done = use_signal(|| false);
 
     // Group every day in the range: entries grouped per day, empty days
     // render with their ⊕ so any day is plannable.
@@ -4091,14 +4096,23 @@ fn MealPlanContent() -> Element {
     // Bind the drag snapshots before rsx: one read per repaint.
     let drag_snapshot = plan_drag.read().clone();
     let drag_target_snapshot = drag_target.read().clone();
-    // Dates only, for the drag hit-test: `days` itself moves into the rsx.
-    let day_dates: Vec<String> = days.iter().map(|d| d.date.clone()).collect();
+    // The drag hit-test needs no captured day list: it re-reads the rendered
+    // `.plan-day` ids from the DOM (closures inside the `for day in days`
+    // rsx loop are `FnMut` and can never move-capture a `Vec`).
 
     // Infinite scroll: a light poll watches the content scroller. While the
     // reader is actively scrolling toward an end, the range grows a week at
     // a time to fill the timeline; prepends compensate the scroll position
     // so the view stays put. Polling (instead of scroll events) works in
     // every webview, including ones that swallow programmatic scroll events.
+    // Open the tab on today, with the preloaded week above it.
+    use_effect(move || {
+        if loaded() && !scroll_done() {
+            scroll_done.set(true);
+            scroll_plan_to_today(today_value.clone());
+        }
+    });
+
     #[cfg(target_arch = "wasm32")]
     extend_plan_range_on_scroll(back, forward);
 
@@ -4119,16 +4133,20 @@ fn MealPlanContent() -> Element {
                         if (ev.client_coordinates().y - d.start_y).abs() < 8.0 {
                             return;
                         }
-                        plan_drag.with_mut(|s| if let Some(s) = s { s.armed = true; });
+                        plan_drag.with_mut(|s| {
+                            if let Some(s) = s {
+                                s.armed = true;
+                                s.last_y = ev.client_coordinates().y;
+                            }
+                        });
                     }
                     // Which rendered day section is under the pointer?
                     let y = ev.client_coordinates().y;
-                    let target = hit_test_plan_day(&day_dates, y);
+                    let target = hit_test_plan_day(y);
                     drag_target.set(target);
                 },
                 onpointerup: move |_ev: PointerEvent| {
                     let Some(d) = plan_drag.read().clone() else { return };
-                    let target = drag_target.read().clone();
                     plan_drag.set(None);
                     drag_target.set(None);
                     if !d.armed {
@@ -4136,6 +4154,7 @@ fn MealPlanContent() -> Element {
                         return;
                     }
                     suppress_open.set(true);
+                    let target = hit_test_plan_day(d.last_y);
                     if let Some(date) = target {
                         if date != d.origin_date {
                             move_planned_entry(
@@ -4174,8 +4193,46 @@ fn MealPlanContent() -> Element {
                                 origin_date,
                                 recipe_id,
                                 start_y: y,
+                                last_y: y,
                                 armed: false,
                             }));
+                        },
+                        on_card_move: move |(entry_id, y): (i64, f64)| {
+                            let Some(mut d) = plan_drag.write().clone() else { return };
+                            if d.entry_id != entry_id {
+                                return;
+                            }
+                            if !d.armed {
+                                if (y - d.start_y).abs() < 8.0 {
+                                    return;
+                                }
+                                d.armed = true;
+                            }
+                            d.last_y = y;
+                            plan_drag.set(Some(d));
+                            let target = hit_test_plan_day(y);
+                            drag_target.set(target);
+                        },
+                        on_card_drop: move |(entry_id, y): (i64, f64)| {
+                            let Some(d) = plan_drag.read().clone() else { return };
+                            if !d.armed || d.entry_id != entry_id {
+                                return;
+                            }
+                            plan_drag.set(None);
+                            drag_target.set(None);
+                            suppress_open.set(true);
+                            let target = hit_test_plan_day(y);
+                            if let Some(date) = target {
+                                if date != d.origin_date {
+                                    move_planned_entry(
+                                        d.entry_id,
+                                        d.recipe_id,
+                                        date,
+                                        entries,
+                                        error,
+                                    );
+                                }
+                            }
                         },
                         on_remove: move |entry_id: i64| {
                             spawn(async move {
@@ -4304,28 +4361,48 @@ fn extend_plan_range_on_scroll(mut back: Signal<i64>, mut forward: Signal<i64>) 
     });
 }
 
-/// Which rendered day section contains the vertical position `y`?
-/// (wasm/webview only — the native shell never renders the UI.)
-fn hit_test_plan_day(dates: &[String], y: f64) -> Option<String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let window = web_sys::window()?;
-        let document = window.document()?;
-        for date in dates {
-            if let Some(el) = document.get_element_by_id(&format!("plan-day-{date}")) {
-                let rect = el.get_bounding_client_rect();
-                if y >= rect.top() && y <= rect.bottom() {
-                    return Some(date.clone());
-                }
-            }
+/// Which rendered day section contains the viewport position `y`?
+/// Direct DOM hit-test on web (the web build always runs as wasm). Takes no
+/// captured data on purpose: closures inside the `for day in days` rsx loop
+/// are `FnMut` and can never move-capture a `Vec`, so the day dates are
+/// re-read from the rendered ids instead. The mobile app uses its own
+/// eval-bridge variant over cached rects.
+#[cfg(target_arch = "wasm32")]
+fn hit_test_plan_day(y: f64) -> Option<String> {
+    let window = web_sys::window()?;
+    let document = window.document()?;
+    let days = document.query_selector_all(".plan-day").ok()?;
+    for i in 0..days.length() {
+        let el = days.get(i)?.dyn_into::<web_sys::Element>().ok()?;
+        let id = el.get_attribute("id")?;
+        let date = id.strip_prefix("plan-day-")?;
+        let rect = el.get_bounding_client_rect();
+        if y >= rect.top() && y <= rect.bottom() {
+            return Some(date.to_string());
         }
-        None
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (dates, y);
-        None
-    }
+    None
+}
+
+/// Host fallback: never called (no UI on the host build), keeps the crate
+/// compilable for `cargo test`.
+#[cfg(not(target_arch = "wasm32"))]
+fn hit_test_plan_day(_y: f64) -> Option<String> {
+    None
+}
+
+/// Scroll the plan so today's section is at the top. One attempt a beat
+/// after mount: the day sections render with the initial paint, so no
+/// retry loop is needed (a retry would fight the reader's scrolling).
+fn scroll_plan_to_today(today: String) {
+    spawn(async move {
+        sleep_ms(300).await;
+        dioxus::document::eval(&format!(
+            "document.getElementById('plan-day-{today}')?.scrollIntoView({{ block: 'start' }})"
+        ))
+        .await
+        .ok();
+    });
 }
 
 /// Move a planned entry to another day: optimistically re-date it locally,
@@ -4413,6 +4490,11 @@ fn PlanDaySection(
     drag_entry: Option<i64>,
     is_drag_target: bool,
     on_card_down: EventHandler<(i64, String, i64, f64)>,
+    on_card_move: EventHandler<(i64, f64)>,
+    // Only the entry id and pointer y: the drop reads origin/recipe from the
+    // drag state, so the handle's listener captures nothing non-Copy (two
+    // closures in the `for entry` loop could never both own `entry.date`).
+    on_card_drop: EventHandler<(i64, f64)>,
     on_remove: EventHandler<i64>,
     on_add: EventHandler<String>,
     on_open: EventHandler<i64>,
@@ -4462,6 +4544,17 @@ fn PlanDaySection(
                                     entry.recipe.id,
                                     ev.client_coordinates().y,
                                 ));
+                            },
+                            // Handle-level move/drop: dispatched events on
+                            // the handle reach these own-element listeners
+                            // directly (the container's handlers only see
+                            // trusted input events).
+                            onpointermove: move |ev: PointerEvent| {
+                                on_card_move.call((entry.id, ev.client_coordinates().y));
+                            },
+                            onpointerup: move |ev: PointerEvent| {
+                                ev.stop_propagation();
+                                on_card_drop.call((entry.id, ev.client_coordinates().y));
                             },
                             IconMenu {}
                         },

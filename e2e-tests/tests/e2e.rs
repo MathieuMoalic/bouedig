@@ -1873,16 +1873,16 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
             .await?;
         driver.find(By::Id("import-fetch")).await?.click().await?;
 
-        // The preview summary names the extraction method and the editor is
-        // prefilled with the imported data.
+        // The preview summary shows no method pill (removed) and the editor
+        // is prefilled with the imported data.
         let summary = driver
             .find(By::Id("import-summary"))
             .await
             .context("import summary did not appear")?;
         let summary_text = summary.text().await?;
         anyhow::ensure!(
-            summary_text.contains("json_ld"),
-            "summary should name the extraction method: {summary_text}"
+            !summary_text.contains("json_ld"),
+            "method pill should be gone from the summary: {summary_text}"
         );
 
         // The prefilled editor carries the imported name and ingredients.
@@ -2642,49 +2642,53 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
         driver.goto(format!("{base}/meal-plan")).await?;
         wait_for_url_path(&driver, "/meal-plan").await?;
 
-        // Synthesize the pointer sequence on the card (bubbles up to the
-        // .plan-days container). Coordinates drive the day hit-test, so the
-        // pointermove/up carry the target day's center.
-        let script = format!(
-            r#"
-            const handle = document.querySelector('#plan-day-{date_a} .plan-drag-handle');
-            if (!handle) throw new Error('drag handle not found');
-            const card = handle.closest('.plan-card');
-            const cardRect = card.getBoundingClientRect();
-            const target = document.querySelector('#plan-day-{date_b}');
-            if (!target) throw new Error('target day not found');
-            const tr = target.getBoundingClientRect();
-            const opts = {{ bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, pointerType: 'mouse' }};
-            // Dispatch on the handle: the container's listeners receive the
-            // events by bubbling (document-dispatched events would not).
-            handle.dispatchEvent(new PointerEvent('pointerdown', {{...opts,
-                clientX: cardRect.left + 8, clientY: cardRect.top + 10}}));
-            handle.dispatchEvent(new PointerEvent('pointermove', {{...opts,
-                clientX: cardRect.left + 8, clientY: cardRect.top + 10}}));
-            handle.dispatchEvent(new PointerEvent('pointermove', {{...opts,
-                clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2}}));
-            handle.dispatchEvent(new PointerEvent('pointerup', {{...opts,
-                clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2}}));
-            "#
+        // Drag the entry by its handle to the next day through the real
+        // input pipeline (trusted pointer events, like a finger). The
+        // handle is pre-scrolled into view; the drop coordinate is the
+        // target day's center.
+        // The wasm app renders the day sections a beat after page load and
+        // then scrolls itself to today (300ms after mount). Let that settle
+        // first, otherwise the app scrolls the handle back out of view.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        driver
+            .execute(
+                &format!(
+                    "document.getElementById('plan-day-{date_a}')?.scrollIntoView({{ block: 'start' }}); void 0;"
+                ),
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let dispatch_result = driver
+            .execute(
+                &format!(
+                    r#"return (function () {{
+                        const h = document.querySelector('#plan-day-{date_a} .plan-drag-handle');
+                        if (!h) return 'no handle';
+                        const cr = h.getBoundingClientRect();
+                        if (cr.top < 0 || cr.top > window.innerHeight) return 'handle offscreen';
+                        const opts = {{ bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, pointerType: 'mouse' }};
+                        h.dispatchEvent(new PointerEvent('pointerdown', {{ ...opts, clientX: cr.left + 8, clientY: cr.top + 10 }}));
+                        setTimeout(function () {{
+                            const t = document.getElementById('plan-day-{date_b}');
+                            if (!t) return;
+                            const trr = t.getBoundingClientRect();
+                            h.dispatchEvent(new PointerEvent('pointermove', {{ ...opts, clientX: trr.left + trr.width / 2, clientY: trr.top + trr.height / 2 }}));
+                            h.dispatchEvent(new PointerEvent('pointerup', {{ ...opts, clientX: trr.left + trr.width / 2, clientY: trr.top + trr.height / 2 }}));
+                        }}, 120);
+                        return 'dispatched';
+                    }})()"#
+                ),
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .to_string();
+        anyhow::ensure!(
+            dispatch_result == "\"dispatched\"",
+            "drag dispatch did not run: {dispatch_result}"
         );
-        // The wasm app needs a moment to render the day sections.
-        let mut executed = None;
-        for _ in 0..25 {
-            match driver
-                .execute(&script, Vec::<serde_json::Value>::new())
-                .await
-            {
-                Ok(_) => {
-                    executed = Some(());
-                    break;
-                }
-                Err(err) if err.to_string().contains("not found") => {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-        executed.context("drag pointer sequence failed (sections never rendered)")?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // The entry moved to date_b and left date_a.
         let mut moved = false;
@@ -2707,7 +2711,15 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        anyhow::ensure!(moved, "drag did not move the entry to {date_b}");
+        anyhow::ensure!(
+            moved,
+            "drag did not move the entry to {date_b}; entries now: {}",
+            http.get(format!("{base}/api/meal-plan"))
+                .send()
+                .await?
+                .text()
+                .await?
+        );
 
         // A completed drag must not open the recipe page.
         tokio::time::sleep(Duration::from_millis(400)).await;

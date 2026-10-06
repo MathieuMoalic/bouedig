@@ -3746,6 +3746,7 @@ struct PlanDrag {
     origin_date: String,
     recipe_id: i64,
     start_y: f64,
+    last_y: f64,
     armed: bool,
 }
 
@@ -3763,6 +3764,10 @@ fn MealPlanContent() -> Element {
     let mut plan_drag = use_signal(|| None::<PlanDrag>);
     let mut drag_target = use_signal(|| None::<String>);
     let mut suppress_open = use_signal(|| false);
+    // Day-section viewport rects for the drag hit-test, captured through
+    // the eval bridge when a drag arms (no DOM access natively).
+    let mut plan_day_rects = use_signal(|| None::<Vec<(String, f64, f64)>>);
+    let mut scroll_done = use_signal(|| false);
 
     use_effect(move || {
         if !loaded() {
@@ -3815,7 +3820,14 @@ fn MealPlanContent() -> Element {
     let drag_snapshot = plan_drag.read().clone();
     let drag_target_snapshot = drag_target.read().clone();
     // Dates only, for the drag hit-test: `days` itself moves into the rsx.
-    let day_dates: Vec<String> = days.iter().map(|d| d.date.clone()).collect();
+    // Open the tab on today, with the preloaded week above it.
+    use_effect(move || {
+        if loaded() && !scroll_done() {
+            scroll_done.set(true);
+            let today = today_value.clone();
+            scroll_plan_to_today(today);
+        }
+    });
 
     // Infinite scroll: approaching either end of the rendered range extends
     // it. The scroll flags come from the shared content scroller (Layout)
@@ -3850,16 +3862,20 @@ fn MealPlanContent() -> Element {
                         if (ev.client_coordinates().y - d.start_y).abs() < 8.0 {
                             return;
                         }
-                        plan_drag.with_mut(|s| if let Some(s) = s { s.armed = true; });
+                        plan_drag.with_mut(|s| {
+                            if let Some(s) = s {
+                                s.armed = true;
+                                s.last_y = ev.client_coordinates().y;
+                            }
+                        });
                     }
                     // Which rendered day section is under the pointer?
                     let y = ev.client_coordinates().y;
-                    let target = hit_test_plan_day(&day_dates, y);
+                    let target = hit_test_plan_day(plan_day_rects.read().clone().as_ref(), y);
                     drag_target.set(target);
                 },
                 onpointerup: move |_ev: PointerEvent| {
                     let Some(d) = plan_drag.read().clone() else { return };
-                    let target = drag_target.read().clone();
                     plan_drag.set(None);
                     drag_target.set(None);
                     if !d.armed {
@@ -3867,17 +3883,37 @@ fn MealPlanContent() -> Element {
                         return;
                     }
                     suppress_open.set(true);
-                    if let Some(date) = target {
-                        if date != d.origin_date {
-                            move_planned_entry(
-                                d.entry_id,
-                                d.recipe_id,
-                                date,
-                                entries,
-                                error,
-                            );
+                    // The highlight may lag the capture, so the drop
+                    // re-measures the day under the last pointer position.
+                    spawn(async move {
+                        // Eval the array directly: the evaluator stringifies
+                        // the result value itself, so JSON.stringify here
+                        // would come back as a string and fail to join.
+                        let rects = match dioxus::document::eval(
+                            "[...document.querySelectorAll('.plan-day')].map(el => { const r = el.getBoundingClientRect(); return [el.id.slice(9), r.top, r.bottom]; })",
+                        )
+                        .join::<Vec<(String, f64, f64)>>()
+                        .await
+                        {
+                            Ok(rects) => rects,
+                            Err(err) => {
+                                tracing::error!("drop hit-test failed: {err:#}");
+                                return;
+                            }
+                        };
+                        let target = hit_test_plan_day(Some(&rects), d.last_y);
+                        if let Some(date) = target {
+                            if date != d.origin_date {
+                                move_planned_entry(
+                                    d.entry_id,
+                                    d.recipe_id,
+                                    date,
+                                    entries,
+                                    error,
+                                );
+                            }
                         }
-                    }
+                    });
                 },
                 onpointerleave: move |_ev: PointerEvent| {
                     plan_drag.set(None);
@@ -3905,8 +3941,26 @@ fn MealPlanContent() -> Element {
                                 origin_date,
                                 recipe_id,
                                 start_y: y,
+                                last_y: y,
                                 armed: false,
                             }));
+                            // Snapshot the day rects for the hit-test (via the
+                            // eval bridge, so this also works in the mobile
+                            // webview). Eval the array directly: the
+                            // evaluator stringifies the result value itself,
+                            // so JSON.stringify here would come back as a
+                            // string and fail to join.
+                            spawn(async move {
+                                let rects = dioxus::document::eval(
+                                    "[...document.querySelectorAll('.plan-day')].map(el => { const r = el.getBoundingClientRect(); return [el.id.slice(9), r.top, r.bottom]; })",
+                                )
+                                .join::<Vec<(String, f64, f64)>>()
+                                .await;
+                                match rects {
+                                    Ok(rects) => plan_day_rects.set(Some(rects)),
+                                    Err(err) => tracing::error!("day rect capture failed: {err:#}"),
+                                }
+                            });
                         },
                         on_remove: move |entry_id: i64| {
                             spawn(async move {
@@ -4074,27 +4128,30 @@ struct PlanDay {
 }
 
 /// Which rendered day section contains the vertical position `y`?
-/// (wasm/webview only — the native shell never renders the UI.)
-fn hit_test_plan_day(dates: &[String], y: f64) -> Option<String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let window = web_sys::window()?;
-        let document = window.document()?;
-        for date in dates {
-            if let Some(el) = document.get_element_by_id(&format!("plan-day-{date}")) {
-                let rect = el.get_bounding_client_rect();
-                if y >= rect.top() && y <= rect.bottom() {
-                    return Some(date.clone());
-                }
-            }
-        }
-        None
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (dates, y);
-        None
-    }
+/// Works from the cached rects (captured via eval when the drag arms), so
+/// it behaves identically on the web and inside the mobile webview.
+fn hit_test_plan_day(
+    rects: Option<&Vec<(String, f64, f64)>>,
+    y: f64,
+) -> Option<String> {
+    let rects = rects?;
+    rects
+        .iter()
+        .find(|(_, top, bottom)| y >= *top && y <= *bottom)
+        .map(|(date, _, _)| date.clone())
+}
+
+/// Scroll the plan so today's section is at the top. One attempt a beat
+/// after mount: the day sections render with the initial paint.
+fn scroll_plan_to_today(today: String) {
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        dioxus::document::eval(&format!(
+            "document.getElementById('plan-day-{today}')?.scrollIntoView({{ block: 'start' }})"
+        ))
+        .await
+        .ok();
+    });
 }
 
 /// Move a planned entry to another day: optimistically re-date it locally,
