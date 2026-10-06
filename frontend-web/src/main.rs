@@ -3991,6 +3991,62 @@ fn day_label(date: &str, today: &str) -> String {
     format!("{weekday}, {rest}")
 }
 
+/// Offset in whole Sat→Fri weeks relative to the week containing today.
+/// Friday evening (from 17:00) is planning time — the household plans the
+/// upcoming Saturday-to-Friday week then — so the tab opens on next week
+/// from that moment; otherwise on the current week.
+fn initial_week_offset() -> i64 {
+    let now = js_sys::Date::new_0();
+    if now.get_day() == 5 && now.get_hours() >= 17 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The Saturday starting the Sat→Fri week `offset` weeks from the week
+/// containing `today`. Same pure UTC-millisecond arithmetic as `shift_iso`:
+/// date-only strings parse as UTC midnight, `getUTCDay()` is 0=Sun..6=Sat.
+fn week_start(today: &str, offset: i64) -> String {
+    let millis = js_sys::Date::parse(today);
+    if millis.is_nan() {
+        return today.to_string();
+    }
+    let d = js_sys::Date::new(&millis.into());
+    let days_since_saturday = ((d.get_utc_day() + 1) % 7) as i64;
+    shift_iso(today, 7 * offset - days_since_saturday)
+}
+
+/// "Sat 10 Oct" short label (en-GB, same locale style as `day_label`).
+fn short_date(date: &str) -> String {
+    let millis = js_sys::Date::parse(date);
+    if millis.is_nan() {
+        return date.to_string();
+    }
+    let d = js_sys::Date::new(&millis.into());
+    let weekday = d.to_locale_date_string(
+        "en-GB",
+        &js_sys::Object::from(js_sys::JSON::parse("{\"weekday\":\"short\"}").unwrap()),
+    );
+    let rest = d.to_locale_date_string(
+        "en-GB",
+        &js_sys::Object::from(
+            js_sys::JSON::parse("{\"day\":\"numeric\",\"month\":\"short\"}").unwrap(),
+        ),
+    );
+    format!("{weekday} {rest}")
+}
+
+/// Header title for the open week: This/Next/Last week, else the date range.
+fn week_title(offset: i64, start: &str) -> String {
+    match offset {
+        0 => "This week".into(),
+        1 => "Next week".into(),
+        -1 => "Last week".into(),
+        _ => format!("{} – {}", short_date(start), short_date(&shift_iso(start, 6))),
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct PlanDay {
     /// `YYYY-MM-DD`.
@@ -4028,6 +4084,41 @@ struct PlanDrag {
     armed: bool,
 }
 
+/// The meal a plain tap on a card's ≡ handle offered to move: the bottom
+/// sheet lists the open week's days to drop it on.
+#[derive(Clone, PartialEq)]
+struct MoveTarget {
+    entry_id: i64,
+    recipe_id: i64,
+    name: String,
+    origin_date: String,
+}
+
+/// A plain tap on a card's ≡ handle (pointerup without a drag): offer to
+/// move the meal to another day of the open week via the bottom sheet.
+/// Binds before reading so the signal guard can't outlive the lookup.
+fn open_move_sheet(
+    drag: &PlanDrag,
+    entries: Signal<Vec<MealPlanEntry>>,
+    mut move_sheet: Signal<Option<MoveTarget>>,
+    mut suppress_open: Signal<bool>,
+) {
+    let found = entries
+        .read()
+        .iter()
+        .find(|e| e.id == drag.entry_id)
+        .map(|e| (e.recipe.id, e.recipe.name.clone(), e.date.clone()));
+    suppress_open.set(true);
+    if let Some((recipe_id, name, origin_date)) = found {
+        move_sheet.set(Some(MoveTarget {
+            entry_id: drag.entry_id,
+            recipe_id,
+            name,
+            origin_date,
+        }));
+    }
+}
+
 #[component]
 fn MealPlanContent() -> Element {
     let mut entries = use_signal(Vec::<MealPlanEntry>::new);
@@ -4062,23 +4153,22 @@ fn MealPlanContent() -> Element {
         }
     });
 
-    // The rendered day range. It starts small (3 days back, 3 weeks ahead)
-    // and grows a week at a time as the reader scrolls toward either end.
-    // A week of history preloaded above today.
-    let back = use_signal(|| 7i64);
-    let forward = use_signal(|| 21i64);
-    // Day-section viewport rects for the drag hit-test, captured through
-    // the eval bridge when a drag arms.
-    let mut scroll_done = use_signal(|| false);
+    // The open Sat→Fri week: 0 = the week containing today. Friday evening
+    // opens on next week (see `initial_week_offset`).
+    let mut week_offset = use_signal(initial_week_offset);
+    // A plain tap on a card's ≡ handle opens the "Move to day…" sheet.
+    let mut move_sheet = use_signal(|| None::<MoveTarget>);
 
-    // Group every day in the range: entries grouped per day, empty days
-    // render with their ⊕ so any day is plannable.
+    // The seven days of the open week: entries grouped per day, empty days
+    // render with their ⊕ so any day is plannable. All entries are already
+    // in memory, so flipping weeks is instant.
     let today_value = today.read().clone();
-    let back_value = back.read().clone();
-    let forward_value = forward.read().clone();
-    let mut days: Vec<PlanDay> = ((-back_value)..=forward_value)
-        .map(|offset| {
-            let date = shift_iso(&today_value, offset);
+    let week_offset_value = week_offset.read().clone();
+    let week_start_date = week_start(&today_value, week_offset_value);
+    let week_heading = week_title(week_offset_value, &week_start_date);
+    let days: Vec<PlanDay> = (0..7)
+        .map(|i| {
+            let date = shift_iso(&week_start_date, i);
             PlanDay {
                 label: day_label(&date, &today_value),
                 entries: entries
@@ -4091,42 +4181,53 @@ fn MealPlanContent() -> Element {
             }
         })
         .collect();
-    days.sort_by(|a, b| a.date.cmp(&b.date));
 
     // Bind the drag snapshots before rsx: one read per repaint.
     let drag_snapshot = plan_drag.read().clone();
     let drag_target_snapshot = drag_target.read().clone();
+    let move_sheet_snapshot = move_sheet.read().clone();
     // The drag hit-test needs no captured day list: it re-reads the rendered
     // `.plan-day` ids from the DOM (closures inside the `for day in days`
     // rsx loop are `FnMut` and can never move-capture a `Vec`).
-
-    // Infinite scroll: a light poll watches the content scroller. While the
-    // reader is actively scrolling toward an end, the range grows a week at
-    // a time to fill the timeline; prepends compensate the scroll position
-    // so the view stays put. Polling (instead of scroll events) works in
-    // every webview, including ones that swallow programmatic scroll events.
-    // Open the tab on today, with the preloaded week above it.
-    use_effect(move || {
-        if loaded() && !scroll_done() {
-            scroll_done.set(true);
-            scroll_plan_to_today(today_value.clone());
-        }
-    });
-
-    #[cfg(target_arch = "wasm32")]
-    extend_plan_range_on_scroll(back, forward);
 
     rsx! {
         div { class: "page",
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
-            // The keyed day list lives in its own container: mixing a keyed
-            // list with static siblings panics dioxus's differ when the
-            // range grows.
+            // Week pager head: previous / title / (jump to today) / next.
+            div { class: "plan-week-head",
+                button {
+                    id: "plan-week-prev",
+                    class: "plan-week-btn",
+                    r#type: "button",
+                    title: "Previous week",
+                    onclick: move |_| week_offset.with_mut(|v| *v -= 1),
+                    IconBack {}
+                }
+                div { class: "plan-week-mid",
+                    span { class: "plan-week-title", "{week_heading}" }
+                    if week_offset_value != 0 {
+                        button {
+                            id: "plan-week-today",
+                            class: "plan-week-today",
+                            r#type: "button",
+                            onclick: move |_| week_offset.set(0),
+                            "Today"
+                        }
+                    }
+                }
+                button {
+                    id: "plan-week-next",
+                    class: "plan-week-btn icon-flip",
+                    r#type: "button",
+                    title: "Next week",
+                    onclick: move |_| week_offset.with_mut(|v| *v += 1),
+                    IconBack {}
+                }
+            }
             div {
                 class: "plan-days",
-                key: "{back_value}-{forward_value}",
                 onpointermove: move |ev: PointerEvent| {
                     let Some(d) = plan_drag.read().clone() else { return };
                     if !d.armed {
@@ -4150,7 +4251,8 @@ fn MealPlanContent() -> Element {
                     plan_drag.set(None);
                     drag_target.set(None);
                     if !d.armed {
-                        // Plain tap: let the card's onclick open the recipe.
+                        // Plain tap on the handle: offer to move the meal.
+                        open_move_sheet(&d, entries, move_sheet, suppress_open);
                         return;
                     }
                     suppress_open.set(true);
@@ -4215,11 +4317,17 @@ fn MealPlanContent() -> Element {
                         },
                         on_card_drop: move |(entry_id, y): (i64, f64)| {
                             let Some(d) = plan_drag.read().clone() else { return };
-                            if !d.armed || d.entry_id != entry_id {
+                            if d.entry_id != entry_id {
                                 return;
                             }
                             plan_drag.set(None);
                             drag_target.set(None);
+                            if !d.armed {
+                                // Plain tap on the handle (mouse released on
+                                // it): offer to move the meal.
+                                open_move_sheet(&d, entries, move_sheet, suppress_open);
+                                return;
+                            }
                             suppress_open.set(true);
                             let target = hit_test_plan_day(y);
                             if let Some(date) = target {
@@ -4274,6 +4382,7 @@ fn MealPlanContent() -> Element {
                     date: state.date.clone(),
                     label: state.label.clone(),
                     recipes: recipes.read().clone(),
+                    on_cancel: move |_| picker.set(None),
                     on_add: move |(date, recipe_id): (String, i64)| {
                         picker.set(None);
                         spawn(async move {
@@ -4303,62 +4412,23 @@ fn MealPlanContent() -> Element {
                     },
                 }
             }
+
+            if let Some(target) = move_sheet_snapshot {
+                MoveSheet {
+                    key: "{target.entry_id}",
+                    target,
+                    week_start: week_start_date.clone(),
+                    today: today_value.clone(),
+                    entries: entries.read().clone(),
+                    on_move: move |(entry_id, recipe_id, date): (i64, i64, String)| {
+                        move_sheet.set(None);
+                        move_planned_entry(entry_id, recipe_id, date, entries, error);
+                    },
+                    on_cancel: move |_| move_sheet.set(None),
+                }
+            }
         }
     }
-}
-
-/// Watch the content scroller and grow the rendered plan range toward
-/// whichever end the reader approaches (wasm only — the UI runs in the
-/// webview; the native shell never renders, so this is compiled out there).
-#[cfg(target_arch = "wasm32")]
-fn extend_plan_range_on_scroll(mut back: Signal<i64>, mut forward: Signal<i64>) {
-    spawn(async move {
-        let mut last_top: i64 = 0;
-        let mut pending: Option<(i64, i64)> = None; // (pre-extension height, user's scroll pos)
-        loop {
-            let promise = js_sys::Promise::new(&mut |resolve, _| {
-                if let Some(window) = web_sys::window() {
-                    let _ = window
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                            &resolve,
-                            250,
-                        );
-                }
-            });
-            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-            let Some(window) = web_sys::window() else { continue };
-            let Some(document) = window.document() else { continue };
-            let Some(element) = document
-                .get_element_by_id("content-scroller")
-                .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
-            else {
-                continue;
-            };
-
-            // A backward extension rendered since the last tick: restore
-            // the reader's viewport over the prepended days.
-            if let Some((pre_height, user_top)) = pending.take() {
-                let delta = element.scroll_height() as i64 - pre_height;
-                if delta > 0 {
-                    element.set_scroll_top((user_top + delta) as i32);
-                }
-            }
-
-            let top = element.scroll_top() as i64;
-            let height = element.scroll_height() as i64;
-            let client = element.client_height() as i64;
-            let bottom_dist = height - (top + client);
-            let moving_up = top < last_top;
-
-            if bottom_dist < 400 && forward() < 370 {
-                forward.set((forward() + 7).min(370));
-            } else if moving_up && top < 400 && back() < 365 {
-                back.set(back + 7);
-                pending = Some((height, top));
-            }
-            last_top = top;
-        }
-    });
 }
 
 /// Which rendered day section contains the viewport position `y`?
@@ -4389,20 +4459,6 @@ fn hit_test_plan_day(y: f64) -> Option<String> {
 #[cfg(not(target_arch = "wasm32"))]
 fn hit_test_plan_day(_y: f64) -> Option<String> {
     None
-}
-
-/// Scroll the plan so today's section is at the top. One attempt a beat
-/// after mount: the day sections render with the initial paint, so no
-/// retry loop is needed (a retry would fight the reader's scrolling).
-fn scroll_plan_to_today(today: String) {
-    spawn(async move {
-        sleep_ms(300).await;
-        dioxus::document::eval(&format!(
-            "document.getElementById('plan-day-{today}')?.scrollIntoView({{ block: 'start' }})"
-        ))
-        .await
-        .ok();
-    });
 }
 
 /// Move a planned entry to another day: optimistically re-date it locally,
@@ -4535,7 +4591,7 @@ fn PlanDaySection(
                         button {
                             class: "plan-drag-handle",
                             r#type: "button",
-                            title: "Drag to another day",
+                            title: "Drag or tap to move",
                             onpointerdown: move |ev: PointerEvent| {
                                 ev.stop_propagation();
                                 on_card_down.call((
@@ -4596,6 +4652,7 @@ fn PlanPicker(
     date: String,
     label: String,
     recipes: Vec<Recipe>,
+    on_cancel: EventHandler<()>,
     on_add: EventHandler<(String, i64)>,
 ) -> Element {
     let mut search = use_signal(String::new);
@@ -4612,8 +4669,9 @@ fn PlanPicker(
 
     rsx! {
         div { class: "dialog-backdrop",
-            onclick: move |_| {},
+            onclick: move |_| on_cancel.call(()),
             div { class: "dialog plan-picker", role: "dialog",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
                 h2 { class: "dialog-title", "Add to {label}" }
                 input {
                     id: "plan-search",
@@ -4622,7 +4680,6 @@ fn PlanPicker(
                     value: "{search}",
                     oninput: move |e: FormEvent| search.set(e.value()),
                 }
-                div { class: "plan-picker-list",
                 div { class: "plan-picker-list",
                     for recipe in matches {
                         PlanPickerRow {
@@ -4638,6 +4695,91 @@ fn PlanPicker(
                         p { class: "empty", "No recipes match." }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Bottom sheet offering to move a planned meal to another day of the open
+/// Sat→Fri week, blaz style: every day shows the recipes already planned on
+/// it (thumbnails), or "Nothing planned". Tapping the meal's current day
+/// just closes the sheet.
+#[component]
+fn MoveSheet(
+    target: MoveTarget,
+    week_start: String,
+    today: String,
+    entries: Vec<MealPlanEntry>,
+    on_move: EventHandler<(i64, i64, String)>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    // Copy-only pieces: the row closures are FnMut and could never each own
+    // a String from `target`.
+    let move_entry_id = target.entry_id;
+    let move_recipe_id = target.recipe_id;
+    let days: Vec<(String, String, Vec<MealPlanEntry>, bool)> = (0..7)
+        .map(|i| {
+            let date = shift_iso(&week_start, i);
+            let label = day_label(&date, &today);
+            let planned: Vec<MealPlanEntry> =
+                entries.iter().filter(|e| e.date == date).cloned().collect();
+            let is_origin = date == target.origin_date;
+            (date, label, planned, is_origin)
+        })
+        .collect();
+
+    rsx! {
+        div { class: "sheet-backdrop",
+            onclick: move |_| on_cancel.call(()),
+            div { class: "sheet", role: "dialog",
+                onclick: move |e: MouseEvent| e.stop_propagation(),
+                h2 { class: "sheet-title", "Move \u{201c}{target.name}\u{201d} to…" }
+                div { class: "sheet-list day-list",
+                    for (date, label, planned, is_origin) in days {
+                        button {
+                            id: "move-day-{date}",
+                            class: "day-btn",
+                            r#type: "button",
+                            onclick: move |_| {
+                                if is_origin {
+                                    on_cancel.call(());
+                                } else {
+                                    on_move.call((move_entry_id, move_recipe_id, date.clone()));
+                                }
+                            },
+                            div { class: "day-main",
+                                span { class: "day-label", "{label}" }
+                                if planned.is_empty() {
+                                    span { class: "day-none", "Nothing planned" }
+                                } else {
+                                    div { class: "day-thumbs",
+                                        for entry in planned.iter() {
+                                            div { class: "day-thumb",
+                                                if let Some(thumb) = &entry.recipe.thumb {
+                                                    img { src: "{thumb}", alt: "{entry.recipe.name}" }
+                                                } else {
+                                                    div { class: "day-thumb-placeholder",
+                                                        {entry.recipe.name.chars().next().unwrap_or('?').to_string()}
+                                                    }
+                                                }
+                                                span { class: "day-thumb-name", "{entry.recipe.name}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            span { class: "day-chevron", "›" }
+                        }
+                    }
+                }
+                div { class: "sheet-actions day-actions",
+                    button {
+                        id: "move-cancel",
+                        class: "dialog-btn day-cancel",
+                        r#type: "button",
+                        onclick: move |_| on_cancel.call(()),
+                        "Cancel"
+                    }
                 }
             }
         }

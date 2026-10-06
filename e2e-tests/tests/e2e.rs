@@ -2009,9 +2009,9 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
         driver.goto(format!("{base}/meal-plan")).await?;
         wait_for_url_path(&driver, "/meal-plan").await?;
 
-        // The rolling range renders many days (a week back, two months
-        // ahead) — every day is plannable. The wasm client needs a moment
-        // to boot, so poll for the first render.
+        // The week pager renders exactly seven day sections (Sat→Fri).
+        // The wasm client needs a moment to boot, so poll for the first
+        // render.
         let mut day_count: i64 = 0;
         for _ in 0..50 {
             day_count = driver
@@ -2028,33 +2028,115 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        // The lazy window starts at 25 sections (3 back, today, 21 ahead)
-        // and grows a week at a time as the reader approaches an end.
         anyhow::ensure!(
-            day_count >= 20 && day_count <= 40,
-            "unexpected initial window: {day_count} sections"
+            day_count == 7,
+            "expected 7 day sections in the week pager, got {day_count}"
         );
 
-        // Infinite scroll: driving the content scroller to its bottom must
-        // extend the range automatically (no buttons).
-        driver
-            .execute(
-                "var c = document.querySelector('.content'); c.scrollTop = c.scrollHeight;",
-                Vec::<serde_json::Value>::new(),
-            )
+        // Smart default: on Friday evening the tab opens on next week
+        // (planning time); otherwise on the current week. Normalize to the
+        // current week for the rest of this flow.
+        let title_text = driver
+            .find(By::Css(".plan-week-title"))
+            .await?
+            .text()
             .await?;
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let extended = driver
+        anyhow::ensure!(
+            title_text == "This week" || title_text == "Next week",
+            "unexpected week title: {title_text}"
+        );
+        if title_text == "Next week" {
+            driver
+                .find(By::Id("plan-week-today"))
+                .await?
+                .click()
+                .await?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        let title_text = driver
+            .find(By::Css(".plan-week-title"))
+            .await?
+            .text()
+            .await?;
+        anyhow::ensure!(
+            title_text == "This week",
+            "the Today button must return to the current week, got {title_text}"
+        );
+
+        // The current week runs Saturday→Friday and contains today.
+        let first_label = driver
             .execute(
-                "return document.querySelectorAll('.plan-day').length;",
+                "return document.querySelector('.plan-day-label').textContent;",
                 Vec::<serde_json::Value>::new(),
             )
             .await?
-            .json().as_i64().context("day count not a number")
-            .context("extended day count missing")?;
+            .json()
+            .as_str()
+            .context("first label missing")?
+            .to_string();
         anyhow::ensure!(
-            extended > day_count,
-            "scrolling to the bottom must extend the range: {day_count} -> {extended}"
+            first_label.starts_with("Sat, "),
+            "the week must start on Saturday, got {first_label:?}"
+        );
+        driver
+            .find(By::XPath(
+                "//div[contains(@class, 'plan-day')][.//span[@class='plan-day-label' and text()='Today']]",
+            ))
+            .await
+            .context("the current week must contain today")?;
+
+        // Arrows flip weeks: next shifts every date by seven days, prev
+        // comes back to the identical week.
+        let first_id_script = "return document.querySelector('.plan-day').id;";
+        let before = driver
+            .execute(first_id_script, Vec::<serde_json::Value>::new())
+            .await?
+            .json()
+            .as_str()
+            .context("first day id missing")?
+            .to_string();
+        driver
+            .find(By::Id("plan-week-next"))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let title_text = driver
+            .find(By::Css(".plan-week-title"))
+            .await?
+            .text()
+            .await?;
+        anyhow::ensure!(
+            title_text == "Next week",
+            "the next arrow must move to next week, got {title_text}"
+        );
+        let after = driver
+            .execute(first_id_script, Vec::<serde_json::Value>::new())
+            .await?
+            .json()
+            .as_str()
+            .context("first day id missing")?
+            .to_string();
+        anyhow::ensure!(
+            before != after,
+            "next week must shift the rendered days: {before} -> {after}"
+        );
+        driver
+            .find(By::Id("plan-week-prev"))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let restored = driver
+            .execute(first_id_script, Vec::<serde_json::Value>::new())
+            .await?
+            .json()
+            .as_str()
+            .context("first day id missing")?
+            .to_string();
+        anyhow::ensure!(
+            restored == before,
+            "the previous arrow must restore the original week"
         );
 
         // Every rendered day must be unique — duplicated sections were the
@@ -2599,9 +2681,50 @@ fn tiny_png() -> Vec<u8> {
     b64_decode(B64)
 }
 
+/// The seven dates of the Sat→Fri week the app opens on (mirrors the
+/// clients' `initial_week_offset`: Friday from 17:00 counts as next week —
+/// planning time).
+fn initial_plan_week() -> [String; 7] {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    let offset: i64 = if now.weekday() == chrono::Weekday::Fri && now.hour() >= 17 {
+        1
+    } else {
+        0
+    };
+    let days_since_saturday = (now.weekday().num_days_from_monday() + 2) % 7;
+    let start = now.date_naive()
+        - chrono::Duration::days(days_since_saturday as i64)
+        + chrono::Duration::weeks(offset);
+    std::array::from_fn(|i| {
+        (start + chrono::Duration::days(i as i64))
+            .format("%Y-%m-%d")
+            .to_string()
+    })
+}
+
+/// Wait for the wasm meal plan to render its seven day sections.
+async fn wait_for_plan_render(driver: &thirtyfour::WebDriver) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let count = driver
+            .execute(
+                "return document.querySelectorAll('.plan-day').length;",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_i64()
+            .context("day count not a number")?;
+        if count == 7 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("meal plan week pager did not render 7 sections")
+}
+
 /// Dragging a planned card from one day onto another moves the entry
-/// (DELETE + re-add under the hood), does NOT navigate to the recipe, and
-/// the tap-without-drag still opens the recipe.
+/// (DELETE + re-add under the hood) and does NOT navigate to the recipe.
 #[tokio::test(flavor = "multi_thread")]
 async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
@@ -2611,7 +2734,8 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
     wait_for_port(&addr.to_string()).await?;
     wait_for_port(&webdriver_addr()).await?;
 
-    // Seed a recipe and plan it for today+2.
+    // Seed a recipe and plan it inside the week the pager opens on, so both
+    // sections are always rendered (all seven days are in the DOM).
     let (status, body) = json_post(
         &http,
         &base,
@@ -2623,12 +2747,9 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
     let recipe_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
         .as_i64()
         .unwrap();
-    let date_a = (chrono::Local::now().date_naive() + chrono::Duration::days(2))
-        .format("%Y-%m-%d")
-        .to_string();
-    let date_b = (chrono::Local::now().date_naive() + chrono::Duration::days(3))
-        .format("%Y-%m-%d")
-        .to_string();
+    let week = initial_plan_week();
+    let date_a = week[2].clone();
+    let date_b = week[3].clone();
     let status = http
         .post(format!("{base}/api/meal-plan"))
         .json(&serde_json::json!({ "date": date_a, "recipe_id": recipe_id }))
@@ -2641,24 +2762,12 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
     let result = (|| async {
         driver.goto(format!("{base}/meal-plan")).await?;
         wait_for_url_path(&driver, "/meal-plan").await?;
+        wait_for_plan_render(&driver).await?;
 
-        // Drag the entry by its handle to the next day through the real
-        // input pipeline (trusted pointer events, like a finger). The
-        // handle is pre-scrolled into view; the drop coordinate is the
-        // target day's center.
-        // The wasm app renders the day sections a beat after page load and
-        // then scrolls itself to today (300ms after mount). Let that settle
-        // first, otherwise the app scrolls the handle back out of view.
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        driver
-            .execute(
-                &format!(
-                    "document.getElementById('plan-day-{date_a}')?.scrollIntoView({{ block: 'start' }}); void 0;"
-                ),
-                Vec::<serde_json::Value>::new(),
-            )
-            .await?;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Drag the entry by its handle onto the next day. Synthetic events
+        // on the handle reach the app's own element listeners; the drop
+        // coordinate is the target day's center (offscreen is fine — the
+        // hit-test works on client coordinates).
         let dispatch_result = driver
             .execute(
                 &format!(
@@ -2666,7 +2775,6 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
                         const h = document.querySelector('#plan-day-{date_a} .plan-drag-handle');
                         if (!h) return 'no handle';
                         const cr = h.getBoundingClientRect();
-                        if (cr.top < 0 || cr.top > window.innerHeight) return 'handle offscreen';
                         const opts = {{ bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, pointerType: 'mouse' }};
                         h.dispatchEvent(new PointerEvent('pointerdown', {{ ...opts, clientX: cr.left + 8, clientY: cr.top + 10 }}));
                         setTimeout(function () {{
@@ -2727,6 +2835,131 @@ async fn meal_plan_drag_move_flow() -> anyhow::Result<()> {
         anyhow::ensure!(
             !url.path().starts_with("/recipe/"),
             "drag trailing click navigated to {}",
+            url.path()
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// A plain tap on a card's ≡ handle opens the "Move to day…" sheet; picking
+/// another day of the open week moves the meal there, and the sheet never
+/// navigates to the recipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn meal_plan_move_sheet_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    let (status, body) = json_post(
+        &http,
+        &base,
+        "/api/recipes",
+        r#"{"name":"Movable Pie","sections":[],"ingredients":[],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}"#,
+    )
+    .await?;
+    anyhow::ensure!(status == 201, "recipe seed failed: {body}");
+    let recipe_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+        .as_i64()
+        .unwrap();
+    let week = initial_plan_week();
+    let date_a = week[2].clone();
+    let date_b = week[4].clone();
+    let status = http
+        .post(format!("{base}/api/meal-plan"))
+        .json(&serde_json::json!({ "date": date_a, "recipe_id": recipe_id }))
+        .send()
+        .await?
+        .status();
+    anyhow::ensure!(status.as_u16() == 201, "meal-plan seed failed: {status}");
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/meal-plan")).await?;
+        wait_for_url_path(&driver, "/meal-plan").await?;
+        wait_for_plan_render(&driver).await?;
+
+        // Plain click on the handle (no drag): the sheet opens and the
+        // recipe does NOT open.
+        driver
+            .find(By::Css(&format!(
+                "#plan-day-{date_a} .plan-drag-handle"
+            )))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let sheet_title = driver
+            .find(By::Css(".sheet-title"))
+            .await
+            .context("the move sheet did not open")?
+            .text()
+            .await?;
+        anyhow::ensure!(
+            sheet_title.contains("Movable Pie"),
+            "unexpected sheet title: {sheet_title}"
+        );
+        let rows = driver
+            .execute(
+                "return document.querySelectorAll('.sheet .day-btn').length;",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_i64()
+            .context("row count not a number")?;
+        anyhow::ensure!(
+            rows == 7,
+            "the move sheet must list the week's 7 days, got {rows}"
+        );
+
+        // Pick another day: the entry moves.
+        driver
+            .find(By::Id(&format!("move-day-{date_b}")))
+            .await?
+            .click()
+            .await?;
+        let mut moved = false;
+        for _ in 0..50 {
+            let entries: Vec<serde_json::Value> = http
+                .get(format!("{base}/api/meal-plan"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            let in_b = entries
+                .iter()
+                .any(|e| e["date"] == serde_json::json!(date_b) && e["recipe"]["id"] == serde_json::json!(recipe_id));
+            let in_a = entries
+                .iter()
+                .any(|e| e["date"] == serde_json::json!(date_a) && e["recipe"]["id"] == serde_json::json!(recipe_id));
+            if in_b && !in_a {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(
+            moved,
+            "move sheet did not move the entry to {date_b}; entries now: {}",
+            http.get(format!("{base}/api/meal-plan"))
+                .send()
+                .await?
+                .text()
+                .await?
+        );
+
+        // The sheet tap must not navigate to the recipe page.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let url = driver.current_url().await?;
+        anyhow::ensure!(
+            !url.path().starts_with("/recipe/"),
+            "move sheet trailing click navigated to {}",
             url.path()
         );
         Ok(())

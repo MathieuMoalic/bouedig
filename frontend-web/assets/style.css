@@ -1619,6 +1619,67 @@ ol.instruction-list li {
 /* Meal plan                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Week pager head: previous / title / (jump to today) / next. */
+.plan-week-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 2px 12px;
+}
+
+.plan-week-mid {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.plan-week-title {
+    font-weight: 700;
+    font-size: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.plan-week-btn {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border: none;
+    border-radius: 50%;
+    background: var(--pill);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.plan-week-btn:hover {
+    background: var(--accent);
+    color: #fff;
+}
+
+.plan-week-today {
+    flex: none;
+    border: none;
+    border-radius: 999px;
+    padding: 4px 12px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+/* Mirrors a left-pointing icon into a right-pointing one. */
+.icon-flip {
+    transform: scaleX(-1);
+}
+
 .plan-day {
     background: var(--surface);
     border-radius: 14px;
@@ -1906,11 +1967,4 @@ ol.instruction-list li {
 .plan-drag-handle .icon {
     width: 14px;
     height: 14px;
-}
-
-/* The meal plan grows backward by prepending days and compensating the
-   scroll position itself; the browser's scroll anchoring would double-
-   correct and make upward scrolling jump around. */
-#content-scroller {
-    overflow-anchor: none;
 }
