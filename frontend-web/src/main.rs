@@ -2611,6 +2611,11 @@ fn RecipeDetail(id: i64) -> Element {
     let mut error = use_signal(|| String::new());
     let mut confirm_delete = use_signal(|| false);
     let mut scale_text = use_signal(|| String::from("1"));
+    // Cooking check-off: tap an ingredient line or a step to strike it
+    // through, tap again to clear. Session-only by design — it resets when
+    // the page is left or reloaded.
+    let mut crossed_ingredients = use_signal(|| HashSet::<usize>::new());
+    let mut crossed_steps = use_signal(|| HashSet::<usize>::new());
     let mut cart_sheet = use_signal(|| false);
     let mut day_chooser = use_signal(|| false);
     let mut added_note = use_signal(|| String::new());
@@ -2648,8 +2653,9 @@ fn RecipeDetail(id: i64) -> Element {
     let effective_scale = if scale_valid { scale.unwrap() } else { 1.0 };
 
     // Detail view ingredient grouping: unsectioned items first, then one
-    // group per section (in order).
-    let detail_groups: Vec<(Option<String>, Vec<Ingredient>)> = loaded
+    // group per section (in order). Each line carries a stable index for
+    // the tap-to-cross check-off.
+    let detail_groups: Vec<(Option<String>, Vec<(usize, Ingredient)>)> = loaded
         .as_ref()
         .map(|d| {
             let mut groups: Vec<(Option<String>, Vec<Ingredient>)> = Vec::new();
@@ -2672,7 +2678,20 @@ fn RecipeDetail(id: i64) -> Element {
                         .collect(),
                 ));
             }
+            let mut index = 0usize;
             groups
+                .into_iter()
+                .map(|(section, group)| {
+                    let numbered = group
+                        .into_iter()
+                        .map(|ingredient| {
+                            index += 1;
+                            (index, ingredient)
+                        })
+                        .collect::<Vec<_>>();
+                    (section, numbered)
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -2818,10 +2837,18 @@ fn RecipeDetail(id: i64) -> Element {
                                 id: "scale-input",
                                 class: if scale_valid { "" } else { "invalid" },
                                 r#type: "text",
+                                inputmode: "decimal",
+                                autocomplete: "off",
                                 value: "{scale_value}",
                                 oninput: move |e: FormEvent| {
-                                    let v = e.value();
-                                    scale_text.set(v);
+                                    // Numbers only: keep digits and the decimal
+                                    // point, drop everything else as typed.
+                                    let cleaned: String = e
+                                        .value()
+                                        .chars()
+                                        .filter(|c| c.is_ascii_digit() || *c == '.')
+                                        .collect();
+                                    scale_text.set(cleaned);
                                 },
                             }
                             if scale_valid {
@@ -2848,8 +2875,22 @@ fn RecipeDetail(id: i64) -> Element {
                                         div { class: "detail-section-title", "{name}" }
                                     }
                                     ul { class: "ingredient-list",
-                                        for ingredient in group {
-                                            li { class: "ingredient-item", "{ingredient_line(ingredient, effective_scale)}" }
+                                        for &(index, ref ingredient) in group {
+                                            li {
+                                                class: if crossed_ingredients.read().contains(&index) {
+                                                    "ingredient-item crossed"
+                                                } else {
+                                                    "ingredient-item"
+                                                },
+                                                onclick: move |_| {
+                                                    crossed_ingredients.with_mut(|s| {
+                                                        if !s.remove(&index) {
+                                                            s.insert(index);
+                                                        }
+                                                    });
+                                                },
+                                                "{ingredient_line(ingredient, effective_scale)}"
+                                            }
                                         }
                                     }
                                 }
@@ -2869,8 +2910,21 @@ fn RecipeDetail(id: i64) -> Element {
                                         div { class: "detail-section-title", "{name}" }
                                     }
                                     ol { class: "instruction-list",
-                                        for (number, step) in group {
-                                            li { key: "{number}", class: "instruction-item",
+                                        for &(number, ref step) in group {
+                                            li {
+                                                key: "{number}",
+                                                class: if crossed_steps.read().contains(&number) {
+                                                    "instruction-item crossed"
+                                                } else {
+                                                    "instruction-item"
+                                                },
+                                                onclick: move |_| {
+                                                    crossed_steps.with_mut(|s| {
+                                                        if !s.remove(&number) {
+                                                            s.insert(number);
+                                                        }
+                                                    });
+                                                },
                                                 span { class: "step-badge", "{number}" }
                                                 span { class: "step-text", "{step.text}" }
                                             }

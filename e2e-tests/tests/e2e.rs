@@ -777,7 +777,10 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
                 prep: None,
                 section: None,
             }],
-            instructions: vec![],
+            instructions: vec![InstructionStep {
+                text: "Mix the flour with water.".into(),
+                section: None,
+            }],
             instruction_sections: vec![],
             notes: String::new(),
             yield_amount: String::new(),
@@ -838,6 +841,82 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
         anyhow::ensure!(
             text.contains("200 g Flour"),
             "reset did not restore 1x: {text}"
+        );
+
+        // The scale field is numbers-only: typed letters are dropped as they
+        // come (the value stays "1" after the reset above).
+        driver
+            .find(By::Id("scale-input"))
+            .await?
+            .send_keys("abc")
+            .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let value = driver
+            .find(By::Id("scale-input"))
+            .await?
+            .prop("value")
+            .await?
+            .unwrap_or_default();
+        anyhow::ensure!(
+            value == "1",
+            "scale field must strip non-numeric input, got {value:?}"
+        );
+        driver.find(By::Id("scale-reset")).await?.click().await?;
+
+        // Tapping an ingredient line strikes it through; tapping again
+        // clears it (session-only check-off).
+        let line = driver
+            .find(By::Css(".ingredient-item"))
+            .await
+            .context("ingredient line missing")?;
+        line.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let crossed = driver
+            .find(By::Css(".ingredient-item.crossed"))
+            .await
+            .is_ok();
+        anyhow::ensure!(crossed, "tapping an ingredient must cross it out");
+        driver.find(By::Css(".ingredient-item.crossed")).await?.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        anyhow::ensure!(
+            driver.find(By::Css(".ingredient-item.crossed")).await.is_err(),
+            "second tap must clear the check-off"
+        );
+
+        // Steps: the number badge sits inline with the text (same top edge)
+        // and tapping the step crosses it, tapping again clears it.
+        let step = driver.find(By::Css(".instruction-item")).await?;
+        let badge_top = step
+            .find(By::Css(".step-badge"))
+            .await?
+            .rect()
+            .await?
+            .y;
+        let text_top = step
+            .find(By::Css(".step-text"))
+            .await?
+            .rect()
+            .await?
+            .y;
+        anyhow::ensure!(
+            (badge_top - text_top).abs() < 6.0,
+            "step number must be inline with the text (badge {badge_top} vs text {text_top})"
+        );
+        step.click().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        anyhow::ensure!(
+            driver.find(By::Css(".instruction-item.crossed")).await.is_ok(),
+            "tapping a step must cross it out"
+        );
+        driver
+            .find(By::Css(".instruction-item.crossed"))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        anyhow::ensure!(
+            driver.find(By::Css(".instruction-item.crossed")).await.is_err(),
+            "second tap must clear the step check-off"
         );
 
         // The stored recipe is untouched by scaling.

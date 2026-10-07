@@ -621,11 +621,57 @@ ol.instruction-list {
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 10px;
 }
 
-ol.instruction-list li {
-    padding-left: 4px;
+/* Number inline with the text: badge left, step text flowing beside it. */
+ol.instruction-list li.instruction-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding-left: 0;
+    cursor: pointer;
+}
+
+.step-badge {
+    flex: none;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+}
+
+.step-text {
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+
+/* Cooking check-off: tapped lines are struck through and dimmed. The step
+   badge stays colored so the numbering keeps reading. */
+.ingredient-item {
+    cursor: pointer;
+}
+
+.ingredient-item.crossed {
+    text-decoration: line-through;
+    color: var(--muted);
+}
+
+.instruction-item.crossed .step-text {
+    text-decoration: line-through;
+    color: var(--muted);
+}
+
+.instruction-item.crossed .step-badge {
+    background: var(--pill);
+    color: var(--muted);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1339,25 +1385,6 @@ ol.instruction-list li {
 
 .list-add:hover {
     background: rgba(255, 255, 255, 0.03);
-}
-
-.step-badge {
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    background: var(--accent);
-    color: #fff;
-    font-size: 13px;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-}
-
-.step-text {
-    flex: 1;
-    overflow-wrap: anywhere;
 }
 
 /* Modal text inputs */
