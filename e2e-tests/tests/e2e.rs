@@ -843,8 +843,9 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
             "reset did not restore 1x: {text}"
         );
 
-        // The scale field is numbers-only: typed letters are dropped as they
-        // come (the value stays "1" after the reset above).
+        // The scale field is numbers-only, and focusing it selects the whole
+        // value: typed letters replace the selection and are stripped (the
+        // field ends up empty), and a digit typed afterwards lands alone.
         driver
             .find(By::Id("scale-input"))
             .await?
@@ -858,8 +859,24 @@ async fn scale_multiplies_quantities() -> anyhow::Result<()> {
             .await?
             .unwrap_or_default();
         anyhow::ensure!(
-            value == "1",
+            value.is_empty(),
             "scale field must strip non-numeric input, got {value:?}"
+        );
+        driver
+            .find(By::Id("scale-input"))
+            .await?
+            .send_keys("2")
+            .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let value = driver
+            .find(By::Id("scale-input"))
+            .await?
+            .prop("value")
+            .await?
+            .unwrap_or_default();
+        anyhow::ensure!(
+            value == "2",
+            "a digit typed into the focused field must land alone, got {value:?}"
         );
         driver.find(By::Id("scale-reset")).await?.click().await?;
 

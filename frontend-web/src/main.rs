@@ -2840,6 +2840,26 @@ fn RecipeDetail(id: i64) -> Element {
                                 inputmode: "decimal",
                                 autocomplete: "off",
                                 value: "{scale_value}",
+                                onfocus: move |_| {
+                                    // Select the current value: click + type a
+                                    // number replaces it, no manual deleting.
+                                    // Deferred a beat — the browser places the
+                                    // caret AFTER the focus handler runs and
+                                    // would collapse the selection again.
+                                    spawn(async move {
+                                        sleep_ms(20).await;
+                                        if let Some(input) = web_sys::window()
+                                            .and_then(|w| w.document())
+                                            .and_then(|d| d.get_element_by_id("scale-input"))
+                                            .and_then(|el| {
+                                                el.dyn_into::<web_sys::HtmlInputElement>()
+                                                    .ok()
+                                            })
+                                        {
+                                            input.select();
+                                        }
+                                    });
+                                },
                                 oninput: move |e: FormEvent| {
                                     // Numbers only: keep digits and the decimal
                                     // point, drop everything else as typed.

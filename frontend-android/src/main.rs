@@ -2667,6 +2667,24 @@ fn RecipeDetail(id: i64) -> Element {
                                 inputmode: "decimal",
                                 autocomplete: "off",
                                 value: "{scale_value}",
+                                onfocus: move |_| {
+                                    // Select the current value: tap + type a
+                                    // number replaces it, no manual deleting.
+                                    // Deferred a beat — the browser places the
+                                    // caret AFTER the focus handler runs and
+                                    // would collapse the selection again.
+                                    spawn(async move {
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_millis(20),
+                                        )
+                                        .await;
+                                        dioxus::document::eval(
+                                            "document.getElementById('scale-input')?.select()",
+                                        )
+                                        .await
+                                        .ok();
+                                    });
+                                },
                                 oninput: move |e: FormEvent| {
                                     // Numbers only: keep digits and the decimal
                                     // point, drop everything else as typed.
