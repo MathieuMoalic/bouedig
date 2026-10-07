@@ -411,30 +411,17 @@ button[type="submit"]:hover {
     color: var(--error);
 }
 
-.add-row {
-    display: flex;
-    gap: 6px;
-    margin: 8px 0 12px;
+.add-sheet .input-wrap {
+    margin-bottom: 10px;
 }
 
-.add-row input {
+.add-sheet .input-wrap input {
     background: var(--surface);
     border: 1px solid var(--divider);
     color: var(--text);
     border-radius: 12px;
     padding: 11px 12px;
     font: inherit;
-}
-
-.add-row input:first-child,
-.add-row .input-wrap {
-    flex: 2;
-}
-
-.add-row input:nth-child(2),
-.add-row .input-wrap + input {
-    flex: 1;
-    min-width: 0;
 }
 
 .input-wrap {
@@ -1558,12 +1545,18 @@ ol.instruction-list li {
 
 .plan-card {
     position: relative;
+    /* Always exactly two per row: no min-width, or narrow screens push
+       cards to full-width stacking. */
     width: calc(50% - 5px);
-    min-width: 150px;
     border-radius: 12px;
     overflow: hidden;
     background: var(--raised);
     cursor: pointer;
+}
+
+/* Today's card glows a lighter green so the current day reads at a glance. */
+.plan-day.today {
+    background: #24402f;
 }
 
 .plan-card-media {

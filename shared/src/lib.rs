@@ -16,7 +16,6 @@ pub const GROCERY_CATEGORIES: &[&str] = &[
     "Drinks",
     "Alcohol",
     "Seasoning",
-    "Canned",
     "Pantry",
     "Non-Food",
     "Pharmacy",
@@ -36,7 +35,6 @@ pub const CLASSIFIER_CATEGORIES: &[&str] = &[
     "Drinks",
     "Alcohol",
     "Seasoning",
-    "Canned",
     "Pantry",
 ];
 
@@ -50,7 +48,6 @@ pub fn category_emoji(name: &str) -> &'static str {
         "Drinks" => "🥤",
         "Alcohol" => "🍷",
         "Seasoning" => "🧂",
-        "Canned" => "🥫",
         "Pantry" => "🍝",
         "Non-Food" => "🧼",
         "Pharmacy" => "💊",

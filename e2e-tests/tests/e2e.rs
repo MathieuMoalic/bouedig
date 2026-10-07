@@ -294,7 +294,8 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         "recipe ingredients must not be auto-added; source:\n{src}"
     );
 
-    // Manual add: Enter submits; the add row has no group field anymore.
+    // Manual add: Enter submits; the add sheet has no group field anymore.
+    open_grocery_add_sheet(driver).await?;
     let input = driver.find(By::Id("grocery-input")).await?;
     input.send_keys("Bananas").await?;
     input.send_keys("\u{E007}").await?;
@@ -1107,7 +1108,7 @@ async fn grocery_edit_provenance_and_bought_flow() -> anyhow::Result<()> {
             .find_all(By::Css(".sheet-cats .cat-btn"))
             .await?;
         anyhow::ensure!(
-            buttons.len() >= 14,
+            buttons.len() >= shared::GROCERY_CATEGORIES.len(),
             "expected the preset categories as buttons, got {}",
             buttons.len()
         );
@@ -1452,7 +1453,7 @@ async fn auth_login_gate_flow() -> anyhow::Result<()> {
         driver.find(By::Id("login-submit")).await?.click().await?;
         tokio::time::sleep(Duration::from_millis(800)).await;
         driver
-            .find(By::Id("grocery-input"))
+            .find(By::Id("grocery-fab-add"))
             .await
             .context("grocery content did not appear after login")?;
 
@@ -1583,10 +1584,14 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
         );
 
         // Expiry: a removal with no undo click fades the bar away.
+        open_grocery_add_sheet(&driver).await?;
         let input = driver.find(By::Id("grocery-input")).await?;
         input.send_keys("Bread").await?;
         input.send_keys("\u{E007}").await?;
         poll_grocery(&http, &base, "Bread", None).await?;
+        // Close the sheet: its backdrop would block the row clicks below.
+        driver.find(By::Id("add-cancel")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
             .send()
@@ -1639,6 +1644,19 @@ async fn poll_first_grocery_id(http: &reqwest::Client, base: &str) -> anyhow::Re
     anyhow::bail!("no grocery item appeared")
 }
 
+/// Open the add-item sheet from the [+] FAB (the top add row is gone) and
+/// wait for its name field.
+async fn open_grocery_add_sheet(driver: &WebDriver) -> anyhow::Result<()> {
+    driver.find(By::Id("grocery-fab-add")).await?.click().await?;
+    for _ in 0..25 {
+        if driver.find(By::Id("grocery-input")).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("the add-item sheet did not open")
+}
+
 async fn json_post(
     http: &reqwest::Client,
     base: &str,
@@ -1668,10 +1686,9 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
     let result = (|| async {
         driver.goto(format!("{base}/grocery")).await?;
         wait_for_url_path(&driver, "/grocery").await?;
-        driver
-            .find(By::Id("grocery-input"))
+        open_grocery_add_sheet(&driver)
             .await
-            .context("grocery input missing")?;
+            .context("grocery add sheet missing")?;
 
         // Empty input: the dropdown stays closed even while focused.
         driver.find(By::Id("grocery-input")).await?.click().await?;
@@ -1736,6 +1753,10 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             "expected 'apple' and 'Milk' rows, got {texts:?}"
         );
 
+        // Close the sheet: its backdrop would block the checkbox clicks below.
+        driver.find(By::Id("add-cancel")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
+
         // Checking the box (bought) removes every "apple" row from the UI
         // and the database.
         for _ in 0..10 {
@@ -1762,6 +1783,7 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
         poll_grocery_gone(&http, &base, "apple").await?;
 
         // Adding another item must NOT resurrect "apple".
+        open_grocery_add_sheet(&driver).await?;
         let bread_input = driver.find(By::Id("grocery-input")).await?;
         bread_input.clear().await?;
         bread_input.send_keys("Bread").await?;

@@ -210,11 +210,34 @@ def build_apk(version: str) -> Path:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
 
+    def stamp_manifest() -> None:
+        # Bottom sheets must sit above the keyboard: without adjustResize the
+        # webview keeps its full height and the IME overlays the sheets (the
+        # add/edit/move inputs become invisible while typing). dx does not
+        # emit this attribute; patch the generated manifest if it's there.
+        manifest = app_dir / "app" / "src" / "main" / "AndroidManifest.xml"
+        try:
+            text = manifest.read_text()
+        except FileNotFoundError:
+            return
+        if "windowSoftInputMode" in text:
+            return
+        patched = text.replace(
+            'android:name="dev.dioxus.main.MainActivity"',
+            'android:name="dev.dioxus.main.MainActivity" '
+            'android:windowSoftInputMode="adjustResize"',
+            1,
+        )
+        if patched != text:
+            manifest.write_text(patched)
+            print(f"+ stamped windowSoftInputMode into {manifest}", flush=True)
+
     wipe_mipmaps()
     # The manifest references @style/BouedigTheme, so the values file must
     # exist before dx's own gradle run — values only, because the full set
     # would collide with the stock mipmaps dx re-copies during the build.
     stamp_launcher(values_only=True)
+    stamp_manifest()
     for jni in app_dir.glob("app/src/main/jniLibs"):
         shutil.rmtree(jni)
     env = dict(os.environ, BOUEDIG_API_BASE=PROD_API_BASE)
@@ -225,6 +248,10 @@ def build_apk(version: str) -> Path:
          "--target", ANDROID_TARGET],
         cwd=ANDROID, env=env, check=True,
     )
+    # dx's gradle run may have packaged before our manifest stamp if the
+    # project was generated fresh; ensure the stamp and re-package later via
+    # the assembleDebug re-run below regardless.
+    stamp_manifest()
 
     # dx packaged the APK with its stock icons; swap in ours (full set incl.
     # the launcher mipmaps) and re-run gradle so the artifact carries them.

@@ -282,11 +282,14 @@ fn IconTrash() -> Element {
 #[component]
 fn IconSort() -> Element {
     rsx! {
-        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round",
-            path { d: "M4 7h10M18 7h2M4 12h4M12 12h8M4 17h10M18 17h2" }
-            circle { cx: "16", cy: "7", r: "2" }
-            circle { cx: "10", cy: "12", r: "2" }
-            circle { cx: "16", cy: "17", r: "2" }
+        // Arrow-down-wide-narrow: the widest bar shrinks stepwise — reads as
+        // "sort descending" at a glance.
+        svg { class: "icon", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round",
+            path { d: "m3 16 4 4 4-4" }
+            path { d: "M7 4v16" }
+            path { d: "M11 4h10" }
+            path { d: "M11 8h7" }
+            path { d: "M11 12h4" }
         }
     }
 }
@@ -843,7 +846,22 @@ fn Recipes() -> Element {
                     id: "fab-search",
                     class: "fab small",
                     title: "Search",
-                    onclick: move |_| search_open.set(true),
+                    onclick: move |_| {
+                        search_open.set(true);
+                        // Put the cursor in the field right away.
+                        spawn(async move {
+                            sleep_ms(50).await;
+                            if let Some(input) = web_sys::window()
+                                .and_then(|w| w.document())
+                                .and_then(|d| d.get_element_by_id("recipe-search"))
+                            {
+                                let _ = input
+                                    .dyn_into::<web_sys::HtmlInputElement>()
+                                    .ok()
+                                    .map(|i| i.focus());
+                            }
+                        });
+                    },
                     IconSearch {}
                 }
                 button {
@@ -3285,6 +3303,9 @@ fn GroceryContent() -> Element {
     let mut plan_loaded = use_signal(|| false);
     let mut plan_entries = use_signal(Vec::<MealPlanEntry>::new);
     let mut edit_item = use_signal(|| None::<GroceryItem>);
+    // The add-item bottom sheet (opened by the [+] FAB) replaces the old
+    // always-visible add row.
+    let mut add_sheet = use_signal(|| false);
     // The last item ticked off, kept around briefly so a mis-tick can be
     // undone; `undo_gen` invalidates the timer when a newer removal lands.
     let undo_item = use_signal(|| None::<GroceryItem>);
@@ -3296,6 +3317,25 @@ fn GroceryContent() -> Element {
             spawn(async move {
                 refresh(items, error).await;
                 refresh_names(name_history).await;
+            });
+        }
+    });
+
+    // Focus the name field when the add sheet opens, so typing starts
+    // immediately (a beat after mount — the input must exist first).
+    use_effect(move || {
+        if add_sheet() {
+            spawn(async move {
+                sleep_ms(50).await;
+                if let Some(input) = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.get_element_by_id("grocery-input"))
+                {
+                    let _ = input
+                        .dyn_into::<web_sys::HtmlInputElement>()
+                        .ok()
+                        .map(|i| i.focus());
+                }
             });
         }
     });
@@ -3398,59 +3438,8 @@ fn GroceryContent() -> Element {
 
     rsx! {
         div { class: "page",
-            div { class: "add-row",
-                div { class: "input-wrap",
-                    input {
-                        id: "grocery-input",
-                        r#type: "text",
-                        value: "{new_item}",
-                        placeholder: "Add an item manually…",
-                        oninput: move |e: FormEvent| new_item.set(e.value()),
-                        onfocus: move |_| focused.set(true),
-                        onblur: move |_| focused.set(false),
-                        onkeydown: move |e: KeyboardEvent| {
-                            if e.key() == Key::Enter {
-                                // Bind first: the read guard must be dropped
-                                // before submit calls `new_item.set()`.
-                                let name = new_item.read().clone();
-                                submit_grocery_item(name, new_item, items, name_history, error);
-                            }
-                        },
-                        autocomplete: "off",
-                    }
-                    if focused() && !new_item.read().trim().is_empty() && !suggestions.is_empty() {
-                        div { class: "suggestions",
-                            for (name, _) in suggestions {
-                                button {
-                                    class: "suggestion",
-                                    r#type: "button",
-                                    // mousedown, not click: the input's blur
-                                    // (fired on mousedown) unmounts this
-                                    // dropdown before a click could land.
-                                    // Tapping a suggestion adds it outright.
-                                    onmousedown: move |_| {
-                                        submit_grocery_item(
-                                            name.clone(),
-                                            new_item,
-                                            items,
-                                            name_history,
-                                            error,
-                                        );
-                                    },
-                                    span { class: "suggestion-text", "{name}" }
-                                }
-                            }
-                        }
-                    }
-                }
-                button {
-                    id: "grocery-add",
-                    onclick: move |_| {
-                        let name = new_item.read().clone();
-                        submit_grocery_item(name, new_item, items, name_history, error)
-                    },
-                    "Add"
-                }
+            if !error.read().is_empty() {
+                p { class: "status-error", "{error}" }
             }
             if let Some(removed) = undo_snapshot {
                 div { class: "undo-bar",
@@ -3469,7 +3458,7 @@ fn GroceryContent() -> Element {
                 p { class: "status-error", "{error}" }
             }
             if groups.is_empty() {
-                p { class: "empty", "Your grocery list is empty. Add an item above." }
+                p { class: "empty", "Your grocery list is empty. Tap + to add an item." }
             } else {
                 div { id: "grocery-list", class: "grocery-groups",
                     for (category, group_items) in groups {
@@ -3539,21 +3528,95 @@ fn GroceryContent() -> Element {
                     on_cancel: move |_| edit_item.set(None),
                 }
             }
+            if add_sheet() {
+                div { class: "sheet-backdrop",
+                    onclick: move |_| add_sheet.set(false),
+                    div { class: "sheet add-sheet", role: "dialog",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                        h2 { class: "sheet-title", "Add item" }
+                        div { class: "input-wrap",
+                            input {
+                                id: "grocery-input",
+                                r#type: "text",
+                                value: "{new_item}",
+                                placeholder: "Add an item manually…",
+                                oninput: move |e: FormEvent| new_item.set(e.value()),
+                                onfocus: move |_| focused.set(true),
+                                onblur: move |_| focused.set(false),
+                                onkeydown: move |e: KeyboardEvent| {
+                                    if e.key() == Key::Enter {
+                                        // Bind first: the read guard must be
+                                        // dropped before submit calls
+                                        // `new_item.set()`.
+                                        let name = new_item.read().clone();
+                                        submit_grocery_item(
+                                            name,
+                                            new_item,
+                                            items,
+                                            name_history,
+                                            error,
+                                        );
+                                    }
+                                },
+                                autocomplete: "off",
+                            }
+                            if focused()
+                                && !new_item.read().trim().is_empty()
+                                && !suggestions.is_empty()
+                            {
+                                div { class: "suggestions",
+                                    for (name, _) in suggestions {
+                                        button {
+                                            class: "suggestion",
+                                            r#type: "button",
+                                            // mousedown, not click: the input's
+                                            // blur (fired on mousedown) unmounts
+                                            // this dropdown before a click could
+                                            // land. Tapping a suggestion adds it
+                                            // outright.
+                                            onmousedown: move |_| {
+                                                submit_grocery_item(
+                                                    name.clone(),
+                                                    new_item,
+                                                    items,
+                                                    name_history,
+                                                    error,
+                                                );
+                                            },
+                                            span { class: "suggestion-text", "{name}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "sheet-actions",
+                            button {
+                                id: "grocery-add",
+                                class: "dialog-btn primary",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    let name = new_item.read().clone();
+                                    submit_grocery_item(name, new_item, items, name_history, error)
+                                },
+                                "Add"
+                            }
+                            button {
+                                id: "add-cancel",
+                                class: "dialog-btn",
+                                r#type: "button",
+                                onclick: move |_| add_sheet.set(false),
+                                "Cancel"
+                            }
+                        }
+                    }
+                }
+            }
             div { class: "fab-stack",
                 button {
                     id: "grocery-fab-add",
                     class: "fab",
                     title: "Add item",
-                    onclick: move |_| {
-                        if let Some(input) = web_sys::window()
-                            .and_then(|w| w.document())
-                            .and_then(|d| d.get_element_by_id("grocery-input"))
-                        {
-                            let _ = input.dyn_into::<web_sys::HtmlInputElement>()
-                                .ok()
-                                .map(|i| i.focus());
-                        }
-                    },
+                    onclick: move |_| add_sheet.set(true),
                     IconPlus {}
                 }
             }
@@ -4283,6 +4346,7 @@ fn MealPlanContent() -> Element {
                         day: day.clone(),
                         drag_entry: drag_snapshot.as_ref().filter(|d| d.armed).map(|d| d.entry_id),
                         is_drag_target: drag_target_snapshot.as_deref() == Some(day.date.as_str()),
+                        is_today: day.date == today_value,
                         on_card_down: move |(entry_id, origin_date, recipe_id, y): (
                             i64,
                             String,
@@ -4545,6 +4609,7 @@ fn PlanDaySection(
     day: PlanDay,
     drag_entry: Option<i64>,
     is_drag_target: bool,
+    is_today: bool,
     on_card_down: EventHandler<(i64, String, i64, f64)>,
     on_card_move: EventHandler<(i64, f64)>,
     // Only the entry id and pointer y: the drop reads origin/recipe from the
@@ -4561,6 +4626,10 @@ fn PlanDaySection(
     let day_id = format!("plan-day-{day_date}");
     let day_class = if is_drag_target {
         "plan-day drag-target"
+    } else if is_today {
+        // Today's card glows a lighter green so the current day reads at a
+        // glance in the week pager.
+        "plan-day today"
     } else {
         "plan-day"
     };
