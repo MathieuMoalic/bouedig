@@ -1589,9 +1589,9 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
         input.send_keys("Bread").await?;
         input.send_keys("\u{E007}").await?;
         poll_grocery(&http, &base, "Bread", None).await?;
-        // Close the sheet: its backdrop would block the row clicks below.
+        // Close the modal: its backdrop would block the row clicks below.
         driver.find(By::Id("add-cancel")).await?.click().await?;
-        wait_for_gone(&driver, ".sheet").await?;
+        wait_for_gone(&driver, ".add-dialog").await?;
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
             .send()
@@ -1753,9 +1753,9 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             "expected 'apple' and 'Milk' rows, got {texts:?}"
         );
 
-        // Close the sheet: its backdrop would block the checkbox clicks below.
+        // Close the modal: its backdrop would block the checkbox clicks below.
         driver.find(By::Id("add-cancel")).await?.click().await?;
-        wait_for_gone(&driver, ".sheet").await?;
+        wait_for_gone(&driver, ".add-dialog").await?;
 
         // Checking the box (bought) removes every "apple" row from the UI
         // and the database.

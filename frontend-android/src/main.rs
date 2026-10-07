@@ -851,6 +851,14 @@ fn Recipes() -> Element {
                     class: "fab small",
                     title: "Search",
                     onclick: move |_| {
+                        if search_open() {
+                            // Second press closes the bar and resets it,
+                            // same as the ✕ inside it.
+                            search_text.set(String::new());
+                            search_results.set(None);
+                            search_open.set(false);
+                            return;
+                        }
                         search_open.set(true);
                         // Put the cursor in the field right away (eval
                         // bridge — no DOM access natively).
@@ -3348,11 +3356,11 @@ fn GroceryContent() -> Element {
                 }
             }
             if add_sheet() {
-                div { class: "sheet-backdrop",
+                div { class: "dialog-backdrop",
                     onclick: move |_| add_sheet.set(false),
-                    div { class: "sheet add-sheet", role: "dialog",
+                    div { class: "dialog add-dialog", role: "dialog",
                         onclick: move |e: MouseEvent| e.stop_propagation(),
-                        h2 { class: "sheet-title", "Add item" }
+                        h2 { class: "dialog-title", "Add item" }
                         div { class: "input-wrap",
                             input {
                                 id: "grocery-input",
@@ -3408,7 +3416,7 @@ fn GroceryContent() -> Element {
                                 }
                             }
                         }
-                        div { class: "sheet-actions",
+                        div { class: "dialog-actions",
                             button {
                                 id: "grocery-add",
                                 class: "dialog-btn primary",

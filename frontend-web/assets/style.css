@@ -411,11 +411,22 @@ button[type="submit"]:hover {
     color: var(--error);
 }
 
-.add-sheet .input-wrap {
+/* The add-item modal is a centered dialog (not a bottom sheet). Tight
+   title: no gap below "Add item". The suggestions dropdown is absolutely
+   positioned, so it takes no layout space and overlays the actions. */
+.add-dialog {
+    width: 100%;
+}
+
+.add-dialog .dialog-title {
+    margin: 0;
+}
+
+.add-dialog .input-wrap {
     margin-bottom: 10px;
 }
 
-.add-sheet .input-wrap input {
+.add-dialog .input-wrap input {
     background: var(--surface);
     border: 1px solid var(--divider);
     color: var(--text);
