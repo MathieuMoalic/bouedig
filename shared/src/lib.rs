@@ -157,6 +157,13 @@ pub struct GroceryItem {
     /// deleted; `None` for manually added items).
     #[serde(default)]
     pub recipe: Option<Recipe>,
+    /// Optional amount for the row prefix, e.g. `2` (displayed as "2 oat
+    /// milk" with the unit below) — typed as-is, never parsed.
+    #[serde(default)]
+    pub quantity: Option<f64>,
+    /// Optional unit for the amount, e.g. `g`, `ml`, `packs`.
+    #[serde(default)]
+    pub unit: String,
 }
 
 /// Payload used to add a grocery item manually.
@@ -165,6 +172,13 @@ pub struct NewGroceryItem {
     pub name: String,
     #[serde(default)]
     pub category: Option<String>,
+    /// Optional amount fields (from the add modal). When absent — e.g. the
+    /// cart-sheet batch — the backend may split a leading quantity/unit out
+    /// of the name itself.
+    #[serde(default)]
+    pub quantity: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<String>,
 }
 
 /// Payload used to flip the `bought` checkbox of a grocery item.
@@ -173,13 +187,19 @@ pub struct GroceryUpdate {
     pub bought: bool,
 }
 
-/// Payload for renaming / regrouping a grocery item.
+/// Payload for renaming / regrouping a grocery item. The clients always
+/// send quantity and unit (their current field values; `None`/blank
+/// clears the amount).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroceryPatch {
     pub name: String,
     /// `None` or blank resets the item to the default group.
     #[serde(default)]
     pub category: Option<String>,
+    #[serde(default)]
+    pub quantity: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<String>,
 }
 
 /// Payload for adding several grocery items at once (e.g. the ingredients

@@ -382,6 +382,8 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
         bought: row.get::<i64, _>("bought") != 0,
         category: row.get::<String, _>("category"),
         recipe: None,
+        quantity: row.get::<Option<f64>, _>("quantity"),
+        unit: row.get::<String, _>("unit"),
     }
 }
 
@@ -405,12 +407,14 @@ fn row_to_joined_item(row: &sqlx::sqlite::SqliteRow) -> GroceryItem {
         bought: row.get::<i64, _>("bought") != 0,
         category: row.get::<String, _>("category"),
         recipe,
+        quantity: row.get::<Option<f64>, _>("quantity"),
+        unit: row.get::<String, _>("unit"),
     }
 }
 
 /// The grocery SELECT with provenance joined in; `r.id` aliases as
 /// `recipe_id` so it never collides with `g.id`.
-const GROCERY_SELECT: &str = "SELECT g.id, g.name, g.bought, g.category, \
+const GROCERY_SELECT: &str = "SELECT g.id, g.name, g.bought, g.category, g.quantity, g.unit, \
      r.id AS recipe_id, r.name AS recipe_name, r.image_path, r.thumb_path, r.updated_at \
      FROM grocery_items g LEFT JOIN recipes r ON r.id = g.recipe_id";
 
@@ -1529,11 +1533,13 @@ async fn add_grocery_item(
     }
     let (category, needs_classification) = resolve_category(&state.db, &item).await;
     let row = sqlx::query(
-        "INSERT INTO grocery_items (name, category) VALUES (?, ?) \
-         RETURNING id, name, bought, category",
+        "INSERT INTO grocery_items (name, category, quantity, unit) VALUES (?, ?, ?, ?) \
+         RETURNING id, name, bought, category, quantity, unit",
     )
     .bind(name)
     .bind(category)
+    .bind(item.quantity)
+    .bind(item.unit.as_deref().unwrap_or(""))
     .fetch_one(&state.db)
     .await?;
     if needs_classification {
@@ -1571,8 +1577,28 @@ async fn add_grocery_batch(
                 (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
             ));
         }
+        // Explicit quantities (undo restore) are used as-is; bare lines
+        // (recipe cart-sheet pushes) get their leading quantity/unit split
+        // out by the conservative ingredient parser. Lines without a
+        // parseable quantity keep the whole line as the name.
+        let (quantity, unit, name) = if item.quantity.is_some() {
+            (
+                item.quantity,
+                item.unit.clone().unwrap_or_default(),
+                name.to_string(),
+            )
+        } else {
+            let parsed = recipe_import::normalize::parse_ingredient_line(name);
+            match parsed.quantity {
+                Some(q) => {
+                    let unit = parsed.unit.unwrap_or_default();
+                    (Some(q), unit, parsed.name)
+                }
+                None => (None, String::new(), name.to_string()),
+            }
+        };
         let (category, needs_classification) = resolve_category(&state.db, item).await;
-        prepared.push((name.to_string(), category, needs_classification));
+        prepared.push((name, quantity, unit, category, needs_classification));
     }
     // Provenance recipe: validated up front so a bad id rejects the whole
     // batch instead of failing halfway through the inserts.
@@ -1592,13 +1618,16 @@ async fn add_grocery_batch(
     let mut tx = state.db.begin().await?;
     let mut created = Vec::with_capacity(prepared.len());
     let mut pending = Vec::new();
-    for (name, category, needs_classification) in prepared {
+    for (name, quantity, unit, category, needs_classification) in prepared {
         let row = sqlx::query(
-            "INSERT INTO grocery_items (name, category, recipe_id) VALUES (?, ?, ?) \
-             RETURNING id, name, bought, category",
+            "INSERT INTO grocery_items (name, category, quantity, unit, recipe_id) \
+             VALUES (?, ?, ?, ?, ?) \
+             RETURNING id, name, bought, category, quantity, unit",
         )
         .bind(&name)
         .bind(&category)
+        .bind(quantity)
+        .bind(&unit)
         .bind(batch.recipe_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -1671,17 +1700,22 @@ async fn patch_grocery_item(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .unwrap_or(shared::DEFAULT_CATEGORY);
+    let unit = patch.unit.as_deref().map(str::trim).unwrap_or("");
     let old: Option<String> =
         sqlx::query_scalar("SELECT category FROM grocery_items WHERE id = ?")
             .bind(id)
             .fetch_optional(&state.db)
             .await?;
-    let result = sqlx::query("UPDATE grocery_items SET name = ?, category = ? WHERE id = ?")
-        .bind(name)
-        .bind(category)
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE grocery_items SET name = ?, category = ?, quantity = ?, unit = ? WHERE id = ?",
+    )
+    .bind(name)
+    .bind(category)
+    .bind(patch.quantity)
+    .bind(unit)
+    .bind(id)
+    .execute(&state.db)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
     }
@@ -2236,17 +2270,76 @@ pub(crate) mod tests {
 
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let names: Vec<&str> = list
-            .as_array()
-            .unwrap()
+        let rows = list.as_array().unwrap();
+        // Quantified lines are split: quantity/unit move out of the name
+        // (prep is dropped, exactly like the cart-sheet display did).
+        let names: Vec<&str> = rows
             .iter()
             .map(|i| i["name"].as_str().unwrap())
             .collect();
         assert_eq!(
             names,
-            vec!["2 tbsp soy sauce", "1 onion, thinly sliced", "Salt"],
+            vec!["soy sauce", "onion", "Salt"],
             "batch order must be preserved: {body}"
         );
+        assert_eq!(rows[0]["quantity"], 2.0);
+        assert_eq!(rows[0]["unit"], "tbsp");
+        assert_eq!(rows[1]["quantity"], 1.0);
+        assert_eq!(rows[1]["unit"], "");
+        assert!(rows[2]["quantity"].is_null());
+    }
+
+    /// The add modal sends explicit quantity/unit: they are stored as-is,
+    /// and the name is NOT re-split even if it looks quantified.
+    #[tokio::test]
+    async fn grocery_single_add_stores_explicit_quantity_verbatim() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery",
+            Some(r#"{"name":"2 oat milk","quantity":2.0,"unit":"packs"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let item: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(item["name"], "2 oat milk");
+        assert_eq!(item["quantity"], 2.0);
+        assert_eq!(item["unit"], "packs");
+
+        // The edit sheet PATCHes quantity and unit the same way.
+        let id = item["id"].as_i64().unwrap();
+        let (status, body) = json_response(
+            app,
+            "PUT",
+            &format!("/api/grocery/{id}"),
+            Some(r#"{"name":"2 oat milk","category":"Vegan","quantity":0.5,"unit":"l"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let patched: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(patched["quantity"], 0.5);
+        assert_eq!(patched["unit"], "l");
+        assert_eq!(patched["category"], "Vegan");
+    }
+
+    /// A batch item that already carries an explicit quantity skips the
+    /// line-split (the undo restore path depends on this).
+    #[tokio::test]
+    async fn grocery_batch_respects_explicit_quantities() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(
+            app.clone(),
+            "POST",
+            "/api/grocery/batch",
+            Some(r#"{"items":[{"name":"2 oat milk","quantity":2.0,"unit":"packs"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["name"], "2 oat milk");
+        assert_eq!(list[0]["quantity"], 2.0);
+        assert_eq!(list[0]["unit"], "packs");
     }
 
     #[tokio::test]
@@ -2440,7 +2533,7 @@ pub(crate) mod tests {
         let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1, "{body}");
-        assert_eq!(list[0]["name"], "1 onion", "{body}");
+        assert_eq!(list[0]["name"], "onion", "{body}");
         assert!(list[0]["recipe"].is_null(), "{body}");
     }
 
@@ -2965,7 +3058,7 @@ pub(crate) mod tests {
         }
         assert!(flipped, "background classification never applied the category");
         let cached: String =
-            sqlx::query_scalar("SELECT category FROM ingredient_categories WHERE name = '1 lb firm tofu'")
+            sqlx::query_scalar("SELECT category FROM ingredient_categories WHERE name = 'firm tofu'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -2976,7 +3069,7 @@ pub(crate) mod tests {
             app.clone(),
             "POST",
             "/api/grocery",
-            Some(r#"{"name":"1 lb Firm Tofu"}"#),
+            Some(r#"{"name":"Firm Tofu"}"#),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");

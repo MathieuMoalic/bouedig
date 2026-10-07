@@ -1053,7 +1053,25 @@ fn swap_step(steps: &mut [StepRow], id: u64, down: bool) -> bool {
     true
 }
 
+/// Parse the amount field: blank → none, otherwise a plain number.
+fn parse_qty(text: &str) -> Option<f64> {
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|q| q.is_finite() && *q > 0.0)
+}
+
 /// Format a quantity without trailing zeros (200.0 -> "200", 1.5 -> "1.5").
+/// "500 g" / "2"-style row prefix from the stored amount; None when the
+/// item carries no quantity.
+fn grocery_qty_prefix(quantity: Option<f64>, unit: &str) -> Option<String> {
+    let qty = quantity?;
+    let unit = unit.trim();
+    // A trailing space keeps the DOM text "500 g oats" whole for
+    // tests and screen readers despite the separate spans.
+    Some(format!("{} {unit} ", fmt_qty(qty)))
+}
+
 fn fmt_qty(q: f64) -> String {
     let s = format!("{q}");
     if s.contains('.') {
@@ -3111,7 +3129,7 @@ fn RecipeDetail(id: i64) -> Element {
                         let payload = NewGroceryBatch {
                             items: selected
                                 .into_iter()
-                                .map(|name| NewGroceryItem { name, category: None })
+                                .map(|name| NewGroceryItem { name, category: None, quantity: None, unit: None })
                                 .collect(),
                             recipe_id: Some(id),
                         };
@@ -3457,6 +3475,8 @@ fn Grocery() -> Element {
 fn GroceryContent() -> Element {
     let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
+    let mut new_qty = use_signal(String::new);
+    let mut new_unit = use_signal(String::new);
     // Every name ever seen on this list (server: /api/grocery/names) so the
     // add-row suggestions also cover past recipe additions, which are gone
     // from the live list once ticked off.
@@ -3641,12 +3661,19 @@ fn GroceryContent() -> Element {
                     item,
                     source: edit_source,
                     groups: category_options.clone(),
-                    on_save: move |(name, category): (String, String)| {
+                    on_save: move |(name, quantity, unit_text, category): (
+                        String,
+                        Option<f64>,
+                        String,
+                        String,
+                    )| {
                         edit_item.set(None);
                         let id = edited_id.unwrap_or_default();
                         let payload = GroceryPatch {
                             name,
                             category: Some(category),
+                            quantity,
+                            unit: Some(unit_text),
                         };
                         spawn(async move {
                             let client = http();
@@ -3692,6 +3719,35 @@ fn GroceryContent() -> Element {
                         onclick: move |e: MouseEvent| e.stop_propagation(),
                         h2 { class: "dialog-title", "Add item" }
                         div { class: "input-wrap",
+                            div { class: "qty-unit-row",
+                                input {
+                                    id: "grocery-qty",
+                                    class: "qty-input",
+                                    r#type: "text",
+                                    inputmode: "decimal",
+                                    value: "{new_qty}",
+                                    placeholder: "2",
+                                    oninput: move |e: FormEvent| {
+                                        // Digits and the decimal point only.
+                                        let cleaned: String = e
+                                            .value()
+                                            .chars()
+                                            .filter(|c| c.is_ascii_digit() || *c == '.')
+                                            .collect();
+                                        new_qty.set(cleaned);
+                                    },
+                                    autocomplete: "off",
+                                }
+                                input {
+                                    id: "grocery-unit",
+                                    class: "unit-input",
+                                    r#type: "text",
+                                    value: "{new_unit}",
+                                    placeholder: "g, ml, packs…",
+                                    oninput: move |e: FormEvent| new_unit.set(e.value()),
+                                    autocomplete: "off",
+                                }
+                            }
                             input {
                                 id: "grocery-input",
                                 r#type: "text",
@@ -3708,6 +3764,8 @@ fn GroceryContent() -> Element {
                                         let name = new_item.read().clone();
                                         submit_grocery_item(
                                             name,
+                                            parse_qty(&new_qty.read()),
+                                            new_unit.read().trim().to_string(),
                                             new_item,
                                             items,
                                             name_history,
@@ -3734,6 +3792,8 @@ fn GroceryContent() -> Element {
                                             onmousedown: move |_| {
                                                 submit_grocery_item(
                                                     name.clone(),
+                                                    parse_qty(&new_qty.read()),
+                                                    new_unit.read().trim().to_string(),
                                                     new_item,
                                                     items,
                                                     name_history,
@@ -3753,7 +3813,15 @@ fn GroceryContent() -> Element {
                                 r#type: "button",
                                 onclick: move |_| {
                                     let name = new_item.read().clone();
-                                    submit_grocery_item(name, new_item, items, name_history, error)
+                                    submit_grocery_item(
+                                        name,
+                                        parse_qty(&new_qty.read()),
+                                        new_unit.read().trim().to_string(),
+                                        new_item,
+                                        items,
+                                        name_history,
+                                        error,
+                                    )
                                 },
                                 "Add"
                             }
@@ -3879,6 +3947,10 @@ fn GroceryRow(
                     });
                 },
             }
+            // Amount prefix (as typed), only when the item has one.
+            if let Some(prefix) = grocery_qty_prefix(item.quantity, &item.unit) {
+                span { class: "grocery-qty", "{prefix}" }
+            }
             span { "{item.name}" }
         }
     }
@@ -3892,11 +3964,16 @@ fn GroceryEditSheet(
     item: GroceryItem,
     source: String,
     groups: Vec<String>,
-    on_save: EventHandler<(String, String)>,
+    on_save: EventHandler<(String, Option<f64>, String, String)>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let mut name = use_signal(|| item.name.clone());
     let mut group = use_signal(|| item.category.clone());
+    let mut quantity = use_signal(|| match item.quantity {
+        Some(q) => fmt_qty(q),
+        None => String::new(),
+    });
+    let mut unit = use_signal(|| item.unit.clone());
     let name_value = name.read().trim().to_string();
     // Reading the live selection here subscribes the render to `group`, so
     // the highlight follows taps instead of staying on the loaded category.
@@ -3938,6 +4015,35 @@ fn GroceryEditSheet(
                         }
                     }
                     div { class: "sheet-field",
+                    div { class: "sheet-field",
+                        span { "Amount" }
+                        div { class: "qty-unit-row",
+                            input {
+                                id: "sheet-item-qty",
+                                class: "qty-input",
+                                r#type: "text",
+                                inputmode: "decimal",
+                                value: "{quantity}",
+                                placeholder: "2",
+                                oninput: move |e: FormEvent| {
+                                    let cleaned: String = e
+                                        .value()
+                                        .chars()
+                                        .filter(|c| c.is_ascii_digit() || *c == '.')
+                                        .collect();
+                                    quantity.set(cleaned);
+                                },
+                            }
+                            input {
+                                id: "sheet-item-unit",
+                                class: "unit-input",
+                                r#type: "text",
+                                value: "{unit}",
+                                placeholder: "g, ml, packs…",
+                                oninput: move |e: FormEvent| unit.set(e.value()),
+                            }
+                        }
+                    }
                         span { "Group" }
                         div { class: "sheet-cats",
                             for (label, emoji, button_id) in categories.iter() {
@@ -3968,7 +4074,7 @@ fn GroceryEditSheet(
                         class: "dialog-btn primary",
                         disabled: name_value.is_empty(),
                         onclick: move |_| {
-                            on_save.call((name.read().trim().to_string(), group.read().trim().to_string()));
+                            on_save.call((name.read().trim().to_string(), parse_qty(&quantity.read().trim()), unit.read().trim().to_string(), group.read().trim().to_string()));
                         },
                         "Save"
                     }
@@ -4035,6 +4141,8 @@ fn restore_removed_item(
             items: vec![NewGroceryItem {
                 name: item.name.clone(),
                 category: Some(item.category.clone()),
+                quantity: item.quantity,
+                unit: Some(item.unit.clone()),
             }],
             recipe_id: item.recipe.as_ref().map(|r| r.id),
         };
@@ -4067,6 +4175,8 @@ fn restore_removed_item(
 /// category changes happen in the edit sheet, which pins them.
 fn submit_grocery_item(
     name: String,
+    quantity: Option<f64>,
+    unit: String,
     mut new_item: Signal<String>,
     mut items: Signal<Vec<GroceryItem>>,
     name_history: Signal<Vec<String>>,
@@ -4078,7 +4188,12 @@ fn submit_grocery_item(
     }
     new_item.set(String::new());
     spawn(async move {
-        let item = NewGroceryItem { name, category: None };
+        let item = NewGroceryItem {
+            name,
+            category: None,
+            quantity,
+            unit: Some(unit),
+        };
         let url = format!("{}/api/grocery", api_base());
         tracing::info!("Grocery add: POST {url} (name={:?})", item.name);
         match http().post(url).json(&item).send().await {

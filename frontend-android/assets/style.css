@@ -292,6 +292,12 @@ li.grocery-item {
     min-height: 30px;
 }
 
+li.grocery-item > span.grocery-qty {
+    flex: none;
+    color: var(--muted);
+    margin-right: 2px;
+}
+
 li.grocery-item > span {
     flex: 1;
     font-size: 13.5px;
@@ -425,6 +431,24 @@ button[type="submit"]:hover {
 
 .add-dialog .input-wrap {
     margin-bottom: 12px;
+}
+
+/* Amount + unit share one compact row above the name. */
+.add-dialog .qty-unit-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.add-dialog .qty-unit-row .qty-input {
+    width: 76px;
+    flex: none;
+    text-align: center;
+}
+
+.add-dialog .qty-unit-row .unit-input {
+    flex: 1;
+    min-width: 0;
 }
 
 .add-dialog .input-wrap input {

@@ -649,7 +649,7 @@ async fn api_round_trip_recipe_crud() -> anyhow::Result<()> {
     // Grocery manual add still works; the bought toggle deletes the item.
     let item: GroceryItem = http
         .post(format!("{base}/api/grocery"))
-        .json(&NewGroceryItem { name: "Potatoes".into(), category: None })
+        .json(&NewGroceryItem { name: "Potatoes".into(), category: None, quantity: None, unit: None })
         .send()
         .await?
         .json()
@@ -1084,7 +1084,8 @@ async fn recipe_add_to_shopping_list_flow() -> anyhow::Result<()> {
         wait_for_gone(&driver, ".sheet").await?;
 
         // Exactly the two selected lines landed on the list, in order.
-        poll_grocery(&http, &base, "2 tbsp Soy sauce", None).await?;
+        // Quantified lines are split: quantity/unit move out of the name.
+        poll_grocery(&http, &base, "Soy sauce", None).await?;
         poll_grocery(&http, &base, "Salt", None).await?;
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -1092,9 +1093,17 @@ async fn recipe_add_to_shopping_list_flow() -> anyhow::Result<()> {
             .await?
             .json()
             .await?;
+        let soy = items
+            .iter()
+            .find(|i| i.name == "Soy sauce")
+            .context("split soy sauce item missing")?;
+        anyhow::ensure!(
+            soy.quantity == Some(2.0) && soy.unit == "tbsp",
+            "cart push must split quantity/unit out of the line: {soy:?}"
+        );
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         anyhow::ensure!(
-            names == ["2 tbsp Soy sauce", "Salt"],
+            names == ["Soy sauce", "Salt"],
             "unexpected grocery contents: {names:?}"
         );
         anyhow::ensure!(
@@ -1824,6 +1833,50 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
                 .is_empty(),
             "dropdown must stay closed without typed text"
         );
+
+        // The amount fields: a quantity of "2" + unit "packs" rides along
+        // with the name on the next add.
+        driver.find(By::Id("grocery-qty")).await?.send_keys("2").await?;
+        driver
+            .find(By::Id("grocery-unit"))
+            .await?
+            .send_keys("packs")
+            .await?;
+        driver
+            .find(By::Id("grocery-input"))
+            .await?
+            .send_keys("Oat milk")
+            .await?;
+        driver.find(By::Id("grocery-add")).await?.click().await?;
+        poll_grocery(&http, &base, "Oat milk", None).await?;
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let oat = items
+            .iter()
+            .find(|i| i.name == "Oat milk")
+            .context("quantified item missing from the database")?;
+        anyhow::ensure!(
+            oat.quantity == Some(2.0) && oat.unit == "packs",
+            "quantity/unit must be stored as typed: {oat:?}"
+        );
+        // The row renders the amount prefixed to the name.
+        let row = driver
+            .find(By::XPath(
+                "//li[contains(@class, 'grocery-item') and contains(., 'Oat milk')]",
+            ))
+            .await
+            .context("quantified row missing from the UI")?;
+        anyhow::ensure!(
+            row.text().await?.contains("2 packs"),
+            "the row must show the amount prefix"
+        );
+        // Clear the amount fields for the rest of the flow.
+        driver.find(By::Id("grocery-qty")).await?.clear().await?;
+        driver.find(By::Id("grocery-unit")).await?.clear().await?;
 
         // Add "apple" so there is a past entry to suggest. The Add click
         // clears the input (controlled input — send_keys alone would append).
