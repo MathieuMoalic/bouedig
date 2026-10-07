@@ -2843,9 +2843,19 @@ fn RecipeDetail(id: i64) -> Element {
                                 onfocus: move |_| {
                                     // Select the current value: click + type a
                                     // number replaces it, no manual deleting.
-                                    // Deferred a beat — the browser places the
-                                    // caret AFTER the focus handler runs and
-                                    // would collapse the selection again.
+                                    // Select synchronously (real clicks) AND
+                                    // deferred (programmatic focus restores the
+                                    // caret after the handler; automated input
+                                    // types before the deferred pass runs).
+                                    if let Some(input) = web_sys::window()
+                                        .and_then(|w| w.document())
+                                        .and_then(|d| d.get_element_by_id("scale-input"))
+                                        .and_then(|el| {
+                                            el.dyn_into::<web_sys::HtmlInputElement>().ok()
+                                        })
+                                    {
+                                        input.select();
+                                    }
                                     spawn(async move {
                                         sleep_ms(20).await;
                                         if let Some(input) = web_sys::window()

@@ -2670,10 +2670,17 @@ fn RecipeDetail(id: i64) -> Element {
                                 onfocus: move |_| {
                                     // Select the current value: tap + type a
                                     // number replaces it, no manual deleting.
-                                    // Deferred a beat — the browser places the
-                                    // caret AFTER the focus handler runs and
-                                    // would collapse the selection again.
+                                    // Select immediately AND deferred — the
+                                    // browser restores the caret after the
+                                    // handler for programmatic focus, while
+                                    // automated input can type before the
+                                    // deferred pass runs.
                                     spawn(async move {
+                                        dioxus::document::eval(
+                                            "document.getElementById('scale-input')?.select()",
+                                        )
+                                        .await
+                                        .ok();
                                         tokio::time::sleep(
                                             std::time::Duration::from_millis(20),
                                         )

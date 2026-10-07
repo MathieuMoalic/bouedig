@@ -50,6 +50,13 @@
 
       # Release web bundle (dx handles wasm-bindgen itself; only wasm-opt
       # comes from PATH via binaryen).
+      #
+      # dx feeds wasm-opt a module that carries DWARF debug info (dx builds
+      # with debug info even in release), and binaryen 132 aborts when it
+      # writes those sections back (llvm_unreachable in its DWARF-YAML
+      # emitter) — the wasm-opt SIGABRT every release build hit. The shim
+      # strips the debug sections before optimizing: no abort, and the
+      # shipped wasm drops the debug payload it had been carrying.
       mkWeb = pkgs:
         let toolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" ];
@@ -59,7 +66,13 @@
           pname = "bouedig-web";
           inherit version;
           src = bouedigSrc pkgs;
-          nativeBuildInputs = [ toolchain pkgs.dioxus-cli pkgs.binaryen ];
+          nativeBuildInputs = [
+            toolchain
+            pkgs.dioxus-cli
+            (pkgs.writeShellScriptBin "wasm-opt" ''
+              exec ${pkgs.binaryen}/bin/wasm-opt --strip-dwarf "$@"
+            '')
+          ];
 
           cargoDeps = pkgs.rustPlatform.importCargoLock {
             lockFile = ./Cargo.lock;
@@ -463,6 +476,12 @@
             pkgs.geckodriver
             pkgs.firefox
             pkgs.android-tools
+            # Shim ahead of binaryen: dx builds the web wasm with debug info
+            # even in release, and binaryen 132 aborts writing those DWARF
+            # sections back — the wrapper strips them first (see mkWeb).
+            (pkgs.writeShellScriptBin "wasm-opt" ''
+              exec ${pkgs.binaryen}/bin/wasm-opt --strip-dwarf "$@"
+            '')
             pkgs.binaryen # wasm-opt, required by `dx build --release`
             pkgs.python3 # scripts/release.py
             pkgs.gh # GitHub release publishing (`just release`)
