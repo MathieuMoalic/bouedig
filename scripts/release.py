@@ -211,33 +211,78 @@ def build_apk(version: str) -> Path:
             shutil.copy2(src, dest)
 
     def stamp_manifest() -> None:
-        # Bottom sheets must sit above the keyboard: without adjustResize the
-        # webview keeps its full height and the IME overlays the sheets (the
-        # add/edit/move inputs become invisible while typing). dx does not
-        # emit this attribute; patch the generated manifest if it's there.
+        # Two patches to dx's generated manifest, both idempotent:
+        # 1. adjustResize — bottom sheets must sit above the keyboard;
+        #    without it the IME overlays the sheets and their inputs are
+        #    invisible while typing.
+        # 2. FileProvider — the camera picker hands the camera app a content
+        #    Uri for the captured photo.
         manifest = app_dir / "app" / "src" / "main" / "AndroidManifest.xml"
         try:
             text = manifest.read_text()
         except FileNotFoundError:
             return
-        if "windowSoftInputMode" in text:
-            return
-        patched = text.replace(
-            'android:name="dev.dioxus.main.MainActivity"',
-            'android:name="dev.dioxus.main.MainActivity" '
-            'android:windowSoftInputMode="adjustResize"',
-            1,
+        original = text
+        if "windowSoftInputMode" not in text:
+            text = text.replace(
+                'android:name="dev.dioxus.main.MainActivity"',
+                'android:name="dev.dioxus.main.MainActivity" '
+                'android:windowSoftInputMode="adjustResize"',
+                1,
+            )
+        if "fileprovider" not in text:
+            text = text.replace(
+                "</application>",
+                """<provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>""",
+                1,
+            )
+        if text != original:
+            manifest.write_text(text)
+            print(f"+ stamped manifest patches into {manifest}", flush=True)
+
+    def stamp_main_activity() -> None:
+        # The webview's <input type=file> never opens a chooser on Android
+        # (wry attaches its chrome client but onShowFileChooser is never
+        # called). Patch MainActivity to expose the native BouedigNative
+        # bridge (photo library + camera) that the import screen uses. The
+        # full source lives in frontend-android/launcher/MainActivity.kt.
+        source = ANDROID / "launcher" / "MainActivity.kt"
+        target = (
+            app_dir / "app" / "src" / "main" / "kotlin" / "dev" / "dioxus" / "main" / "MainActivity.kt"
         )
-        if patched != text:
-            manifest.write_text(patched)
-            print(f"+ stamped windowSoftInputMode into {manifest}", flush=True)
+        if source.exists() and target.parent.exists():
+            shutil.copy2(source, target)
+            print(f"+ stamped {target}", flush=True)
+
+    def stamp_file_paths() -> None:
+        res_xml = res_dir / "xml"
+        res_xml.mkdir(parents=True, exist_ok=True)
+        (res_xml / "file_paths.xml").write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="import_cache" path="." />
+    <external-files-path name="captured_pictures" path="Pictures/" />
+</paths>
+"""
+        )
 
     wipe_mipmaps()
     # The manifest references @style/BouedigTheme, so the values file must
     # exist before dx's own gradle run — values only, because the full set
     # would collide with the stock mipmaps dx re-copies during the build.
     stamp_launcher(values_only=True)
+    stamp_file_paths()
     stamp_manifest()
+    stamp_main_activity()
     for jni in app_dir.glob("app/src/main/jniLibs"):
         shutil.rmtree(jni)
     env = dict(os.environ, BOUEDIG_API_BASE=PROD_API_BASE)
@@ -252,6 +297,8 @@ def build_apk(version: str) -> Path:
     # project was generated fresh; ensure the stamp and re-package later via
     # the assembleDebug re-run below regardless.
     stamp_manifest()
+    stamp_main_activity()
+    stamp_file_paths()
 
     # dx packaged the APK with its stock icons; swap in ours (full set incl.
     # the launcher mipmaps) and re-run gradle so the artifact carries them.

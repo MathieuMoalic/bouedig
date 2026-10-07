@@ -2269,9 +2269,11 @@ async fn import_from_image_flow() -> anyhow::Result<()> {
             detail["name"] == "Photo Pancakes",
             "saved recipe wrong: {detail}"
         );
+        // The import photo is NOT used as the recipe image (user decision) —
+        // the recipe saves without one.
         anyhow::ensure!(
-            detail["image"].as_str().unwrap_or_default().starts_with("/api/images/"),
-            "the picked photo must be stored as the recipe image: {detail}"
+            detail["image"].as_str().is_none(),
+            "import photo must not become the recipe image: {detail}"
         );
         let ingredients = detail["ingredients"]
             .as_array()

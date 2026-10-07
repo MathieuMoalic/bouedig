@@ -1202,7 +1202,6 @@ fn ImportRecipe() -> Element {
                     RecipeFormFields {
                         initial: detail,
                         initial_image_url: image_url,
-                        initial_photo: None,
                         editing_id: None,
                     }
                 }
@@ -1217,36 +1216,68 @@ fn ImportRecipe() -> Element {
 /// image unless the user replaces it.
 #[component]
 fn ImportImage() -> Element {
-    let mut image = use_signal(|| None::<(String, Vec<u8>)>);
+    let images = use_signal(Vec::<(String, Vec<u8>)>::new);
     let mut loading = use_signal(|| false);
     let mut error = use_signal(|| String::new());
     let mut preview = use_signal(|| None::<ImportPreview>);
     let mut show_warnings = use_signal(|| true);
 
-    // Read the picked file into memory; the submit posts it as-is.
-    let pick = move |e: FormEvent| {
-        let files = e.files();
+    // The webview's <input type=file> never opens a chooser on Android (wry
+    // gap), so picking goes through the native BouedigNative bridge: Kotlin
+    // launches the library/camera picker, downscales the result into the
+    // app cache, and the Rust side polls for the file by name.
+    const IMPORT_CACHE: &str = "/data/data/eu.matmoa.bouedig/cache/import.jpg";
+    const IMPORT_CANCEL: &str = "/data/data/eu.matmoa.bouedig/cache/import.cancelled";
+
+    let request_native_pick = |which: String| {
+        // Start a fresh pick: clear both marker files.
+        let _ = std::fs::remove_file(IMPORT_CACHE);
+        let _ = std::fs::remove_file(IMPORT_CANCEL);
         spawn(async move {
-            if let Some(file) = files.into_iter().next() {
-                match file.read_bytes().await {
-                    Ok(bytes) => {
-                        error.set(String::new());
-                        image.set(Some((file.name(), bytes.to_vec())));
+            dioxus::document::eval(&format!(
+                "if (window.BouedigNative) {{ BouedigNative.pick{which}(); }}"
+            ))
+            .await
+            .ok();
+        });
+    };
+
+    // Poll for the native picker's outcome: the downscaled photo file (the
+    // pick) or the cancelled marker. The picker can stay open for minutes.
+    let wait_for_pick = |mut error: Signal<String>, mut images: Signal<Vec<(String, Vec<u8>)>>| {
+        spawn(async move {
+            for _ in 0..750 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                if std::path::Path::new(IMPORT_CANCEL).exists() {
+                    let _ = std::fs::remove_file(IMPORT_CANCEL);
+                    error.set("No photo was picked.".into());
+                    return;
+                }
+                let path = std::path::Path::new(IMPORT_CACHE);
+                if path.exists() {
+                    match std::fs::read(path) {
+                        Ok(bytes) => {
+                            images.with_mut(|v| {
+                                v.push(("photo.jpg".to_string(), bytes));
+                            });
+                            let _ = std::fs::remove_file(IMPORT_CACHE);
+                            error.set(String::new());
+                        }
+                        Err(err) => {
+                            tracing::error!("native pick unreadable: {err:#}");
+                            error.set("Could not read the picked photo.".into());
+                        }
                     }
-                    Err(err) => {
-                        tracing::error!("failed to read the picked image: {err:#}");
-                        error.set("Could not read that file.".into());
-                    }
+                    return;
                 }
             }
+            error.set("No photo was picked.".into());
         });
     };
 
     let import = move |_| {
-        let Some((filename, bytes)) = image.read().clone() else {
-            return;
-        };
-        if *loading.read() {
+        let picked = images.read().clone();
+        if picked.is_empty() || *loading.read() {
             return;
         }
         loading.set(true);
@@ -1259,13 +1290,19 @@ fn ImportImage() -> Element {
                     .map(|d| d.as_millis())
                     .unwrap_or(0)
             );
-            let mut body = format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; \
-                 filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-            )
-            .into_bytes();
-            body.extend_from_slice(&bytes);
-            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let mut body: Vec<u8> = Vec::new();
+            for (filename, bytes) in &picked {
+                body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; \
+                         filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
             let result = http()
                 .post(format!("{}/api/recipes/import-image", api_base()))
@@ -1311,10 +1348,15 @@ fn ImportImage() -> Element {
         });
     };
 
-    let image_snapshot = image.read().clone();
-    let picked_note: Option<String> = image_snapshot
-        .as_ref()
-        .map(|(name, bytes)| format!("{name} ({} bytes)", bytes.len()));
+    let images_snapshot = images.read().clone();
+    let picked_note: Option<String> = (!images_snapshot.is_empty()).then(|| {
+        let total: usize = images_snapshot.iter().map(|(_, b)| b.len()).sum();
+        format!(
+            "{} photo(s), {} bytes — pages of the same recipe combine into one",
+            images_snapshot.len(),
+            total
+        )
+    });
     let preview_snapshot = preview.read().clone();
     match preview_snapshot {
         None => rsx! {
@@ -1323,14 +1365,29 @@ fn ImportImage() -> Element {
                     h1 { "Import from image" }
                     p { class: "muted",
                         "Pick a photo of a recipe — a cookbook page, a recipe card \
-                         or a screenshot. Bouedig reads it and lets you review the \
-                         result before saving. The photo becomes the recipe image."
+                         or a screenshot. Several photos (e.g. two pages) combine \
+                         into one recipe. Bouedig reads them and lets you review \
+                         the result before saving."
                     }
-                    input {
+                    button {
                         id: "import-image",
-                        r#type: "file",
-                        accept: "image/*",
-                        onchange: pick,
+                        class: "btn-primary",
+                        r#type: "button",
+                        onclick: move |_| {
+                            request_native_pick("FromLibrary".to_string());
+                            wait_for_pick(error, images);
+                        },
+                        "Choose from photo library"
+                    }
+                    button {
+                        id: "import-image-camera",
+                        class: "btn-primary",
+                        r#type: "button",
+                        onclick: move |_| {
+                            request_native_pick("Photo".to_string());
+                            wait_for_pick(error, images);
+                        },
+                        "Take a photo"
                     }
                     if let Some(note) = &picked_note {
                         p { class: "muted", "{note}" }
@@ -1383,7 +1440,6 @@ fn ImportImage() -> Element {
                     RecipeFormFields {
                         initial: detail,
                         initial_image_url: None,
-                        initial_photo: image_snapshot,
                         editing_id: None,
                     }
                 }
@@ -1421,10 +1477,18 @@ fn RecipeForm(editing: Option<i64>) -> Element {
     let loaded = detail.read().clone();
     match (editing, loaded) {
         (None, _) => rsx! {
-            RecipeFormFields { initial: RecipeDetailModel::default(), initial_image_url: None, initial_photo: None, editing_id: None }
+            RecipeFormFields {
+                initial: RecipeDetailModel::default(),
+                initial_image_url: None,
+                editing_id: None,
+            }
         },
         (Some(_), Some(initial)) => rsx! {
-            RecipeFormFields { initial: initial, initial_image_url: None, initial_photo: None, editing_id: editing }
+            RecipeFormFields {
+                initial: initial,
+                initial_image_url: None,
+                editing_id: editing,
+            }
         },
         (Some(_), None) => rsx! {
             if load_error.read().is_empty() {
@@ -1496,9 +1560,6 @@ fn IconHandle() -> Element {
 fn RecipeFormFields(
     initial: RecipeDetailModel,
     initial_image_url: Option<String>,
-    /// A photo to start with (the picked import image) — pre-seeds the photo
-    /// signal so saving uploads it like a manual photo.
-    initial_photo: Option<(String, Vec<u8>)>,
     editing_id: Option<i64>,
 ) -> Element {
     // One shared id counter so element ids never collide across lists.
@@ -1574,7 +1635,7 @@ fn RecipeFormFields(
     let mut modal = use_signal(|| None::<Modal>);
     let mut drag = use_signal(|| None::<DragState>);
     let mut suppress_click = use_signal(|| false);
-    let mut photo = use_signal(move || initial_photo.clone());
+    let mut photo = use_signal(|| None::<(String, Vec<u8>)>);
     let mut status = use_signal(|| String::new());
     let mut status_error = use_signal(|| false);
     let navigator = use_navigator();

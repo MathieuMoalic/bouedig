@@ -1220,11 +1220,11 @@ async fn import_recipe_from_url(
     }
 }
 
-/// `POST /api/recipes/import-image`: read a recipe from a photo with the
-/// configured vision model and return it as a **preview** (same contract as
-/// the URL import). Nothing is persisted here — the client reviews/edits the
-/// preview and saves it through the normal create/update endpoints, keeping
-/// the picked photo as the recipe image.
+/// `POST /api/recipes/import-image`: read a recipe from one or more photos
+/// (e.g. two pages of the same cookbook recipe) with the configured vision
+/// model and return it as a **preview** (same contract as the URL import).
+/// Nothing is persisted here — the client reviews/edits the preview and
+/// saves it through the normal create/update endpoints.
 async fn import_recipe_from_image(
     axum::extract::State(state): axum::extract::State<AppState>,
     mut multipart: axum::extract::Multipart,
@@ -1235,7 +1235,7 @@ async fn import_recipe_from_image(
             "image import is not configured on this server".to_string(),
         ));
     };
-    let mut image: Option<Vec<u8>> = None;
+    let mut images: Vec<Vec<u8>> = Vec::new();
     while let Some(field) = multipart
         .next_field()
         .await
@@ -1257,26 +1257,30 @@ async fn import_recipe_from_image(
         if bytes.len() > recipe_import::vision::MAX_IMAGE_BYTES {
             return Err(ApiError::client(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "image is too large (max 15 MiB)".to_string(),
+                "an image is too large (max 15 MiB each)".to_string(),
             ));
         }
-        image = Some(bytes.to_vec());
+        images.push(bytes.to_vec());
     }
-    let Some(bytes) = image else {
+    if images.is_empty() {
         return Err(ApiError::client(
             StatusCode::BAD_REQUEST,
             "no image attached (field \"image\")".to_string(),
         ));
-    };
-    let Some(mime) = sniff_image_mime(&bytes) else {
-        return Err(ApiError::client(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported image format (use JPEG, PNG or WebP)".to_string(),
-        ));
-    };
+    }
+    let mut extracted: Vec<(Vec<u8>, &'static str)> = Vec::new();
+    for bytes in &images {
+        let Some(mime) = sniff_image_mime(bytes) else {
+            return Err(ApiError::client(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported image format (use JPEG, PNG or WebP)".to_string(),
+            ));
+        };
+        extracted.push((bytes.clone(), mime));
+    }
 
     let started = std::time::Instant::now();
-    let (recipe, mut warnings) = match vision.extract(&bytes, mime).await {
+    let (recipe, mut warnings) = match vision.extract(&extracted).await {
         Ok(result) => result,
         Err(err @ recipe_import::vision::VisionError::Upstream(_)) => {
             return Err(ApiError::client(StatusCode::BAD_GATEWAY, err.to_string()))
@@ -1302,7 +1306,7 @@ async fn import_recipe_from_image(
         method = "vision",
         confidence = %format!("{:.2}", score.confidence),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        bytes = bytes.len(),
+        images = extracted.len(),
         "recipe import from image succeeded"
     );
     Ok((

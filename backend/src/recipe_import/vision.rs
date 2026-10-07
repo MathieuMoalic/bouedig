@@ -7,6 +7,7 @@
 //! reviews and fixes it before saving.
 
 use base64::Engine as _;
+use serde_json::Value;
 
 /// Hard cap on the uploaded photo (mirrors a phone camera JPEG; larger files
 /// are rejected with 413 before any base64 work).
@@ -75,26 +76,29 @@ impl VisionExtractor {
         })
     }
 
-    /// Send the photo and parse the answer into a recipe. The returned
+    /// Send the photo(s) and parse the answer into a recipe. The returned
     /// warnings flag things worth a human review (unreadable regions the
-    /// model itself calls out).
+    /// model itself calls out, lines it had to skip).
     pub async fn extract(
         &self,
-        image: &[u8],
-        mime: &str,
+        images: &[(Vec<u8>, &'static str)],
     ) -> Result<(shared::RecipeInput, Vec<String>), VisionError> {
-        let data_uri = format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(image)
-        );
+        let mut content = vec![serde_json::json!({"type": "text", "text": USER_PROMPT})];
+        for (image, mime) in images {
+            let data_uri = format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(image)
+            );
+            content.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": data_uri},
+            }));
+        }
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "text", "text": USER_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                ]},
+                {"role": "user", "content": content},
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
@@ -126,12 +130,56 @@ impl VisionExtractor {
         Self::parse_recipe(content)
     }
 
+    /// Models answer `null` for fields the photo doesn't show, but
+    /// `RecipeInput` wants real strings (name/text/notes/yield). Sanitize in
+    /// place: nulls in string slots become empty strings, and lines without
+    /// a readable name/text are dropped entirely (counted for the warning).
+    /// Returns how many ingredient/instruction lines were dropped.
+    fn sanitize(value: &mut serde_json::Value) -> usize {
+        let mut dropped = 0;
+        if value.get("name").map(Value::is_null).unwrap_or(false) {
+            value["name"] = Value::String(String::new());
+        }
+        for key in ["notes", "yield"] {
+            if value.get(key).map(Value::is_null).unwrap_or(false) {
+                value[key] = Value::String(String::new());
+            }
+        }
+        for key in ["sections", "instruction_sections"] {
+            if let Some(arr) = value.get_mut(key).and_then(Value::as_array_mut) {
+                arr.retain(|entry| !entry.is_null());
+            }
+        }
+        if let Some(arr) = value.get_mut("ingredients").and_then(Value::as_array_mut) {
+            let before = arr.len();
+            arr.retain(|item| {
+                !item
+                    .get("name")
+                    .map(|n| n.is_null() || n.as_str().is_some_and(|s| s.trim().is_empty()))
+                    .unwrap_or(true)
+            });
+            dropped += before - arr.len();
+        }
+        if let Some(arr) = value.get_mut("instructions").and_then(Value::as_array_mut) {
+            let before = arr.len();
+            arr.retain(|item| {
+                !item
+                    .get("text")
+                    .map(|t| t.is_null() || t.as_str().is_some_and(|s| s.trim().is_empty()))
+                    .unwrap_or(true)
+            });
+            dropped += before - arr.len();
+        }
+        dropped
+    }
+
     /// Strictly parse the model's answer into a recipe: a JSON object that
     /// deserializes into `RecipeInput` and carries the minimum a recipe
     /// needs (a name, ingredients, instructions).
     pub fn parse_recipe(content: &str) -> Result<(shared::RecipeInput, Vec<String>), VisionError> {
-        let value: serde_json::Value = serde_json::from_str(content)
+        let mut value: serde_json::Value = serde_json::from_str(content)
             .map_err(|err| VisionError::BadResponse(format!("answer was not JSON: {err}")))?;
+        let dropped = Self::sanitize(&mut value);
         let mut recipe: shared::RecipeInput = serde_json::from_value(value)
             .map_err(|err| VisionError::BadResponse(format!("answer shape wrong: {err}")))?;
         recipe.name = recipe.name.trim().to_string();
@@ -152,7 +200,7 @@ impl VisionExtractor {
         }
         // Conservative by house rules: surface what the model itself was
         // unsure about so the preview makes it visible.
-        let warnings: Vec<String> = recipe
+        let mut warnings: Vec<String> = recipe
             .ingredients
             .iter()
             .filter(|i| i.quantity.is_none())
@@ -164,6 +212,11 @@ impl VisionExtractor {
                 }
             })
             .collect();
+        if dropped > 0 {
+            warnings.push(format!(
+                "{dropped} unreadable line(s) were skipped — please check the photo"
+            ));
+        }
         Ok((recipe, warnings))
     }
 }
@@ -172,17 +225,18 @@ const SYSTEM_PROMPT: &str = "You are a recipe-extraction engine for a cooking ap
     You read recipes from photos of cookbook pages, recipe cards, screenshots or \
     handwritten notes and answer with strict JSON only — no markdown, no commentary.";
 
-const USER_PROMPT: &str = r#"Extract the recipe shown in this photo. Respond with only a JSON object with exactly these keys:
+const USER_PROMPT: &str = r#"The attached photo(s) show a recipe — possibly split across several pages. Extract it into one recipe. Respond with only a JSON object with exactly these keys:
 
 {"name": string, "sections": [string], "ingredients": [{"quantity": number | null, "unit": string | null, "name": string, "prep": string | null, "section": string | null}], "instructions": [{"text": string, "section": string | null}], "instruction_sections": [string], "notes": string, "yield": string}
 
 Rules:
+- "name", "text", "notes" and "yield" are always strings — use "" when the photo shows nothing for them. NEVER use null for these.
 - "quantity" is a number when the photo shows one (0.5 for ½), otherwise null. Never guess a quantity.
 - Convert imperial units to metric: volumes to ml, weights to g. Keep teaspoons (tsp) and tablespoons (tbsp) as-is. Use short unit names: g, kg, ml, l, tsp, tbsp, pinch, can, clove.
-- "sections" lists the ingredient-group headings the photo shows; set each ingredient's "section" to its group, null when ungrouped.
+- "sections" lists the ingredient-group headings the photos show; set each ingredient's "section" to its group, null when ungrouped.
 - "instruction_sections" lists step-group headings; set each instruction's "section" likewise, null when ungrouped.
 - Never invent ingredients or steps that are not visible. If a region is unreadable, extract the rest and append to "notes" like "unreadable: last two steps".
-- "yield" is the servings/yield line, empty string when the photo shows none."#;
+- "yield" is the servings/yield line, empty string when the photos show none."#;
 
 #[cfg(test)]
 mod tests {
@@ -224,13 +278,37 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    #[test]
+    fn parse_recipe_tolerates_nulls_from_the_model() {
+        let nulls = r#"{"name":"Stew","sections":["Base"],"ingredients":[
+            {"quantity":null,"unit":"g","name":"lentils","prep":null,"section":"Base"},
+            {"quantity":null,"unit":null,"name":null,"prep":null,"section":null}],
+            "instructions":[{"text":null,"section":null},{"text":"Simmer.","section":null}],
+            "instruction_sections":[],"notes":null,"yield":null}"#;
+        let (recipe, warnings) = VisionExtractor::parse_recipe(nulls).unwrap();
+        assert_eq!(recipe.notes, "");
+        assert_eq!(recipe.yield_amount, "");
+        assert_eq!(
+            recipe.ingredients.len(),
+            1,
+            "a line with a null name must be dropped"
+        );
+        assert_eq!(recipe.instructions.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unreadable line")),
+            "dropped lines must be surfaced: {warnings:?}"
+        );
+    }
+
     #[tokio::test]
     async fn extract_reports_unreachable_endpoint_as_upstream() {
         let extractor =
             VisionExtractor::from_parts(Some("key".into()), Some("test-model".into()),
                 Some("http://127.0.0.1:9/v1/chat/completions".into()))
             .unwrap();
-        match extractor.extract(b"png", "image/png").await {
+        match extractor.extract(&[(b"png".to_vec(), "image/png")]).await {
             Err(VisionError::Upstream(_)) => {}
             other => panic!("expected Upstream, got {other:?}"),
         }
