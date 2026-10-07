@@ -59,6 +59,12 @@ pub struct Config {
     /// Classifier endpoint override (`BOUEDIG_CLASSIFIER_ENDPOINT`), used by
     /// tests to point at a local mock.
     pub classifier_endpoint: Option<String>,
+    /// Vision model slug for photo import (`BOUEDIG_VISION_MODEL`). Absent →
+    /// `POST /api/recipes/import-image` answers 503.
+    pub vision_model: Option<String>,
+    /// Vision endpoint override (`BOUEDIG_VISION_ENDPOINT`), used by tests
+    /// to point at a local mock.
+    pub vision_endpoint: Option<String>,
     /// Household password (`BOUEDIG_PASSWORD`). When set, recipe browsing
     /// stays public but every other API call needs a session cookie; unset
     /// disables auth entirely (dev/test default).
@@ -97,6 +103,8 @@ impl Config {
             openrouter_key: std::env::var("BOUEDIG_OPENROUTER_KEY").ok(),
             classifier_model: std::env::var("BOUEDIG_CLASSIFIER_MODEL").ok(),
             classifier_endpoint: std::env::var("BOUEDIG_CLASSIFIER_ENDPOINT").ok(),
+            vision_model: std::env::var("BOUEDIG_VISION_MODEL").ok(),
+            vision_endpoint: std::env::var("BOUEDIG_VISION_ENDPOINT").ok(),
             password: std::env::var("BOUEDIG_PASSWORD").ok().filter(|p| !p.is_empty()),
             secure_cookies: std::env::var("BOUEDIG_SECURE_COOKIES")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -113,6 +121,9 @@ pub struct AppState {
     import_allow_private: bool,
     /// Present only when an OpenRouter key is configured.
     classifier: Option<classifier::Classifier>,
+    /// Present only when an OpenRouter key AND a vision model are
+    /// configured.
+    vision: Option<recipe_import::vision::VisionExtractor>,
     /// Household password; `None` disables auth entirely.
     password: Option<String>,
     /// Append `; Secure` to session cookies (production behind TLS).
@@ -129,6 +140,11 @@ impl AppState {
                 config.openrouter_key.clone(),
                 config.classifier_model.clone(),
                 config.classifier_endpoint.clone(),
+            ),
+            vision: recipe_import::vision::VisionExtractor::from_parts(
+                config.openrouter_key.clone(),
+                config.vision_model.clone(),
+                config.vision_endpoint.clone(),
             ),
             password: config.password.clone(),
             secure_cookies: config.secure_cookies,
@@ -170,6 +186,10 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
         .route(
             "/recipes/import",
             post(import_recipe_from_url),
+        )
+        .route(
+            "/recipes/import-image",
+            post(import_recipe_from_image),
         )
         .route(
             "/recipes/{id}",
@@ -1200,6 +1220,116 @@ async fn import_recipe_from_url(
     }
 }
 
+/// `POST /api/recipes/import-image`: read a recipe from a photo with the
+/// configured vision model and return it as a **preview** (same contract as
+/// the URL import). Nothing is persisted here — the client reviews/edits the
+/// preview and saves it through the normal create/update endpoints, keeping
+/// the picked photo as the recipe image.
+async fn import_recipe_from_image(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<(StatusCode, Json<RecipePreview>), ApiError> {
+    let Some(vision) = state.vision.clone() else {
+        return Err(ApiError::client(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "image import is not configured on this server".to_string(),
+        ));
+    };
+    let mut image: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::client(
+            StatusCode::BAD_REQUEST,
+            format!("could not read the upload: {err}"),
+        ))?
+    {
+        if field.name() != Some("image") {
+            continue;
+        }
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|err| ApiError::client(
+                StatusCode::BAD_REQUEST,
+                format!("could not read the image: {err}"),
+            ))?;
+        if bytes.len() > recipe_import::vision::MAX_IMAGE_BYTES {
+            return Err(ApiError::client(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "image is too large (max 15 MiB)".to_string(),
+            ));
+        }
+        image = Some(bytes.to_vec());
+    }
+    let Some(bytes) = image else {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            "no image attached (field \"image\")".to_string(),
+        ));
+    };
+    let Some(mime) = sniff_image_mime(&bytes) else {
+        return Err(ApiError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported image format (use JPEG, PNG or WebP)".to_string(),
+        ));
+    };
+
+    let started = std::time::Instant::now();
+    let (recipe, mut warnings) = match vision.extract(&bytes, mime).await {
+        Ok(result) => result,
+        Err(err @ recipe_import::vision::VisionError::Upstream(_)) => {
+            return Err(ApiError::client(StatusCode::BAD_GATEWAY, err.to_string()))
+        }
+        Err(err @ recipe_import::vision::VisionError::BadResponse(_)) => {
+            return Err(ApiError::client(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                err.to_string(),
+            ))
+        }
+    };
+    // Same informational scoring as the URL import; the vision-specific
+    // warnings (lines without a quantity) come first.
+    let score = recipe_import::score::score(&recipe_import::score::ScoreInput {
+        recipe: &recipe,
+        from_json_ld: false,
+        html_ingredient_count: None,
+        html_only: false,
+        ingredients_without_quantity: Vec::new(),
+    });
+    warnings.extend(score.warnings);
+    tracing::info!(
+        method = "vision",
+        confidence = %format!("{:.2}", score.confidence),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        bytes = bytes.len(),
+        "recipe import from image succeeded"
+    );
+    Ok((
+        StatusCode::OK,
+        Json(RecipePreview {
+            image_url: None,
+            recipe,
+            method: recipe_import::ExtractionMethod::Vision,
+            confidence: score.confidence,
+            warnings,
+        }),
+    ))
+}
+
+/// Magic-byte sniffing for the image formats the vision call accepts.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 async fn list_recipes(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<Vec<Recipe>>, ApiError> {
@@ -1690,6 +1820,8 @@ pub(crate) mod tests {
             openrouter_key: None,
             classifier_model: None,
             classifier_endpoint: None,
+            vision_model: None,
+            vision_endpoint: None,
             password: None,
             secure_cookies: false,
         }
@@ -1723,8 +1855,36 @@ pub(crate) mod tests {
                 Some("typesafe-ai/jev".into()),
                 Some(endpoint),
             ),
+            vision: None,
         };
         (build_router(state.clone(), &config), state.db)
+    }
+
+    /// Router with a vision extractor pointed at `endpoint` — a local mock
+    /// server in the tests.
+    pub(crate) async fn test_router_with_vision(endpoint: String) -> Router {
+        let config = test_config(None, None);
+        ensure_data_dirs(&config.data_dir).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let state = AppState {
+            db: pool,
+            data_dir: config.data_dir.clone(),
+            import_allow_private: true,
+            password: None,
+            secure_cookies: false,
+            classifier: None,
+            vision: recipe_import::vision::VisionExtractor::from_parts(
+                Some("test-key".into()),
+                Some("test-vision-model".into()),
+                Some(endpoint),
+            ),
+        };
+        build_router(state, &config)
     }
 
     /// HTTP server that counts requests and always answers `body` with
@@ -3262,6 +3422,203 @@ pub(crate) mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let recipe: Recipe = serde_json::from_slice(&bytes).unwrap();
         assert!(recipe.image.is_none(), "failed download must not block the save");
+    }
+
+    /// HTTP server that records every request body into `log` and always
+    /// answers `body` with `status` — a vision-endpoint stand-in whose
+    /// received payload the test can assert on.
+    fn capturing_server(
+        log: std::sync::Arc<std::sync::Mutex<String>>,
+        body: &'static str,
+        status: &'static str,
+    ) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // Read until the headers promise a Content-Length that has
+                // fully arrived (the OpenRouter JSON carries the base64
+                // image, so it exceeds one 8 KiB read).
+                use std::io::Read;
+                let mut buffer: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 16384];
+                loop {
+                    let Ok(n) = stream.read(&mut chunk) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..n]);
+                    if let Some(header_end) = buffer
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buffer).into_owned();
+                if let Ok(mut log) = log.lock() {
+                    log.push_str(&text);
+                }
+                use std::io::Write;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// A multipart body with a single binary `image` field.
+    fn multipart_with_image(boundary: &str, image: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; \
+                 filename=\"photo.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    #[tokio::test]
+    async fn import_image_extracts_via_the_vision_model() {
+        let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        let answer = openrouter_answer(
+            r#"{"name":"Photo Cake","sections":[],"ingredients":[
+                {"quantity":300,"unit":"g","name":"flour","prep":null,"section":null},
+                {"quantity":null,"unit":null,"name":"salt","prep":null,"section":null}],
+                "instructions":[{"text":"Mix.","section":null}],
+                "instruction_sections":[],"notes":"","yield":"8 slices"}"#,
+        );
+        let addr = capturing_server(log.clone(), answer, "200 OK");
+        let app = test_router_with_vision(format!("http://{addr}/v1/chat/completions")).await;
+
+        // A real PNG (magic bytes are what the endpoint sniffs).
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[1, 2, 3, 4]);
+        let boundary = "VisionBnd";
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/import-image")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(multipart_with_image(boundary, &png)))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let preview: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(preview["method"], "vision");
+        assert_eq!(preview["recipe"]["name"], "Photo Cake");
+        assert_eq!(preview["recipe"]["yield"], "8 slices");
+        let warnings = preview["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| w.as_str().unwrap().contains("salt")),
+            "missing-quantity lines must be surfaced: {warnings:?}"
+        );
+
+        // The vision call carried the model slug and the photo as a base64
+        // data URI.
+        let captured = log.lock().unwrap().clone();
+        assert!(
+            captured.contains("\"model\":\"test-vision-model\""),
+            "captured request head: {}", &captured[..captured.len().min(300)]
+        );
+        assert!(captured.contains("data:image/png;base64,"), "captured: {captured}");
+    }
+
+    #[tokio::test]
+    async fn import_image_without_configuration_is_503() {
+        let app = test_router(None).await;
+        let boundary = "VisionBnd";
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/import-image")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(multipart_with_image(boundary, b"\x89PNG\r\n\x1a\n")))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn import_image_upstream_error_is_502() {
+        let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        let addr = capturing_server(log, "{}", "500 Internal Server Error");
+        let app = test_router_with_vision(format!("http://{addr}/v1/chat/completions")).await;
+        let boundary = "VisionBnd";
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/import-image")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(multipart_with_image(boundary, b"\x89PNG\r\n\x1a\n")))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn import_image_unusable_answer_is_422() {
+        let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        let addr = capturing_server(log, openrouter_answer("I see no recipe here"), "200 OK");
+        let app = test_router_with_vision(format!("http://{addr}/v1/chat/completions")).await;
+        let boundary = "VisionBnd";
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/import-image")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(multipart_with_image(boundary, b"\x89PNG\r\n\x1a\n")))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn import_image_without_a_file_is_400() {
+        let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        let addr = capturing_server(log, "{}", "200 OK");
+        let app = test_router_with_vision(format!("http://{addr}/v1/chat/completions")).await;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/import-image")
+            .header("content-type", "multipart/form-data; boundary=EmptyBnd")
+            .body(Body::from("--EmptyBnd--\r\n"))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn import_image_rejects_non_image_bytes() {
+        let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        let addr = capturing_server(log, "{}", "200 OK");
+        let app = test_router_with_vision(format!("http://{addr}/v1/chat/completions")).await;
+        let boundary = "VisionBnd";
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/recipes/import-image")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(multipart_with_image(boundary, b"plain text, not an image")))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// The full plan Phase 13 journey: import preview → save → retrieve and

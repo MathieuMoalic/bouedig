@@ -313,6 +313,16 @@
               description = "Classifier API endpoint override.";
             };
 
+            visionModel = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = ''
+                OpenRouter vision-capable model for import-from-image
+                (e.g. "google/gemini-2.5-flash"). Uses the same OpenRouter
+                key as the classifier; null disables image import.
+              '';
+            };
+
             importAllowPrivate = lib.mkOption {
               type = lib.types.bool;
               default = false;
@@ -365,6 +375,7 @@
               // lib.optionalAttrs (cfg.openrouterKey != null) { BOUEDIG_OPENROUTER_KEY = cfg.openrouterKey; }
               // lib.optionalAttrs (cfg.classifierModel != null) { BOUEDIG_CLASSIFIER_MODEL = cfg.classifierModel; }
               // lib.optionalAttrs (cfg.classifierEndpoint != null) { BOUEDIG_CLASSIFIER_ENDPOINT = cfg.classifierEndpoint; }
+              // lib.optionalAttrs (cfg.visionModel != null) { BOUEDIG_VISION_MODEL = cfg.visionModel; }
               // lib.optionalAttrs cfg.importAllowPrivate { BOUEDIG_IMPORT_ALLOW_PRIVATE = "1"; };
 
               script = ''

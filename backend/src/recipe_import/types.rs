@@ -22,6 +22,18 @@ pub struct FetchedPage {
 pub enum ExtractionMethod {
     JsonLd,
     Html,
+    Vision,
+}
+
+impl ExtractionMethod {
+    /// Stable lowercase name for logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtractionMethod::JsonLd => "json_ld",
+            ExtractionMethod::Html => "html",
+            ExtractionMethod::Vision => "vision",
+        }
+    }
 }
 
 /// Shape-tolerant representation of one Schema.org `Recipe` object.

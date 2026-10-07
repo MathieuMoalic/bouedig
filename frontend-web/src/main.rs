@@ -32,6 +32,8 @@ enum Route {
     AddRecipe {},
     #[route("/import")]
     ImportRecipe {},
+    #[route("/import-image")]
+    ImportImage {},
     #[route("/recipe/:id")]
     RecipeDetail { id: i64 },
     #[route("/edit/:id")]
@@ -814,10 +816,13 @@ fn Recipes() -> Element {
                         span { "Import from URL" }
                     }
                     button {
-                        class: "disabled",
-                        title: "Coming soon",
+                        id: "fab-menu-import-image",
+                        onclick: move |_| {
+                            add_menu.set(false);
+                            navigator.push(Route::ImportImage {});
+                        },
                         IconImage {}
-                        span { "Import from image — soon" }
+                        span { "Import from image" }
                     }
                 }
             }
@@ -1347,9 +1352,204 @@ fn ImportRecipe() -> Element {
                 RecipeFormFields {
                     initial: import_preview_to_detail(&p),
                     initial_image_url: p.image_url.clone(),
+                    initial_photo: None,
                     editing_id: None,
                 }
             }
+            }
+        },
+    }
+}
+
+/// Import a recipe from a photo: pick an image, the backend reads it with
+/// the configured vision model, and the result lands in the same preview →
+/// edit → save flow as the URL import. The picked photo becomes the recipe
+/// image unless the user replaces it.
+#[component]
+fn ImportImage() -> Element {
+    let mut image = use_signal(|| None::<(String, Vec<u8>)>);
+    let mut loading = use_signal(|| false);
+    let mut error = use_signal(|| String::new());
+    let mut preview = use_signal(|| None::<ImportPreview>);
+    let mut show_warnings = use_signal(|| true);
+
+    // Read the picked file into memory; the submit posts it as-is.
+    let pick = move |e: FormEvent| {
+        let files = e.files();
+        spawn(async move {
+            if let Some(file) = files.into_iter().next() {
+                match file.read_bytes().await {
+                    Ok(bytes) => {
+                        error.set(String::new());
+                        image.set(Some((file.name(), bytes.to_vec())));
+                    }
+                    Err(err) => {
+                        tracing::error!("failed to read the picked image: {err:#}");
+                        error.set("Could not read that file.".into());
+                    }
+                }
+            }
+        });
+    };
+
+    let import = move |_| {
+        let Some((filename, bytes)) = image.read().clone() else {
+            return;
+        };
+        if *loading.read() {
+            return;
+        }
+        loading.set(true);
+        error.set(String::new());
+        spawn(async move {
+            // reqwest multipart is unavailable on wasm — hand-roll the body
+            // (same as the recipe photo upload).
+            let boundary = format!("ImportImage{}", js_sys::Date::now() as u64);
+            let mut body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; \
+                 filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .into_bytes();
+            body.extend_from_slice(&bytes);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+            let client = reqwest::Client::new();
+            let endpoint = format!("{}/api/recipes/import-image", api_base());
+            let result = client
+                .post(endpoint)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .timeout(std::time::Duration::from_secs(120))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => match resp.json::<ImportPreview>().await {
+                    Ok(p) => {
+                        show_warnings.set(true);
+                        preview.set(Some(p));
+                    }
+                    Err(err) => {
+                        tracing::error!("import response unreadable: {err:#}");
+                        error.set("The server returned an unreadable preview.".into());
+                    }
+                },
+                Ok(resp) => {
+                    let status = resp.status();
+                    let message = resp.text().await.unwrap_or_default();
+                    let message = serde_json::from_str::<serde_json::Value>(&message)
+                        .ok()
+                        .and_then(|v| v["error"].as_str().map(str::to_string))
+                        .unwrap_or(message);
+                    tracing::error!("image import failed: {status} {message}");
+                    error.set(if message.is_empty() {
+                        format!("the server answered {status}")
+                    } else {
+                        message
+                    });
+                }
+                Err(err) => {
+                    tracing::error!("image import request failed: {err:#}");
+                    error.set("Could not reach the server.".into());
+                }
+            }
+            loading.set(false);
+        });
+    };
+
+    let image_snapshot = image.read().clone();
+    // rsx bodies can't hold `let` statements, so precompute the picked-file
+    // note ("name — N bytes").
+    let picked_note: Option<String> = image_snapshot
+        .as_ref()
+        .map(|(name, bytes)| format!("{name} ({} bytes)", bytes.len()));
+    let preview_snapshot = preview.read().clone();
+    match preview_snapshot {
+        None => rsx! {
+            div { class: "page",
+                div { class: "card import-card",
+                    h1 { "Import from image" }
+                    p { class: "muted",
+                        "Pick a photo of a recipe — a cookbook page, a recipe card \
+                         or a screenshot. Bouedig reads it and lets you review the \
+                         result before saving. The photo becomes the recipe image."
+                    }
+                    input {
+                        id: "import-image",
+                        r#type: "file",
+                        accept: "image/*",
+                        onchange: pick,
+                    }
+                    if let Some(note) = &picked_note {
+                        p { class: "muted", "{note}" }
+                        button {
+                            id: "import-image-submit",
+                            class: "btn-primary",
+                            r#type: "button",
+                            disabled: *loading.read(),
+                            onclick: import,
+                            if *loading.read() { "Reading the photo…" } else { "Import" }
+                        }
+                    }
+                    if !error.read().is_empty() {
+                        p { class: "status-error", "{error}" }
+                    }
+                    if *loading.read() {
+                        p { class: "muted", "Reading the photo can take half a minute." }
+                    }
+                }
+            }
+        },
+        Some(p) => {
+            let warning_items: Vec<(&String, Option<JumpTarget>)> = p
+                .warnings
+                .iter()
+                .map(|warning| (warning, jump_target_for(warning, &p.recipe.ingredients)))
+                .collect();
+            rsx! {
+                div { class: "page",
+                    div { class: "card import-summary", id: "import-summary",
+                        if show_warnings() && !p.warnings.is_empty() {
+                            div { class: "import-warnings",
+                                button {
+                                    id: "import-warnings-dismiss",
+                                    class: "warnings-dismiss",
+                                    r#type: "button",
+                                    title: "Dismiss",
+                                    onclick: move |_| show_warnings.set(false),
+                                    IconX {}
+                                }
+                                p { "Check these before saving:" }
+                                ul { class: "warning-list",
+                                    for (warning, target) in warning_items {
+                                        li {
+                                            if let Some(target) = target {
+                                                button {
+                                                    class: "warning-jump",
+                                                    r#type: "button",
+                                                    title: "Show it in the form",
+                                                    onclick: move |_| do_jump(&target),
+                                                    span { class: "warning-text", "{warning}" }
+                                                    span { class: "warning-arrow", "↓" }
+                                                }
+                                            } else {
+                                                span { class: "warning-text", "{warning}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    RecipeFormFields {
+                        initial: import_preview_to_detail(&p),
+                        initial_image_url: None,
+                        initial_photo: image_snapshot,
+                        editing_id: None,
+                    }
+                }
             }
         },
     }
@@ -1396,10 +1596,10 @@ fn RecipeForm(editing: Option<i64>) -> Element {
     let loaded = detail.read().clone();
     match (editing, loaded) {
         (None, _) => rsx! {
-            RecipeFormFields { initial: RecipeDetailModel::default(), initial_image_url: None, editing_id: None }
+            RecipeFormFields { initial: RecipeDetailModel::default(), initial_image_url: None, initial_photo: None, editing_id: None }
         },
         (Some(_), Some(initial)) => rsx! {
-            RecipeFormFields { initial: initial, initial_image_url: None, editing_id: editing }
+            RecipeFormFields { initial: initial, initial_image_url: None, initial_photo: None, editing_id: editing }
         },
         (Some(_), None) => rsx! {
             if load_error.read().is_empty() {
@@ -1471,6 +1671,9 @@ fn IconHandle() -> Element {
 fn RecipeFormFields(
     initial: RecipeDetailModel,
     initial_image_url: Option<String>,
+    /// A photo to start with (the picked import image) — pre-seeds the photo
+    /// signal so saving uploads it like a manual photo.
+    initial_photo: Option<(String, Vec<u8>)>,
     editing_id: Option<i64>,
 ) -> Element {
     // One shared id counter so element ids never collide across lists.
@@ -1546,7 +1749,7 @@ fn RecipeFormFields(
     let mut modal = use_signal(|| None::<Modal>);
     let mut drag = use_signal(|| None::<DragState>);
     let mut suppress_click = use_signal(|| false);
-    let mut photo = use_signal(|| None::<(String, Vec<u8>)>);
+    let mut photo = use_signal(move || initial_photo.clone());
     let import_image_url = use_signal(|| initial_image_url);
     let mut status = use_signal(|| String::new());
     let mut status_error = use_signal(|| false);

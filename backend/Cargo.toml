@@ -21,6 +21,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 scraper.workspace = true
 chrono.workspace = true
 url.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

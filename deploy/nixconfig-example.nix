@@ -52,6 +52,10 @@
         passwordFile
         openrouterKeyFile
         ;
+
+      # Import-from-image: needs a vision-capable OpenRouter model (shares
+      # the openrouterKeyFile). Leave unset to keep image import disabled.
+      # visionModel = "google/gemini-2.5-flash";
     };
 
     services.caddy.virtualHosts.${url}.extraConfig = ''

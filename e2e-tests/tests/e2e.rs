@@ -32,31 +32,59 @@ async fn spawn_test_backend() -> anyhow::Result<SocketAddr> {
 
 /// Same, with the household password configured (auth on).
 async fn spawn_test_backend_with_password(password: Option<&str>) -> anyhow::Result<SocketAddr> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("warn,backend=info,sqlx=warn"))
-        .with_test_writer()
-        .try_init();
-    let db_dir = tempfile::tempdir()?;
-    let data_dir = tempfile::tempdir()?;
     let config = backend::Config {
         addr: SocketAddr::from(([127, 0, 0, 1], env_port("E2E_BACKEND_PORT", 0))),
-        db_url: format!("sqlite://{}/bouedig-test.db?mode=rwc", db_dir.path().display()),
+        db_url: String::new(),
         base_path: None,
         static_dir: Some(find_web_bundle()?),
-        data_dir: data_dir.path().to_path_buf(),
+        data_dir: std::env::temp_dir().join("unused"),
         // The browser import test fetches a loopback fixture page.
         import_allow_private: true,
         // No OpenRouter key in e2e: unclassified items simply stay in Other.
         openrouter_key: None,
         classifier_model: None,
         classifier_endpoint: None,
+        vision_model: None,
+        vision_endpoint: None,
         password: password.map(str::to_string),
         secure_cookies: false,
     };
+    spawn_test_backend_with_config(config).await
+}
+
+/// Same, with a vision endpoint (a local mock) so image import works.
+async fn spawn_test_backend_with_vision(vision_endpoint: String) -> anyhow::Result<SocketAddr> {
+    let config = backend::Config {
+        addr: SocketAddr::from(([127, 0, 0, 1], env_port("E2E_BACKEND_PORT", 0))),
+        db_url: String::new(),
+        base_path: None,
+        static_dir: Some(find_web_bundle()?),
+        data_dir: std::env::temp_dir().join("unused"),
+        import_allow_private: true,
+        openrouter_key: Some("test-key".into()),
+        classifier_model: None,
+        classifier_endpoint: None,
+        vision_model: Some("test-vision-model".into()),
+        vision_endpoint: Some(vision_endpoint),
+        password: None,
+        secure_cookies: false,
+    };
+    spawn_test_backend_with_config(config).await
+}
+
+/// Fill in the per-test scratch paths of `config` and spawn the server.
+/// The tempdirs are leaked on purpose: deleting them would race the server.
+async fn spawn_test_backend_with_config(mut config: backend::Config) -> anyhow::Result<SocketAddr> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn,backend=info,sqlx=warn"))
+        .with_test_writer()
+        .try_init();
+    let db_dir = tempfile::tempdir()?;
+    let data_dir = tempfile::tempdir()?;
+    config.db_url = format!("sqlite://{}/bouedig-test.db?mode=rwc", db_dir.path().display());
+    config.data_dir = data_dir.path().to_path_buf();
     let addr = backend::spawn_server(config).await?;
-    // Keep the tempdirs alive for the rest of the process.
-    std::mem::forget(db_dir);
-    std::mem::forget(data_dir);
+    std::mem::forget((db_dir, data_dir));
     Ok(addr)
 }
 
@@ -2084,6 +2112,173 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
         anyhow::ensure!(
             detail.ingredients.len() == 3 && detail.yield_amount == "2 galettes",
             "imported structure incomplete: {detail:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Vision-endpoint mock: records every request body into `log` (the test
+/// asserts the photo arrived as a base64 data URI) and answers each request
+/// with `answer` — an OpenRouter chat-completions response.
+fn vision_mock_server(log: std::sync::Arc<std::sync::Mutex<String>>, answer: String) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // Read until the promised Content-Length has fully arrived (the
+            // base64 image makes the JSON body exceed one read).
+            use std::io::Read;
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 16384];
+            loop {
+                let Ok(n) = stream.read(&mut chunk) else { break };
+                if n == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            if let Ok(mut log) = log.lock() {
+                log.push_str(&String::from_utf8_lossy(&buffer));
+            }
+            use std::io::Write;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    addr
+}
+
+/// Import from image: the vision endpoint is a local mock answering a canned
+/// recipe. The browser picks a PNG, the preview fills the editor, saving
+/// stores the recipe WITH the picked photo as its image.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_from_image_flow() -> anyhow::Result<()> {
+    let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+    let content = serde_json::json!({
+        "name": "Photo Pancakes",
+        "sections": [],
+        "ingredients": [
+            {"quantity": 200, "unit": "g", "name": "flour", "prep": null, "section": null},
+            {"quantity": 1, "unit": "tsp", "name": "baking powder", "prep": null, "section": null}
+        ],
+        "instructions": [
+            {"text": "Whisk everything.", "section": null},
+            {"text": "Fry until golden.", "section": null}
+        ],
+        "instruction_sections": [],
+        "notes": "",
+        "yield": "4 pancakes"
+    })
+    .to_string();
+    let answer = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+    let vision_addr = vision_mock_server(log.clone(), answer);
+
+    // The backend is pointed at the mock like the production config points
+    // at OpenRouter.
+    let addr = spawn_test_backend_with_vision(format!(
+        "http://{vision_addr}/v1/chat/completions"
+    ))
+    .await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    // A small valid PNG on disk, selectable by the browser.
+    let png_path = std::env::temp_dir().join("bouedig-e2e-import.png");
+    std::fs::write(&png_path, tiny_png()).context("failed to write test photo")?;
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/")).await?;
+        driver.find(By::Id("fab-add-recipe")).await?.click().await?;
+        driver
+            .find(By::Id("fab-menu-import-image"))
+            .await?
+            .click()
+            .await?;
+        wait_for_url_path(&driver, "/import-image").await?;
+        driver
+            .find(By::Id("import-image"))
+            .await?
+            .send_keys(png_path.to_str().unwrap())
+            .await?;
+        driver.find(By::Id("import-image-submit")).await?.click().await?;
+
+        // The preview fills the editor with the mock's recipe.
+        let mut name_input = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Id("recipe-name")).await {
+                name_input = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let name_input = name_input.context("editor did not open after image import")?;
+        let name = name_input.prop("value").await?.unwrap_or_default();
+        anyhow::ensure!(
+            name == "Photo Pancakes",
+            "editor should carry the extracted name, got {name:?}"
+        );
+        driver.find(By::Id("import-summary")).await?;
+        // The mock received the photo as a base64 data URI.
+        anyhow::ensure!(
+            log.lock().unwrap().contains("data:image/png;base64,"),
+            "the vision call did not carry the photo"
+        );
+
+        // Save: the editor posts the recipe WITH the picked photo.
+        click_scrolled(&driver, "recipe-submit").await?;
+        wait_for_url_path_prefix(&driver, "/recipe/").await?;
+        let url = driver.current_url().await?;
+        let id: i64 = url
+            .path()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .context("detail url does not contain a recipe id")?;
+        let detail: serde_json::Value = http
+            .get(format!("{base}/api/recipes/{id}"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            detail["name"] == "Photo Pancakes",
+            "saved recipe wrong: {detail}"
+        );
+        anyhow::ensure!(
+            detail["image"].as_str().unwrap_or_default().starts_with("/api/images/"),
+            "the picked photo must be stored as the recipe image: {detail}"
+        );
+        let ingredients = detail["ingredients"]
+            .as_array()
+            .context("no ingredients")?;
+        anyhow::ensure!(
+            ingredients.len() == 2 && ingredients[0]["name"] == "flour",
+            "extracted ingredients wrong: {ingredients:?}"
         );
         Ok(())
     })()

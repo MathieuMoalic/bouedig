@@ -13,6 +13,7 @@ pub mod json_ld;
 pub mod normalize;
 pub mod score;
 pub mod types;
+pub mod vision;
 
 use anyhow::Result;
 use url::Url;
@@ -101,22 +102,13 @@ pub async fn import(raw_url: &str, allow_private: bool) -> Result<RecipePreview,
 
     // Diagnostics: hostname, method, outcome, confidence, elapsed — never
     // the page HTML or the JSON-LD payload.
-    match method {
-        ExtractionMethod::JsonLd => tracing::info!(
-            host = %host,
-            method = "json_ld",
-            confidence = %format!("{:.2}", preview.confidence),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "recipe import succeeded"
-        ),
-        ExtractionMethod::Html => tracing::info!(
-            host = %host,
-            method = "html",
-            confidence = %format!("{:.2}", preview.confidence),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "recipe import succeeded (HTML recovery)"
-        ),
-    }
+    tracing::info!(
+        host = %host,
+        method = method.as_str(),
+        confidence = %format!("{:.2}", preview.confidence),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "recipe import succeeded"
+    );
 
     Ok(preview)
 }
