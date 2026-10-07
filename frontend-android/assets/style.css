@@ -412,27 +412,52 @@ button[type="submit"]:hover {
 }
 
 /* The add-item modal is a centered dialog (not a bottom sheet). Tight
-   title: no gap below "Add item". The suggestions dropdown is absolutely
-   positioned, so it takes no layout space and overlays the actions. */
+   title; the suggestions dropdown is absolutely positioned, so it takes
+   no layout space and overlays the actions. */
 .add-dialog {
     width: 100%;
 }
 
 .add-dialog .dialog-title {
-    margin: 0;
+    margin: 0 0 8px;
+    font-size: 17px;
 }
 
 .add-dialog .input-wrap {
-    margin-bottom: 10px;
+    margin-bottom: 12px;
 }
 
 .add-dialog .input-wrap input {
-    background: var(--surface);
+    background: var(--bg);
     border: 1px solid var(--divider);
     color: var(--text);
-    border-radius: 12px;
-    padding: 11px 12px;
+    border-radius: 10px;
+    padding: 10px 12px;
     font: inherit;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.add-dialog .input-wrap input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.add-dialog .dialog-actions {
+    margin-top: 2px;
+}
+
+.add-dialog .dialog-btn {
+    padding: 8px 16px;
+    font-size: 14px;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+}
+
+.add-dialog .dialog-btn.primary {
+    background: var(--accent);
+    color: #fff;
 }
 
 .input-wrap {
@@ -452,10 +477,13 @@ button[type="submit"]:hover {
     left: 0;
     right: 0;
     z-index: 100;
-    margin-top: 4px;
-    background: var(--surface);
+    margin-top: 6px;
+    /* Solid: a translucent panel lets the buttons underneath bleed through. */
+    background: var(--surface-solid);
     border: 1px solid var(--divider);
     border-radius: 12px;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
+    padding: 4px;
     max-height: 200px;
     overflow-y: auto;
     display: flex;
@@ -468,9 +496,10 @@ button[type="submit"]:hover {
     gap: 6px;
     background: none;
     border: none;
+    border-radius: 8px;
     color: var(--text);
     font: inherit;
-    padding: 8px 10px;
+    padding: 9px 10px;
     cursor: pointer;
     text-align: left;
     width: 100%;
@@ -479,30 +508,13 @@ button[type="submit"]:hover {
 
 .suggestion:hover,
 .suggestion:focus {
-    background: var(--divider);
+    background: var(--pill);
 }
 
 .suggestion-text {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-}
-
-/* Only the direct Add button — nested buttons (suggestions) keep their own
-   styling, which a bare `.add-row button` would override. */
-.add-row > button {
-    background: var(--accent);
-    border: none;
-    color: #fff;
-    font: inherit;
-    font-weight: 700;
-    padding: 0 14px;
-    border-radius: 12px;
-    cursor: pointer;
-}
-
-.add-row > button:hover {
-    background: var(--accent-bright);
 }
 
 .empty {
@@ -925,24 +937,40 @@ ol.instruction-list li {
 .search-bar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin: 0 0 12px;
+    gap: 6px;
+    margin: 0 0 14px;
+    background: var(--surface-solid);
+    border: 1px solid var(--divider);
+    border-radius: 14px;
+    padding: 5px 6px 5px 14px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
 }
 
 .search-bar input {
     flex: 1;
+    min-width: 0;
     font: inherit;
-    font-size: 14px;
+    font-size: 15px;
     color: var(--text);
-    background: var(--pill);
-    border: 1px solid var(--divider);
-    border-radius: 12px;
-    padding: 10px 12px;
+    background: transparent;
+    border: none;
+    padding: 9px 0;
 }
 
 .search-bar input:focus {
     outline: none;
-    border-color: var(--accent-bright);
+}
+
+/* The ✕ inside the search card: a small round ghost button. */
+.search-bar .grocery-remove {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    border-radius: 50%;
+    align-self: center;
+    width: 34px;
+    height: 34px;
+    flex: none;
 }
 
 /* Login gate: one centered card with the password form. */
