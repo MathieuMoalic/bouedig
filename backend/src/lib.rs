@@ -1521,9 +1521,12 @@ async fn resolve_category(db: &SqlitePool, item: &NewGroceryItem) -> (String, bo
     }
 }
 
-/// Find an existing quantified item that a new add should merge into: same
-/// name and unit (case-insensitive), both carrying a quantity. Items
-/// without a quantity never merge (separate lines stay separate by design).
+/// Find an existing item that a new add should merge into: same name
+/// (case-insensitive). Units are compatible when they are equal
+/// (case-insensitive) or when either side has none — an add without a
+/// quantity counts as 1 and adopts whatever unit the merged row ends up
+/// with, so "tofu" + "3 tofu" = 4 tofu and "tofu" + "2 packs tofu" =
+/// 3 packs tofu. Different non-empty units stay separate lines.
 async fn find_grocery_merge_target(
     db: impl sqlx::Executor<'_, Database = Sqlite>,
     name: &str,
@@ -1531,15 +1534,40 @@ async fn find_grocery_merge_target(
 ) -> Option<i64> {
     sqlx::query_scalar(
         "SELECT id FROM grocery_items \
-         WHERE lower(name) = lower(?) AND lower(trim(unit)) = lower(?) \
-           AND quantity IS NOT NULL ORDER BY id LIMIT 1",
+         WHERE lower(name) = lower(?) \
+           AND (lower(trim(unit)) = lower(?) OR trim(unit) = '' OR trim(?) = '') \
+         ORDER BY id LIMIT 1",
     )
     .bind(name.trim())
+    .bind(unit.trim())
     .bind(unit.trim())
     .fetch_optional(db)
     .await
     .ok()
     .flatten()
+}
+
+/// Absorb an add into an existing row: quantities add up (a missing stored
+/// quantity counts as 1 — an add without one is already passed as 1) and a
+/// blank unit on the existing row adopts the add's unit.
+async fn merge_grocery_into(
+    db: impl sqlx::Executor<'_, Database = Sqlite>,
+    merge_id: i64,
+    quantity: f64,
+    unit: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE grocery_items \
+         SET quantity = COALESCE(quantity, 1) + ?, \
+             unit = CASE WHEN trim(unit) = '' THEN ? ELSE unit END \
+         WHERE id = ?",
+    )
+    .bind(quantity)
+    .bind(unit.trim())
+    .bind(merge_id)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 async fn add_grocery_item(
@@ -1553,24 +1581,18 @@ async fn add_grocery_item(
         ));
     }
     let unit = item.unit.as_deref().map(str::trim).unwrap_or("");
-    // Same name + same unit + both quantified → the quantities add up and
-    // no second line is created. The existing row wins (name casing,
-    // category, provenance); classification is already done or pending.
-    if let Some(q) = item.quantity {
-        if let Some(merge_id) =
-            find_grocery_merge_target(&state.db, name, unit).await
-        {
-            sqlx::query("UPDATE grocery_items SET quantity = quantity + ? WHERE id = ?")
-                .bind(q)
-                .bind(merge_id)
-                .execute(&state.db)
-                .await?;
-            let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
-                .bind(merge_id)
-                .fetch_one(&state.db)
-                .await?;
-            return Ok((StatusCode::OK, Json(row_to_joined_item(&row))));
-        }
+    // Same name + compatible units → the amounts add up and no second line
+    // is created (a missing quantity counts as 1). The existing row wins
+    // (name casing, category, provenance); classification is already done
+    // or pending.
+    if let Some(merge_id) = find_grocery_merge_target(&state.db, name, unit).await {
+        merge_grocery_into(&state.db, merge_id, item.quantity.unwrap_or(1.0), unit)
+            .await?;
+        let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
+            .bind(merge_id)
+            .fetch_one(&state.db)
+            .await?;
+        return Ok((StatusCode::OK, Json(row_to_joined_item(&row))));
     }
     let (category, needs_classification) = resolve_category(&state.db, &item).await;
     let row = sqlx::query(
@@ -1660,25 +1682,21 @@ async fn add_grocery_batch(
     let mut created = Vec::with_capacity(prepared.len());
     let mut pending = Vec::new();
     for (name, quantity, unit, category, needs_classification) in prepared {
-        // Same name + same unit + both quantified → add up into the existing
-        // row (this also covers duplicates within one batch). Provenance and
-        // category of the existing row win; no fresh classification.
-        if quantity.is_some() {
-            if let Some(merge_id) =
-                find_grocery_merge_target(&mut *tx, &name, &unit).await
-            {
-                sqlx::query("UPDATE grocery_items SET quantity = quantity + ? WHERE id = ?")
-                    .bind(quantity)
-                    .bind(merge_id)
-                    .execute(&mut *tx)
-                    .await?;
-                let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
-                    .bind(merge_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                created.push(row_to_joined_item(&row));
-                continue;
-            }
+        // Same name + compatible units → add up into the existing row (this
+        // also covers duplicates within one batch; a missing quantity counts
+        // as 1). Provenance and category of the existing row win; no fresh
+        // classification.
+        if let Some(merge_id) =
+            find_grocery_merge_target(&mut *tx, &name, &unit).await
+        {
+            merge_grocery_into(&mut *tx, merge_id, quantity.unwrap_or(1.0), &unit)
+                .await?;
+            let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
+                .bind(merge_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            created.push(row_to_joined_item(&row));
+            continue;
         }
         let row = sqlx::query(
             "INSERT INTO grocery_items (name, category, quantity, unit, recipe_id) \
@@ -2384,8 +2402,9 @@ pub(crate) mod tests {
         assert_eq!(patched["category"], "Vegan");
     }
 
-    /// Adding the same name+unit with a quantity adds up instead of
-    /// duplicating the line; different units or unquantified adds do not.
+    /// Same-name adds add up: equal units merge, a missing quantity counts
+    /// as 1, and a missing unit is a wildcard that adopts the merged row's
+    /// unit. Different non-empty units stay separate lines.
     #[tokio::test]
     async fn grocery_add_merges_same_name_and_unit() {
         let app = test_router(None).await;
@@ -2393,7 +2412,11 @@ pub(crate) mod tests {
             r#"{"name":"Oat milk","quantity":2.0,"unit":"packs"}"#,
             r#"{"name":"oat milk","quantity":3.0,"unit":"Packs"}"#,
             r#"{"name":"OAT MILK","quantity":1.5,"unit":"packs"}"#,
+            // No quantity = 1: merges into the packs row (units compatible).
             r#"{"name":"Oat milk","unit":"packs"}"#,
+            // No unit = wildcard: merges and adopts the existing unit.
+            r#"{"name":"Oat milk"}"#,
+            // Different non-empty unit: stays a separate line.
             r#"{"name":"Oat milk","quantity":1.0,"unit":"l"}"#,
         ] {
             let (status, _) = json_response(app.clone(), "POST", "/api/grocery", Some(payload))
@@ -2402,22 +2425,45 @@ pub(crate) mod tests {
         }
         let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
         let list: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // Quantified + same unit merges (2 + 3 + 1.5); the unquantified add
-        // and the different unit stay separate lines.
         let oat_rows: Vec<&serde_json::Value> = list
             .as_array()
             .unwrap()
             .iter()
             .filter(|i| i["name"].as_str().unwrap().to_lowercase() == "oat milk")
             .collect();
-        // 2 + 3 + 1.5 merged into one row; the unquantified add and the
-        // different unit stayed separate, as designed.
-        assert_eq!(oat_rows.len(), 3, "{body}");
-        assert_eq!(oat_rows[0]["quantity"], 6.5);
+        // 2 + 3 + 1.5 + 1 + 1 = 8.5 packs; the litre line stayed separate.
+        assert_eq!(oat_rows.len(), 2, "{body}");
+        assert_eq!(oat_rows[0]["quantity"], 8.5);
         assert_eq!(oat_rows[0]["unit"], "packs");
-        assert!(oat_rows[1]["quantity"].is_null());
-        assert_eq!(oat_rows[2]["quantity"], 1.0);
-        assert_eq!(oat_rows[2]["unit"], "l");
+        assert_eq!(oat_rows[1]["quantity"], 1.0);
+        assert_eq!(oat_rows[1]["unit"], "l");
+    }
+
+    /// A unit-less row absorbs adds of any unit (blank unit = wildcard), and
+    /// an unquantified add onto nothing simply starts at 1.
+    #[tokio::test]
+    async fn grocery_merge_adopts_unit_when_target_has_none() {
+        let app = test_router(None).await;
+        for payload in [
+            r#"{"name":"Tofu"}"#,
+            r#"{"name":"tofu"}"#,
+            r#"{"name":"TOFU","quantity":3.0,"unit":"packs"}"#,
+            r#"{"name":"tofu","quantity":1.0,"unit":"l"}"#,
+        ] {
+            let (status, _) = json_response(app.clone(), "POST", "/api/grocery", Some(payload))
+                .await;
+            assert!(status == StatusCode::CREATED || status == StatusCode::OK, "add failed: {status}");
+        }
+        let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 1 + 1 + 3 = 5 packs (the blank unit adopted "packs"); the litre
+        // add met a non-empty unit, so it stayed separate.
+        assert_eq!(list.as_array().unwrap().len(), 2, "{body}");
+        let packs = &list[0];
+        assert_eq!(packs["name"], "Tofu");
+        assert_eq!(packs["quantity"], 5.0);
+        assert_eq!(packs["unit"], "packs");
+        assert_eq!(list[1]["unit"], "l");
     }
 
     // A batch item that already carries an explicit quantity skips the
@@ -3161,7 +3207,8 @@ pub(crate) mod tests {
                 .unwrap();
         assert_eq!(cached, "Vegan");
 
-        // A repeat add resolves from the cache — the API was called once.
+        // A repeat add resolves from the cache and merges into the existing
+        // row — the API was called once.
         let (status, body) = json_response(
             app.clone(),
             "POST",
@@ -3169,7 +3216,10 @@ pub(crate) mod tests {
             Some(r#"{"name":"Firm Tofu"}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::OK,
+            "{body}"
+        );
         let created: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(created["category"], "Vegan", "repeat add must use the cache: {body}");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);

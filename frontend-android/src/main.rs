@@ -3583,6 +3583,9 @@ fn GroceryContent() -> Element {
     }
 
     let suggestions = rank_suggestions(&new_item.read(), &past_names);
+    // rsx for-loops are FnMut and the suggestion handlers are 'static: hand
+    // the loop owned items (capped at 5) instead of borrows.
+    let shown_suggestions: Vec<_> = suggestions.iter().take(5).cloned().collect();
 
     let today_value = today_local_iso();
     let plan_list = plan_entries.read().clone();
@@ -3781,40 +3784,40 @@ fn GroceryContent() -> Element {
                                 },
                                 autocomplete: "off",
                             }
-                            if focused()
-                                && !new_item.read().trim().is_empty()
-                                && !suggestions.is_empty()
-                            {
-                                div { class: "suggestions",
-                                    for (name, _) in suggestions {
-                                        button {
-                                            class: "suggestion",
-                                            r#type: "button",
-                                            // mousedown, not click: the input's
-                                            // blur (fired on mousedown) unmounts
-                                            // this dropdown before a click could
-                                            // land. Tapping a suggestion adds it
-                                            // outright.
-                                            onmousedown: move |_| {
-                                                // Bind the reads first (see the
-                                                // Enter handler above).
-                                                let qty = parse_qty(&new_qty.read());
-                                                let unit = new_unit.read().trim().to_string();
-                                                submit_grocery_item(
-                                                    name.clone(),
-                                                    qty,
-                                                    unit,
-                                                    new_item,
-                                                    new_qty,
-                                                    new_unit,
-                                                    add_sheet,
-                                                    items,
-                                                    name_history,
-                                                    error,
-                                                );
-                                            },
-                                            span { class: "suggestion-text", "{name}" }
-                                        }
+                        }
+                        if focused()
+                            && !new_item.read().trim().is_empty()
+                            && !shown_suggestions.is_empty()
+                        {
+                            div { class: "suggestions",
+                                for (name, _) in shown_suggestions {
+                                    button {
+                                        class: "suggestion",
+                                        r#type: "button",
+                                        // mousedown, not click: the input's
+                                        // blur (fired on mousedown) unmounts
+                                        // this list before a click could
+                                        // land. Tapping a suggestion adds it
+                                        // outright.
+                                        onmousedown: move |_| {
+                                            // Bind the reads first (see the
+                                            // Enter handler above).
+                                            let qty = parse_qty(&new_qty.read());
+                                            let unit = new_unit.read().trim().to_string();
+                                            submit_grocery_item(
+                                                name.clone(),
+                                                qty,
+                                                unit,
+                                                new_item,
+                                                new_qty,
+                                                new_unit,
+                                                add_sheet,
+                                                items,
+                                                name_history,
+                                                error,
+                                            );
+                                        },
+                                        span { class: "suggestion-text", "{name}" }
                                     }
                                 }
                             }

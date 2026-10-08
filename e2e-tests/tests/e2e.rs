@@ -359,9 +359,9 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         "unexpected suggestion text: {text}"
     );
     suggestion.click().await?;
-    // The pick added a second "Bananas" line (separate lines by design) and
-    // closed the dialog.
-    let mut bananas = 0usize;
+    // The pick adds into the same row — implicit 1 + 1 = 2 — and closes the
+    // dialog.
+    let mut merged = false;
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -369,15 +369,17 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
             .await?
             .json()
             .await?;
-        bananas = items.iter().filter(|i| i.name == "Bananas").count();
-        if bananas >= 2 {
+        let rows: Vec<&GroceryItem> =
+            items.iter().filter(|i| i.name == "Bananas").collect();
+        if rows.len() == 1 && rows[0].quantity == Some(2.0) {
+            merged = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     anyhow::ensure!(
-        bananas >= 2,
-        "tapping the suggestion did not add the item directly"
+        merged,
+        "tapping the suggestion must merge into one row of 2"
     );
     wait_for_gone(driver, ".add-dialog")
         .await
@@ -1967,10 +1969,29 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             }
         };
         suggestion.click().await?;
-        // Tapping the suggestion adds it directly (a second "apple" row)
+        // Tapping the suggestion adds into the same row (implicit 1 + 1 = 2)
         // and closes the dialog.
         wait_for_gone(&driver, ".add-dialog").await?;
-        poll_grocery_count(&http, &base, "apple", 2).await?;
+        let mut merged = false;
+        for _ in 0..50 {
+            let items: Vec<GroceryItem> = http
+                .get(format!("{base}/api/grocery"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            let rows: Vec<&GroceryItem> =
+                items.iter().filter(|i| i.name == "apple").collect();
+            if rows.len() == 1 && rows[0].quantity == Some(2.0) {
+                merged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(
+            merged,
+            "suggestion tap must merge into one apple row of 2"
+        );
 
         // A second, different item in the same group.
         open_grocery_add_sheet(&driver).await?;
@@ -2964,33 +2985,6 @@ async fn poll_grocery(
     }
     anyhow::bail!(
         "grocery item '{name}' (bought={bought:?}) never appeared in the database; last items: {:?}",
-        last.unwrap_or_default()
-    )
-}
-
-/// Poll `GET /api/grocery` until `name` appears at least `expected` times.
-async fn poll_grocery_count(
-    http: &reqwest::Client,
-    base: &str,
-    name: &str,
-    expected: usize,
-) -> anyhow::Result<()> {
-    let mut last = None;
-    for _ in 0..50 {
-        let items: Vec<GroceryItem> = http
-            .get(format!("{base}/api/grocery"))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if items.iter().filter(|i| i.name == name).count() >= expected {
-            return Ok(());
-        }
-        last = Some(items);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    anyhow::bail!(
-        "grocery item '{name}' never appeared {expected} times; last items: {:?}",
         last.unwrap_or_default()
     )
 }

@@ -496,23 +496,15 @@ button[type="submit"]:hover {
 }
 
 .suggestions {
-    position: absolute;
-    /* Open upward over the dialog title: the panel must never cover the
-       Add/Cancel row below the input (a tap meant for "Add" would land on a
-       suggestion and add the wrong item). */
-    bottom: 100%;
-    left: 0;
-    right: 0;
-    z-index: 100;
-    margin-bottom: 6px;
-    /* Solid: a translucent panel lets the buttons underneath bleed through. */
-    background: var(--surface-solid);
+    /* In flow inside the add dialog: the list sits between the input and
+       the Add/Cancel row (max 5 items, sliced client-side). */
+    position: static;
+    margin: 10px 0 0;
     border: 1px solid var(--divider);
     border-radius: 12px;
+    background: var(--surface-solid);
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
     padding: 4px;
-    max-height: 200px;
-    overflow-y: auto;
     display: flex;
     flex-direction: column;
 }
