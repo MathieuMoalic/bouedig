@@ -20,7 +20,7 @@ use shared::{
     NewGroceryBatch, NewGroceryItem, Recipe, RecipeDetail, RecipeInput,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -1521,6 +1521,27 @@ async fn resolve_category(db: &SqlitePool, item: &NewGroceryItem) -> (String, bo
     }
 }
 
+/// Find an existing quantified item that a new add should merge into: same
+/// name and unit (case-insensitive), both carrying a quantity. Items
+/// without a quantity never merge (separate lines stay separate by design).
+async fn find_grocery_merge_target(
+    db: impl sqlx::Executor<'_, Database = Sqlite>,
+    name: &str,
+    unit: &str,
+) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT id FROM grocery_items \
+         WHERE lower(name) = lower(?) AND lower(trim(unit)) = lower(?) \
+           AND quantity IS NOT NULL ORDER BY id LIMIT 1",
+    )
+    .bind(name.trim())
+    .bind(unit.trim())
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn add_grocery_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(item): Json<NewGroceryItem>,
@@ -1530,6 +1551,26 @@ async fn add_grocery_item(
         return Err(ApiError(
             (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
         ));
+    }
+    let unit = item.unit.as_deref().map(str::trim).unwrap_or("");
+    // Same name + same unit + both quantified → the quantities add up and
+    // no second line is created. The existing row wins (name casing,
+    // category, provenance); classification is already done or pending.
+    if let Some(q) = item.quantity {
+        if let Some(merge_id) =
+            find_grocery_merge_target(&state.db, name, unit).await
+        {
+            sqlx::query("UPDATE grocery_items SET quantity = quantity + ? WHERE id = ?")
+                .bind(q)
+                .bind(merge_id)
+                .execute(&state.db)
+                .await?;
+            let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
+                .bind(merge_id)
+                .fetch_one(&state.db)
+                .await?;
+            return Ok((StatusCode::OK, Json(row_to_joined_item(&row))));
+        }
     }
     let (category, needs_classification) = resolve_category(&state.db, &item).await;
     let row = sqlx::query(
@@ -1619,6 +1660,26 @@ async fn add_grocery_batch(
     let mut created = Vec::with_capacity(prepared.len());
     let mut pending = Vec::new();
     for (name, quantity, unit, category, needs_classification) in prepared {
+        // Same name + same unit + both quantified → add up into the existing
+        // row (this also covers duplicates within one batch). Provenance and
+        // category of the existing row win; no fresh classification.
+        if quantity.is_some() {
+            if let Some(merge_id) =
+                find_grocery_merge_target(&mut *tx, &name, &unit).await
+            {
+                sqlx::query("UPDATE grocery_items SET quantity = quantity + ? WHERE id = ?")
+                    .bind(quantity)
+                    .bind(merge_id)
+                    .execute(&mut *tx)
+                    .await?;
+                let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
+                    .bind(merge_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                created.push(row_to_joined_item(&row));
+                continue;
+            }
+        }
         let row = sqlx::query(
             "INSERT INTO grocery_items (name, category, quantity, unit, recipe_id) \
              VALUES (?, ?, ?, ?, ?) \
@@ -2323,8 +2384,44 @@ pub(crate) mod tests {
         assert_eq!(patched["category"], "Vegan");
     }
 
-    /// A batch item that already carries an explicit quantity skips the
-    /// line-split (the undo restore path depends on this).
+    /// Adding the same name+unit with a quantity adds up instead of
+    /// duplicating the line; different units or unquantified adds do not.
+    #[tokio::test]
+    async fn grocery_add_merges_same_name_and_unit() {
+        let app = test_router(None).await;
+        for payload in [
+            r#"{"name":"Oat milk","quantity":2.0,"unit":"packs"}"#,
+            r#"{"name":"oat milk","quantity":3.0,"unit":"Packs"}"#,
+            r#"{"name":"OAT MILK","quantity":1.5,"unit":"packs"}"#,
+            r#"{"name":"Oat milk","unit":"packs"}"#,
+            r#"{"name":"Oat milk","quantity":1.0,"unit":"l"}"#,
+        ] {
+            let (status, _) = json_response(app.clone(), "POST", "/api/grocery", Some(payload))
+                .await;
+            assert!(status == StatusCode::CREATED || status == StatusCode::OK, "add failed: {status}");
+        }
+        let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Quantified + same unit merges (2 + 3 + 1.5); the unquantified add
+        // and the different unit stay separate lines.
+        let oat_rows: Vec<&serde_json::Value> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["name"].as_str().unwrap().to_lowercase() == "oat milk")
+            .collect();
+        // 2 + 3 + 1.5 merged into one row; the unquantified add and the
+        // different unit stayed separate, as designed.
+        assert_eq!(oat_rows.len(), 3, "{body}");
+        assert_eq!(oat_rows[0]["quantity"], 6.5);
+        assert_eq!(oat_rows[0]["unit"], "packs");
+        assert!(oat_rows[1]["quantity"].is_null());
+        assert_eq!(oat_rows[2]["quantity"], 1.0);
+        assert_eq!(oat_rows[2]["unit"], "l");
+    }
+
+    // A batch item that already carries an explicit quantity skips the
+    // line-split (the undo restore path depends on this).
     #[tokio::test]
     async fn grocery_batch_respects_explicit_quantities() {
         let app = test_router(None).await;

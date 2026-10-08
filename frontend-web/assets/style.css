@@ -501,11 +501,14 @@ button[type="submit"]:hover {
 
 .suggestions {
     position: absolute;
-    top: 100%;
+    /* Open upward over the dialog title: the panel must never cover the
+       Add/Cancel row below the input (a tap meant for "Add" would land on a
+       suggestion and add the wrong item). */
+    bottom: 100%;
     left: 0;
     right: 0;
     z-index: 100;
-    margin-top: 6px;
+    margin-bottom: 6px;
     /* Solid: a translucent panel lets the buttons underneath bleed through. */
     background: var(--surface-solid);
     border: 1px solid var(--divider);
@@ -784,6 +787,11 @@ ol.instruction-list li.instruction-item {
     display: flex;
     flex-direction: column;
     max-height: 78vh;
+    /* Clip overflowing content inside the sheet: on short viewports the
+       fields can exceed 78vh, and unpainted overflow would spill past the
+       sheet's edge into the bottom nav's zone (the nav paints on top of it,
+       blocking the action buttons). */
+    overflow-y: auto;
 }
 
 @keyframes sheet-in {

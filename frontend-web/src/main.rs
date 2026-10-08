@@ -3891,15 +3891,20 @@ fn GroceryContent() -> Element {
                                 onblur: move |_| focused.set(false),
                                 onkeydown: move |e: KeyboardEvent| {
                                     if e.key() == Key::Enter {
-                                        // Bind first: the read guard must be
-                                        // dropped before submit calls
-                                        // `new_item.set()`.
+                                        // Bind every read first: argument
+                                        // temporaries keep the read guards
+                                        // alive until the statement ends, and
+                                        // submit sets these signals.
                                         let name = new_item.read().clone();
+                                        let qty = parse_qty(&new_qty.read());
+                                        let unit = new_unit.read().trim().to_string();
                                         submit_grocery_item(
                                             name,
-                                            parse_qty(&new_qty.read()),
-                                            new_unit.read().trim().to_string(),
+                                            qty,
+                                            unit,
                                             new_item,
+                                            new_qty,
+                                            new_unit,
                                             items,
                                             name_history,
                                             error,
@@ -3923,11 +3928,17 @@ fn GroceryContent() -> Element {
                                             // land. Tapping a suggestion adds it
                                             // outright.
                                             onmousedown: move |_| {
+                                                // Bind the reads first (see the
+                                                // Enter handler above).
+                                                let qty = parse_qty(&new_qty.read());
+                                                let unit = new_unit.read().trim().to_string();
                                                 submit_grocery_item(
                                                     name.clone(),
-                                                    parse_qty(&new_qty.read()),
-                                                    new_unit.read().trim().to_string(),
+                                                    qty,
+                                                    unit,
                                                     new_item,
+                                                    new_qty,
+                                                    new_unit,
                                                     items,
                                                     name_history,
                                                     error,
@@ -3945,12 +3956,18 @@ fn GroceryContent() -> Element {
                                 class: "dialog-btn primary",
                                 r#type: "button",
                                 onclick: move |_| {
+                                    // Bind the reads first (see the Enter
+                                    // handler above).
                                     let name = new_item.read().clone();
+                                    let qty = parse_qty(&new_qty.read());
+                                    let unit = new_unit.read().trim().to_string();
                                     submit_grocery_item(
                                         name,
-                                        parse_qty(&new_qty.read()),
-                                        new_unit.read().trim().to_string(),
+                                        qty,
+                                        unit,
                                         new_item,
+                                        new_qty,
+                                        new_unit,
                                         items,
                                         name_history,
                                         error,
@@ -3969,13 +3986,18 @@ fn GroceryContent() -> Element {
                     }
                 }
             }
-            div { class: "fab-stack",
-                button {
-                    id: "grocery-fab-add",
-                    class: "fab",
-                    title: "Add item",
-                    onclick: move |_| add_sheet.set(true),
-                    IconPlus {}
+            // The FAB paints above sheets (fixed sibling, higher stacking
+            // context) — hide it while a sheet/dialog is open so it can't
+            // cover the sheet's own action buttons.
+            if !add_sheet() && edit_item.read().is_none() {
+                div { class: "fab-stack",
+                    button {
+                        id: "grocery-fab-add",
+                        class: "fab",
+                        title: "Add item",
+                        onclick: move |_| add_sheet.set(true),
+                        IconPlus {}
+                    }
                 }
             }
         }
@@ -4292,7 +4314,17 @@ fn restore_removed_item(
         tracing::info!("Grocery undo: POST {url} (name={:?})", payload.items[0].name);
         match client.post(url).json(&payload).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Vec<GroceryItem>>().await {
-                Ok(created) => items_sig.with_mut(|v| v.extend(created)),
+                Ok(created) => items_sig.with_mut(|v| {
+                    // The backend may have merged the restore into an existing
+                    // row — replace in place instead of duplicating.
+                    for c in created {
+                        if let Some(slot) = v.iter_mut().find(|i| i.id == c.id) {
+                            *slot = c;
+                        } else {
+                            v.push(c);
+                        }
+                    }
+                }),
                 Err(err) => {
                     tracing::error!("grocery restore returned an unreadable body: {err:#}");
                     error.set("Failed to restore item.".into());
@@ -4325,6 +4357,8 @@ fn submit_grocery_item(
     quantity: Option<f64>,
     unit: String,
     mut new_item: Signal<String>,
+    mut new_qty: Signal<String>,
+    mut new_unit: Signal<String>,
     mut items: Signal<Vec<GroceryItem>>,
     name_history: Signal<Vec<String>>,
     mut error: Signal<String>,
@@ -4333,7 +4367,11 @@ fn submit_grocery_item(
     if name.is_empty() {
         return;
     }
+    // Reset the whole row, not just the name: sticky quantity/unit would
+    // silently attach to whatever the user adds next.
     new_item.set(String::new());
+    new_qty.set(String::new());
+    new_unit.set(String::new());
     spawn(async move {
         let item = NewGroceryItem {
             name,
@@ -4349,7 +4387,15 @@ fn submit_grocery_item(
                 // Append the created item to the local state instead of
                 // re-fetching: the list keeps whatever the user just removed.
                 Ok(created) => {
-                    items.with_mut(|v| v.push(created));
+                    items.with_mut(|v| {
+                        // Merged adds return the existing row (summed) — replace
+                        // it in place instead of appending a duplicate.
+                        if let Some(slot) = v.iter_mut().find(|i| i.id == created.id) {
+                            *slot = created;
+                        } else {
+                            v.push(created);
+                        }
+                    });
                     refresh_names(name_history).await;
                 }
                 Err(err) => {

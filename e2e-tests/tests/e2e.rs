@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use shared::{GroceryItem, Ingredient, InstructionStep, NewGroceryItem, Recipe, RecipeDetail, RecipeInput};
-use thirtyfour::{By, Capabilities, WebDriver};
+use thirtyfour::{By, Capabilities, Key, WebDriver};
 
 fn env_port(name: &str, default: u16) -> u16 {
     std::env::var(name)
@@ -1874,7 +1874,51 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             row.text().await?.contains("2 packs"),
             "the row must show the amount prefix"
         );
-        // Clear the amount fields for the rest of the flow.
+
+        // Re-adding the same name + unit adds up: 2 + 3 = 5 packs, still one
+        // row. The merged add answers with the existing row's id. Enter on
+        // the input submits (the suggestion dropdown is open while the typed
+        // text matches the existing row).
+        let qty = driver.find(By::Id("grocery-qty")).await?;
+        qty.clear().await?;
+        qty.send_keys("3").await?;
+        // Every submit resets the whole row, so the unit is typed again.
+        let unit_field = driver.find(By::Id("grocery-unit")).await?;
+        unit_field.clear().await?;
+        unit_field.send_keys("packs").await?;
+        let input = driver.find(By::Id("grocery-input")).await?;
+        input.send_keys("Oat milk").await?;
+        input.send_keys(Key::Enter).await?;
+        let mut merged = false;
+        for _ in 0..25 {
+            let items: Vec<GroceryItem> = http
+                .get(format!("{base}/api/grocery"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            let oats: Vec<&GroceryItem> =
+                items.iter().filter(|i| i.name == "Oat milk").collect();
+            if oats.len() == 1 && oats[0].quantity == Some(5.0) {
+                merged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(merged, "same name+unit adds must add up to one row");
+        let row_count = driver
+            .find_all(By::XPath(
+                "//li[contains(@class, 'grocery-item') and contains(., 'Oat milk')]",
+            ))
+            .await?
+            .len();
+        anyhow::ensure!(
+            row_count == 1,
+            "merged item must render as one row, got {row_count}"
+        );
+
+        // Clear the amount fields for the rest of the flow (they should
+        // already be empty: every submit resets quantity and unit too).
         driver.find(By::Id("grocery-qty")).await?.clear().await?;
         driver.find(By::Id("grocery-unit")).await?.clear().await?;
 
@@ -1887,6 +1931,22 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             .await
             .context("added item did not appear in the UI")?;
         poll_grocery(&http, &base, "apple", None).await?;
+        // The amount fields were cleared above: the manual apple must be
+        // unquantified, or the suggestion tap below would merge into it.
+        let items: Vec<GroceryItem> = http
+            .get(format!("{base}/api/grocery"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let apple = items
+            .iter()
+            .find(|i| i.name == "apple")
+            .context("apple missing right after its add")?;
+        anyhow::ensure!(
+            apple.quantity.is_none() && apple.unit.is_empty(),
+            "manual add must be unquantified after the clears: {apple:?}"
+        );
 
         // Typing a fuzzy typo opens the dropdown with the close match.
         let input = driver.find(By::Id("grocery-input")).await?;
@@ -2890,6 +2950,7 @@ async fn poll_grocery(
     name: &str,
     bought: Option<bool>,
 ) -> anyhow::Result<()> {
+    let mut last = None;
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -2904,9 +2965,13 @@ async fn poll_grocery(
         if found {
             return Ok(());
         }
+        last = Some(items);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    anyhow::bail!("grocery item '{name}' (bought={bought:?}) never appeared in the database")
+    anyhow::bail!(
+        "grocery item '{name}' (bought={bought:?}) never appeared in the database; last items: {:?}",
+        last.unwrap_or_default()
+    )
 }
 
 /// Poll `GET /api/grocery` until `name` appears at least `expected` times.
@@ -2916,6 +2981,7 @@ async fn poll_grocery_count(
     name: &str,
     expected: usize,
 ) -> anyhow::Result<()> {
+    let mut last = None;
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -2926,9 +2992,13 @@ async fn poll_grocery_count(
         if items.iter().filter(|i| i.name == name).count() >= expected {
             return Ok(());
         }
+        last = Some(items);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    anyhow::bail!("grocery item '{name}' never appeared {expected} times")
+    anyhow::bail!(
+        "grocery item '{name}' never appeared {expected} times; last items: {:?}",
+        last.unwrap_or_default()
+    )
 }
 
 /// Poll `GET /api/grocery` until `name` is gone from the database.
