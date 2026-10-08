@@ -496,15 +496,10 @@ button[type="submit"]:hover {
 }
 
 .suggestions {
-    /* In flow inside the add dialog: the list sits between the input and
-       the Add/Cancel row (max 5 items, sliced client-side). */
-    position: static;
-    margin: 10px 0 0;
-    border: 1px solid var(--divider);
-    border-radius: 12px;
-    background: var(--surface-solid);
-    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
-    padding: 4px;
+    /* In flow inside the add dialog: a plain integrated list between the
+       input and the Add/Cancel row (max 5 items, sliced client-side) — no
+       border, shadow, or background of its own. */
+    margin: 2px 0 0;
     display: flex;
     flex-direction: column;
 }
