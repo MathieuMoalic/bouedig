@@ -4180,9 +4180,9 @@ fn GroceryEditSheet(
                             oninput: move |e: FormEvent| name.set(e.value()),
                         }
                     }
-                    div { class: "sheet-field",
-                        span { "Amount" }
-                        div { class: "qty-unit-row",
+                    div { class: "qty-unit-row",
+                        label { class: "sheet-field",
+                            span { "Amount" }
                             input {
                                 id: "sheet-item-qty",
                                 class: "qty-input",
@@ -4199,6 +4199,9 @@ fn GroceryEditSheet(
                                     quantity.set(cleaned);
                                 },
                             }
+                        }
+                        label { class: "sheet-field",
+                            span { "Unit" }
                             input {
                                 id: "sheet-item-unit",
                                 class: "unit-input",

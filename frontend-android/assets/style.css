@@ -876,6 +876,17 @@ ol.instruction-list li.instruction-item {
     margin-top: 4px;
 }
 
+/* Amount + unit side by side, each in its own labelled field. */
+.sheet .qty-unit-row {
+    display: flex;
+    gap: 10px;
+}
+
+.sheet .qty-unit-row > .sheet-field {
+    flex: 1;
+    min-width: 0;
+}
+
 .sheet-field {
     display: flex;
     flex-direction: column;

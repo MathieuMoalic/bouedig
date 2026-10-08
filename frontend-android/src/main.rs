@@ -4039,10 +4039,9 @@ fn GroceryEditSheet(
                             oninput: move |e: FormEvent| name.set(e.value()),
                         }
                     }
-                    div { class: "sheet-field",
-                    div { class: "sheet-field",
-                        span { "Amount" }
-                        div { class: "qty-unit-row",
+                    div { class: "qty-unit-row",
+                        label { class: "sheet-field",
+                            span { "Amount" }
                             input {
                                 id: "sheet-item-qty",
                                 class: "qty-input",
@@ -4059,6 +4058,9 @@ fn GroceryEditSheet(
                                     quantity.set(cleaned);
                                 },
                             }
+                        }
+                        label { class: "sheet-field",
+                            span { "Unit" }
                             input {
                                 id: "sheet-item-unit",
                                 class: "unit-input",
@@ -4069,7 +4071,7 @@ fn GroceryEditSheet(
                             }
                         }
                     }
-                        span { "Group" }
+                    span { "Group" }
                         div { class: "sheet-cats",
                             for (label, emoji, button_id) in categories.iter() {
                                 button {
@@ -4086,7 +4088,6 @@ fn GroceryEditSheet(
                             }
                         }
                     }
-                }
                 div { class: "sheet-actions",
                     button {
                         id: "sheet-item-cancel",
