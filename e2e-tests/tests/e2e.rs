@@ -323,10 +323,14 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
     );
 
     // Manual add: Enter submits; the add sheet has no group field anymore.
+    // Every successful add closes the dialog.
     open_grocery_add_sheet(driver).await?;
     let input = driver.find(By::Id("grocery-input")).await?;
     input.send_keys("Bananas").await?;
     input.send_keys("\u{E007}").await?;
+    wait_for_gone(driver, ".add-dialog")
+        .await
+        .context("add dialog must close after an add")?;
     driver
         .find(By::XPath("//li[contains(., 'Bananas')]"))
         .await
@@ -335,7 +339,8 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
 
     // Suggestions: typing a prefix of an on-list item offers it in the
     // dropdown, and TAPPING the suggestion adds it directly — no Add click,
-    // no Enter — and clears the input.
+    // no Enter — and closes the dialog.
+    open_grocery_add_sheet(driver).await?;
     let input = driver.find(By::Id("grocery-input")).await?;
     input.send_keys("Bana").await?;
     let mut suggestion = None;
@@ -355,7 +360,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
     );
     suggestion.click().await?;
     // The pick added a second "Bananas" line (separate lines by design) and
-    // emptied the input for the next item.
+    // closed the dialog.
     let mut bananas = 0usize;
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
@@ -374,11 +379,9 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
         bananas >= 2,
         "tapping the suggestion did not add the item directly"
     );
-    let cleared = input.prop("value").await?.unwrap_or_default();
-    anyhow::ensure!(
-        cleared.is_empty(),
-        "input must clear after a suggestion tap, got {cleared:?}"
-    );
+    wait_for_gone(driver, ".add-dialog")
+        .await
+        .context("add dialog must close after a suggestion tap")?;
 
     // -- 6. Confirm-delete removes the recipe. ------------------------------
     driver
@@ -1722,8 +1725,8 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
         input.send_keys("Bread").await?;
         input.send_keys("\u{E007}").await?;
         poll_grocery(&http, &base, "Bread", None).await?;
-        // Close the modal: its backdrop would block the row clicks below.
-        driver.find(By::Id("add-cancel")).await?.click().await?;
+        // The add already closed the dialog; the row clicks below must not
+        // be blocked by a backdrop.
         wait_for_gone(&driver, ".add-dialog").await?;
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -1835,7 +1838,7 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
         );
 
         // The amount fields: a quantity of "2" + unit "packs" rides along
-        // with the name on the next add.
+        // with the name on the next add. The add closes the dialog.
         driver.find(By::Id("grocery-qty")).await?.send_keys("2").await?;
         driver
             .find(By::Id("grocery-unit"))
@@ -1848,6 +1851,7 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             .send_keys("Oat milk")
             .await?;
         driver.find(By::Id("grocery-add")).await?.click().await?;
+        wait_for_gone(&driver, ".add-dialog").await?;
         poll_grocery(&http, &base, "Oat milk", None).await?;
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -1879,16 +1883,18 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
         // row. The merged add answers with the existing row's id. Enter on
         // the input submits (the suggestion dropdown is open while the typed
         // text matches the existing row).
+        open_grocery_add_sheet(&driver).await?;
         let qty = driver.find(By::Id("grocery-qty")).await?;
         qty.clear().await?;
         qty.send_keys("3").await?;
-        // Every submit resets the whole row, so the unit is typed again.
+        // Every add resets the whole row, so the unit is typed again.
         let unit_field = driver.find(By::Id("grocery-unit")).await?;
         unit_field.clear().await?;
         unit_field.send_keys("packs").await?;
         let input = driver.find(By::Id("grocery-input")).await?;
         input.send_keys("Oat milk").await?;
         input.send_keys(Key::Enter).await?;
+        wait_for_gone(&driver, ".add-dialog").await?;
         let mut merged = false;
         for _ in 0..25 {
             let items: Vec<GroceryItem> = http
@@ -1917,21 +1923,18 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             "merged item must render as one row, got {row_count}"
         );
 
-        // Clear the amount fields for the rest of the flow (they should
-        // already be empty: every submit resets quantity and unit too).
-        driver.find(By::Id("grocery-qty")).await?.clear().await?;
-        driver.find(By::Id("grocery-unit")).await?.clear().await?;
-
-        // Add "apple" so there is a past entry to suggest. The Add click
-        // clears the input (controlled input — send_keys alone would append).
+        // Add "apple" so there is a past entry to suggest. Every add resets
+        // the row and closes the dialog, so this add is unquantified.
+        open_grocery_add_sheet(&driver).await?;
         driver.find(By::Id("grocery-input")).await?.send_keys("apple").await?;
         driver.find(By::Id("grocery-add")).await?.click().await?;
+        wait_for_gone(&driver, ".add-dialog").await?;
         driver
             .find(By::XPath("//li[contains(., 'apple')]"))
             .await
             .context("added item did not appear in the UI")?;
         poll_grocery(&http, &base, "apple", None).await?;
-        // The amount fields were cleared above: the manual apple must be
+        // The dialog add resets quantity and unit: the manual apple must be
         // unquantified, or the suggestion tap below would merge into it.
         let items: Vec<GroceryItem> = http
             .get(format!("{base}/api/grocery"))
@@ -1945,12 +1948,12 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             .context("apple missing right after its add")?;
         anyhow::ensure!(
             apple.quantity.is_none() && apple.unit.is_empty(),
-            "manual add must be unquantified after the clears: {apple:?}"
+            "manual add must be unquantified: {apple:?}"
         );
 
         // Typing a fuzzy typo opens the dropdown with the close match.
+        open_grocery_add_sheet(&driver).await?;
         let input = driver.find(By::Id("grocery-input")).await?;
-        input.clear().await?;
         input.send_keys("appel").await?;
         let suggestion = driver
             .find(By::Css(".suggestions .suggestion"))
@@ -1964,25 +1967,16 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             }
         };
         suggestion.click().await?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
         // Tapping the suggestion adds it directly (a second "apple" row)
-        // and clears the input for the next item.
-        let value = driver
-            .find(By::Id("grocery-input"))
-            .await?
-            .value()
-            .await?
-            .unwrap_or_default();
-        anyhow::ensure!(
-            value.is_empty(),
-            "suggestion tap must add directly and clear the input, got '{value}'"
-        );
+        // and closes the dialog.
+        wait_for_gone(&driver, ".add-dialog").await?;
         poll_grocery_count(&http, &base, "apple", 2).await?;
 
-        // A second, different item in the same group. The input is empty
-        // after Add, so send_keys types from scratch.
+        // A second, different item in the same group.
+        open_grocery_add_sheet(&driver).await?;
         driver.find(By::Id("grocery-input")).await?.send_keys("Milk").await?;
         driver.find(By::Id("grocery-add")).await?.click().await?;
+        wait_for_gone(&driver, ".add-dialog").await?;
         poll_grocery(&http, &base, "Milk", None).await?;
         let texts = grocery_item_texts(&driver).await?;
         anyhow::ensure!(
@@ -1990,8 +1984,8 @@ async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()>
             "expected 'apple' and 'Milk' rows, got {texts:?}"
         );
 
-        // Close the modal: its backdrop would block the checkbox clicks below.
-        driver.find(By::Id("add-cancel")).await?.click().await?;
+        // The dialog is already closed (every add closes it); the checkboxes
+        // below must not be blocked by a backdrop.
         wait_for_gone(&driver, ".add-dialog").await?;
 
         // Checking the box (bought) removes every "apple" row from the UI

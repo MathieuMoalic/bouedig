@@ -3752,7 +3752,7 @@ fn GroceryContent() -> Element {
                                 id: "grocery-input",
                                 r#type: "text",
                                 value: "{new_item}",
-                                placeholder: "Add an item manually…",
+                                placeholder: "tofu, onions, …",
                                 oninput: move |e: FormEvent| new_item.set(e.value()),
                                 onfocus: move |_| focused.set(true),
                                 onblur: move |_| focused.set(false),
@@ -3772,6 +3772,7 @@ fn GroceryContent() -> Element {
                                             new_item,
                                             new_qty,
                                             new_unit,
+                                            add_sheet,
                                             items,
                                             name_history,
                                             error,
@@ -3806,6 +3807,7 @@ fn GroceryContent() -> Element {
                                                     new_item,
                                                     new_qty,
                                                     new_unit,
+                                                    add_sheet,
                                                     items,
                                                     name_history,
                                                     error,
@@ -3835,6 +3837,7 @@ fn GroceryContent() -> Element {
                                         new_item,
                                         new_qty,
                                         new_unit,
+                                        add_sheet,
                                         items,
                                         name_history,
                                         error,
@@ -4212,6 +4215,7 @@ fn submit_grocery_item(
     mut new_item: Signal<String>,
     mut new_qty: Signal<String>,
     mut new_unit: Signal<String>,
+    mut add_sheet: Signal<bool>,
     mut items: Signal<Vec<GroceryItem>>,
     name_history: Signal<Vec<String>>,
     mut error: Signal<String>,
@@ -4220,11 +4224,12 @@ fn submit_grocery_item(
     if name.is_empty() {
         return;
     }
-    // Reset the whole row, not just the name: sticky quantity/unit would
-    // silently attach to whatever the user adds next.
+    // Reset the whole row and close the dialog: one add per open. The
+    // empty-name early-return above keeps the dialog open for a no-op Add.
     new_item.set(String::new());
     new_qty.set(String::new());
     new_unit.set(String::new());
+    add_sheet.set(false);
     spawn(async move {
         let item = NewGroceryItem {
             name,
