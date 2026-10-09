@@ -17,7 +17,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls-tls", "multipart"] }
 scraper.workspace = true
 chrono.workspace = true
 url.workspace = true
@@ -33,6 +33,10 @@ path = "src/main.rs"
 [[bin]]
 name = "migrate"
 path = "src/bin/migrate.rs"
+
+[[bin]]
+name = "import_blaz"
+path = "src/bin/import_blaz.rs"
 
 [lints]
 workspace = true
