@@ -2217,3 +2217,17 @@ ol.instruction-list li.instruction-item {
 .fb-delete {
     color: var(--error);
 }
+
+/* Grocery group header: reorder arrows (device-local ordering). */
+.group-move {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 13px;
+    padding: 2px 4px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.group-move + .group-move {
+    margin-left: 0;
+}

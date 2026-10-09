@@ -3594,7 +3594,23 @@ fn GroceryContent() -> Element {
     let name_history = use_signal(Vec::<String>::new);
     let mut error = use_signal(|| String::new());
     let mut focused = use_signal(|| false);
-    let collapsed = use_signal(|| HashSet::<String>::new());
+    let mut collapsed = use_signal(|| HashSet::<String>::new());
+    // Device-local grocery layout: group display order + collapsed groups,
+    // loaded once and saved on every change (small JSON file).
+    let mut group_order = use_signal(Vec::<String>::new);
+    let mut prefs_loaded = use_signal(|| false);
+    use_effect(move || {
+        let (order, collapsed_set) = load_group_prefs();
+        group_order.set(order);
+        collapsed.set(collapsed_set);
+        prefs_loaded.set(true);
+    });
+    use_effect(move || {
+        if !prefs_loaded() {
+            return;
+        }
+        save_group_prefs(&group_order.read().clone(), &collapsed.read().clone());
+    });
     let mut loaded = use_signal(|| false);
     let mut plan_loaded = use_signal(|| false);
     let mut plan_entries = use_signal(Vec::<MealPlanEntry>::new);
@@ -3685,10 +3701,50 @@ fn GroceryContent() -> Element {
             None => groups.push((item.category.clone(), vec![item.clone()])),
         }
     }
+    // The device's saved order wins; groups it doesn't know (new or renamed)
+    // keep their first-seen position behind the known ones.
+    let saved_order = group_order.read().clone();
+    let order_position =
+        |name: &str| saved_order.iter().position(|o| o == name).unwrap_or(usize::MAX);
+    groups.sort_by_key(|(c, _)| order_position(c));
 
-    // Suggestion pool: the live list first (its casing wins), then the
-    // ever-added history. History names come back lowercased from the
-    // classifier cache, so give cache-only names a display capital.
+    // Move a group up/down in the display order and persist the new order.
+    let display_order: Vec<String> = groups.iter().map(|(c, _)| c.clone()).collect();
+    let move_group = move |name: String, up: bool| {
+        let mut order = display_order.clone();
+        if let Some(index) = order.iter().position(|c| *c == name) {
+            let target = if up { index.checked_sub(1) } else { Some(index + 1) };
+            if let Some(t) = target.filter(|t| *t < order.len()) {
+                order.swap(index, t);
+                group_order.set(order);
+            }
+        }
+    };
+    // Category dropdown options: the preset list first, then any group the
+    // user has invented that isn't already covered (before `groups` is
+    // consumed by the section precompute below).
+    let mut category_options: Vec<String> = shared::GROCERY_CATEGORIES
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    for (category, _) in &groups {
+        if !category_options.contains(category) {
+            category_options.push(category.clone());
+        }
+    }
+    // Precompute per-section handlers: rsx for-bodies can't hold let
+    // statements, and each section needs its own copy of the mover.
+    let groups_empty = groups.is_empty();
+    let sections: Vec<(String, Vec<GroceryItem>, EventHandler<(String, bool)>)> = groups
+        .into_iter()
+        .map(|(category, group_items)| {
+            let mut move_group = move_group.clone();
+            let on_move = EventHandler::new(move |(name, up): (String, bool)| {
+                move_group(name, up);
+            });
+            (category, group_items, on_move)
+        })
+        .collect();
     let mut past_names: Vec<String> = Vec::new();
     for item in &list {
         if !past_names.iter().any(|n| n.eq_ignore_ascii_case(&item.name)) {
@@ -3713,17 +3769,6 @@ fn GroceryContent() -> Element {
     let today_value = today_local_iso();
     let plan_list = plan_entries.read().clone();
     let plan_map = planned_dates(&plan_list, &today_value);
-    // Category dropdown options: the preset list first, then any group the
-    // user has invented that isn't already covered.
-    let mut category_options: Vec<String> = shared::GROCERY_CATEGORIES
-        .iter()
-        .map(|c| c.to_string())
-        .collect();
-    for (category, _) in &groups {
-        if !category_options.contains(category) {
-            category_options.push(category.clone());
-        }
-    }
 
     let edited_item = edit_item.read().clone();
     let edited_id = edited_item.as_ref().map(|item| item.id);
@@ -3760,11 +3805,11 @@ fn GroceryContent() -> Element {
             if !error.read().is_empty() {
                 p { class: "status-error", "{error}" }
             }
-            if groups.is_empty() {
+            if groups_empty {
                 p { class: "empty", "Your grocery list is empty. Add an item above." }
             } else {
                 div { id: "grocery-list", class: "grocery-groups",
-                    for (category, group_items) in groups {
+                    for (category, group_items, on_move) in sections {
                         GroupSection {
                             key: "{category}",
                             name: category,
@@ -3772,6 +3817,7 @@ fn GroceryContent() -> Element {
                             collapsed: collapsed,
                             items_sig: items,
                             error: error,
+                            on_move: on_move,
                             on_edit: move |item: GroceryItem| edit_item.set(Some(item)),
                             on_bought: move |item: GroceryItem| {
                                 record_removed_item(item, undo_item, undo_gen, mounted);
@@ -4007,10 +4053,16 @@ fn GroupSection(
     mut collapsed: Signal<HashSet<String>>,
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
+    on_move: EventHandler<(String, bool)>,
     on_edit: EventHandler<GroceryItem>,
     on_bought: EventHandler<GroceryItem>,
 ) -> Element {
     let is_collapsed = collapsed.read().contains(&name);
+    // Each header handler owns its copy: rsx closures are FnMut and cannot
+    // share one moved String.
+    let collapse_name = name.clone();
+    let up_name = name.clone();
+    let down_name = name.clone();
 
     rsx! {
         div { class: "grocery-card",
@@ -4018,7 +4070,7 @@ fn GroupSection(
                 key: "group-{name}",
                 class: "grocery-group",
                 onclick: move |_| {
-                    let name = name.clone();
+                    let name = collapse_name.clone();
                     tracing::debug!("toggling grocery group {name:?}");
                     collapsed.with_mut(|s| {
                         if !s.remove(&name) {
@@ -4029,6 +4081,22 @@ fn GroupSection(
                 span { class: "group-icon", IconMenu {} }
                 span { class: "group-chevron", IconChevron { down: !is_collapsed } }
                 span { class: "group-name", "{name}" }
+                span {
+                    class: "group-move",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        on_move.call((up_name.clone(), true));
+                    },
+                    "↑"
+                }
+                span {
+                    class: "group-move",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        on_move.call((down_name.clone(), false));
+                    },
+                    "↓"
+                }
             }
             if !is_collapsed {
                 ul { class: "grocery-list",
@@ -5550,5 +5618,36 @@ mod tests {
     fn test_rank_suggestions_no_match() {
         let past = vec!["xyz".to_string(), "qwert".to_string()];
         assert!(rank_suggestions("apple", &past).is_empty());
+    }
+}
+
+/// The grocery groups' device-local layout: display order and which groups
+/// are collapsed. Stored in a small JSON file (app files dir), so each
+/// device keeps its own.
+const GROUP_PREFS: &str = "/data/data/eu.matmoa.bouedig/files/group_prefs.json";
+
+fn load_group_prefs() -> (Vec<String>, HashSet<String>) {
+    match std::fs::read_to_string(GROUP_PREFS) {
+        Ok(json) => match serde_json::from_str::<(Vec<String>, Vec<String>)>(&json) {
+            Ok((order, collapsed)) => (order, collapsed.into_iter().collect()),
+            Err(err) => {
+                tracing::error!("group prefs unreadable: {err:#}");
+                (Vec::new(), HashSet::new())
+            }
+        },
+        // First run: no file yet.
+        Err(_) => (Vec::new(), HashSet::new()),
+    }
+}
+
+fn save_group_prefs(order: &[String], collapsed: &HashSet<String>) {
+    if let Some(dir) = std::path::Path::new(GROUP_PREFS).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_string(&(order, collapsed.iter().collect::<Vec<_>>())) {
+        Ok(json) => {
+            let _ = std::fs::write(GROUP_PREFS, json);
+        }
+        Err(err) => tracing::error!("group prefs serialization failed: {err:#}"),
     }
 }
