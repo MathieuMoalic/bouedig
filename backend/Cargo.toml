@@ -11,6 +11,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 axum = { workspace = true, features = ["multipart"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 tower-http.workspace = true
 sqlx.workspace = true
 tracing.workspace = true

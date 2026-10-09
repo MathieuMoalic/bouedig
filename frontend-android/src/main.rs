@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Timelike};
 use dioxus::prelude::*;
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use shared::{
     FeedbackItem, GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep,
@@ -22,6 +23,12 @@ const API_BASE: &str = match option_env!("BOUEDIG_API_BASE") {
 
 const WALLPAPER: Asset = asset!("/assets/background.avif");
 const FAVICON: Asset = asset!("/assets/icon.png");
+
+/// Live-update counters: the `/api/events` stream bumps these whenever the
+/// server announces a change, and the open page refetches what it shows.
+static GROCERY_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
+static RECIPES_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
+static MEALPLAN_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
 
 fn api_base() -> String {
     API_BASE.to_string()
@@ -158,6 +165,56 @@ fn Layout() -> Element {
             });
         });
     }
+    // Live updates: one SSE subscription for the whole app. Each event
+    // bumps its epoch signal and the open page refetches. The reader
+    // reconnects a few seconds after every dropped stream.
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                let response = http().get(format!("{}/api/events", api_base())).send().await;
+                let mut event = String::new();
+                let mut buffer = String::new();
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        let mut stream = response.bytes_stream();
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(bytes) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                    while let Some(end) = buffer.find('\n') {
+                                        let line = buffer[..end].to_string();
+                                        buffer.drain(..end + 1);
+                                        if let Some(topic) = line.strip_prefix("event: ") {
+                                            event = topic.trim().to_string();
+                                        } else if line.is_empty() && !event.is_empty() {
+                                            match event.as_str() {
+                                                "grocery" => *GROCERY_EPOCH.write() += 1,
+                                                "recipes" => *RECIPES_EPOCH.write() += 1,
+                                                "mealplan" => *MEALPLAN_EPOCH.write() += 1,
+                                                _ => {}
+                                            }
+                                            event.clear();
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!("live stream read failed: {err}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(response) => {
+                        tracing::error!("live stream refused: {}", response.status());
+                    }
+                    Err(err) => {
+                        tracing::error!("live stream unreachable: {err}");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    });
     rsx! {
         style { {include_str!("../assets/style.css")} }
         document::Title { "Bouedig" }
@@ -710,6 +767,26 @@ fn Recipes() -> Element {
                 }
             });
         }
+    });
+
+    // Live updates: another client added/changed/removed a recipe —
+    // refetch the grid (the sort choice stays as the user left it).
+    use_effect(move || {
+        let epoch = RECIPES_EPOCH();
+        if epoch == 0 {
+            return;
+        }
+        spawn(async move {
+            match api_get::<Vec<Recipe>>("/api/recipes").await {
+                Ok(list) => {
+                    recipes.set(list);
+                    error.set(String::new());
+                }
+                Err(err) => {
+                    tracing::error!("recipes live refresh failed: {err:#}");
+                }
+            }
+        });
     });
 
     // Live search: debounce 300 ms, then fetch ranked matches. Stale
@@ -3540,6 +3617,18 @@ fn GroceryContent() -> Element {
         }
     });
 
+    // Live updates: another client changed the list — refetch right now.
+    use_effect(move || {
+        let epoch = GROCERY_EPOCH();
+        if epoch == 0 {
+            return;
+        }
+        spawn(async move {
+            refresh(items, error).await;
+            refresh_names(name_history).await;
+        });
+    });
+
     // Background classification flips categories a few seconds after an
     // add, so re-fetch periodically while the page is open. The loop dies
     // with the page via the mounted flag (use_drop).
@@ -4408,6 +4497,25 @@ fn MealPlanContent() -> Element {
                 }
             });
         }
+    });
+
+    // Live updates: another client planned or unscheduled a meal — refetch
+    // both the plan and the recipes that feed the picker.
+    use_effect(move || {
+        let epoch = MEALPLAN_EPOCH();
+        if epoch == 0 {
+            return;
+        }
+        spawn(async move {
+            match api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                Ok(list) => entries.set(list),
+                Err(err) => tracing::error!("meal plan live refresh failed: {err:#}"),
+            }
+            match api_get::<Vec<Recipe>>("/api/recipes").await {
+                Ok(list) => recipes.set(list),
+                Err(err) => tracing::error!("recipes live refresh failed: {err:#}"),
+            }
+        });
     });
 
     // The open Sat→Fri week: 0 = the week containing today. Friday evening

@@ -15,6 +15,12 @@ use shared::{
 const WALLPAPER: Asset = asset!("/assets/background.avif");
 const FAVICON: Asset = asset!("/assets/icon.png");
 
+/// Live-update counters: the `/api/events` stream bumps these whenever the
+/// server announces a change, and the open page refetches what it shows.
+static GROCERY_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
+static RECIPES_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
+static MEALPLAN_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
+
 fn main() {
     // Set up logging and panic reporting first, so that anything that goes
     // wrong afterwards (including panics) is visible in the browser console.
@@ -60,6 +66,37 @@ fn App() -> Element {
 
 #[component]
 fn Layout() -> Element {
+    // Live updates: one EventSource for the whole app; each topic bumps its
+    // epoch signal and the open page refetches. The source and the
+    // callbacks live for the app's lifetime.
+    use_effect(move || {
+        let source = match web_sys::EventSource::new(&format!("{}/api/events", api_base())) {
+            Ok(source) => source,
+            Err(err) => {
+                tracing::error!("live updates unavailable: {err:?}");
+                return;
+            }
+        };
+        let bump = |epoch: &'static GlobalSignal<u64>| {
+            wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_| {
+                *epoch.write() += 1;
+            })
+        };
+        let handlers = [
+            ("grocery", bump(&GROCERY_EPOCH)),
+            ("recipes", bump(&RECIPES_EPOCH)),
+            ("mealplan", bump(&MEALPLAN_EPOCH)),
+        ];
+        for (topic, callback) in handlers {
+            let _ = source.add_event_listener_with_callback(
+                topic,
+                callback.as_ref().unchecked_ref(),
+            );
+            std::mem::forget(callback);
+        }
+        std::mem::forget(source);
+    });
+
     rsx! {
         style { {include_str!("../assets/style.css")} }
         document::Title { "Bouedig" }
@@ -673,6 +710,26 @@ fn Recipes() -> Element {
                 }
             });
         }
+    });
+
+    // Live updates: another client added/changed/removed a recipe —
+    // refetch the grid (the sort choice stays as the user left it).
+    use_effect(move || {
+        let epoch = RECIPES_EPOCH();
+        if epoch == 0 {
+            return;
+        }
+        spawn(async move {
+            match api_get::<Vec<Recipe>>("/api/recipes").await {
+                Ok(list) => {
+                    recipes.set(list);
+                    error.set(String::new());
+                }
+                Err(err) => {
+                    tracing::error!("recipes live refresh failed: {err:#}");
+                }
+            }
+        });
     });
 
     // Live search: debounce 300 ms, then fetch ranked matches. Stale
@@ -3674,6 +3731,18 @@ fn GroceryContent() -> Element {
         });
     });
 
+    // Live updates: another client changed the list — refetch right now.
+    use_effect(move || {
+        let epoch = GROCERY_EPOCH();
+        if epoch == 0 {
+            return;
+        }
+        spawn(async move {
+            refresh(items, error).await;
+            refresh_names(name_history).await;
+        });
+    });
+
     // Plan dates feed the provenance line ("Lentil Loaf in 4 days"): one
     // fetch, mapped client-side so the day math uses the browser's today.
     use_effect(move || {
@@ -4688,6 +4757,25 @@ fn MealPlanContent() -> Element {
                 }
             });
         }
+    });
+
+    // Live updates: another client planned or unscheduled a meal — refetch
+    // both the plan and the recipes that feed the picker.
+    use_effect(move || {
+        let epoch = MEALPLAN_EPOCH();
+        if epoch == 0 {
+            return;
+        }
+        spawn(async move {
+            match api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
+                Ok(list) => entries.set(list),
+                Err(err) => tracing::error!("meal plan live refresh failed: {err:#}"),
+            }
+            match api_get::<Vec<Recipe>>("/api/recipes").await {
+                Ok(list) => recipes.set(list),
+                Err(err) => tracing::error!("recipes live refresh failed: {err:#}"),
+            }
+        });
     });
 
     // The open Sat→Fri week: 0 = the week containing today. Friday evening

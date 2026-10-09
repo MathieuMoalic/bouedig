@@ -3515,3 +3515,69 @@ async fn settings_feedback_flow() -> anyhow::Result<()> {
     let _ = driver.quit().await;
     result
 }
+
+/// Instant client updates: a change made by another user (raw API call)
+/// appears on an open grocery page within ~2 seconds — the SSE stream
+/// triggers the refetch, faster than the 5s fallback poll could.
+#[tokio::test(flavor = "multi_thread")]
+async fn grocery_live_update_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        // The wasm client needs a moment to boot; the FAB exists as soon as
+        // the page is interactive (an empty list renders the empty state
+        // instead of the list element).
+        let mut list_ready = false;
+        for _ in 0..40 {
+            if driver.find(By::Id("grocery-fab-add")).await.is_ok() {
+                list_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(list_ready, "grocery page never became interactive");
+
+        // Another user adds an item through the raw API — no browser action.
+        let (status, _) = json_post(
+            &http,
+            &base,
+            "/api/grocery",
+            r#"{"name":"Live update pear"}"#,
+        )
+        .await?;
+        anyhow::ensure!(status == 201, "seed add failed: {status}");
+
+        // The open page must show the row well inside the 5s fallback-poll
+        // window, proving the SSE push did the work.
+        let mut appeared = false;
+        for _ in 0..8 {
+            if driver
+                .find(By::XPath("//li[contains(., 'Live update pear')]"))
+                .await
+                .is_ok()
+            {
+                appeared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        anyhow::ensure!(
+            appeared,
+            "the live update never appeared on the open page in time"
+        );
+        // Leave the page before quitting: the open EventSource otherwise
+        // keeps the browser shutdown hanging for minutes.
+        driver.goto("about:blank").await?;
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}

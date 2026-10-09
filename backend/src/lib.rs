@@ -128,10 +128,14 @@ pub struct AppState {
     password: Option<String>,
     /// Append `; Secure` to session cookies (production behind TLS).
     secure_cookies: bool,
+    /// Live-update fan-out: every data mutation sends its topic here and
+    /// the `/api/events` SSE stream relays it to open clients.
+    events: tokio::sync::broadcast::Sender<&'static str>,
 }
 
 impl AppState {
     fn from_config(db: SqlitePool, config: &Config) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(64);
         Self {
             db,
             data_dir: config.data_dir.clone(),
@@ -148,7 +152,14 @@ impl AppState {
             ),
             password: config.password.clone(),
             secure_cookies: config.secure_cookies,
+            events,
         }
+    }
+
+    /// Announce a data change to every connected client. Send errors are
+    /// ignored: no listener simply means nobody is watching.
+    fn notify(&self, topic: &'static str) {
+        let _ = self.events.send(topic);
     }
 }
 
@@ -226,6 +237,7 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
         )
         .route("/login", post(login))
         .route("/logout", post(logout))
+        .route("/events", get(events))
         .route("/session", get(session_status))
         .route("/version", get(server_version))
         .route("/images/{*path}", get(serve_image))
@@ -742,6 +754,7 @@ async fn create_recipe(
 ) -> Result<(StatusCode, Json<Recipe>), ApiError> {
     validate_recipe_input(&input)?;
     let recipe = insert_recipe(&state.db, &input, None).await?;
+    state.notify("recipes");
     Ok((StatusCode::CREATED, Json(recipe)))
 }
 
@@ -904,6 +917,7 @@ async fn create_recipe_with_photo(
         parse_recipe_multipart(&state, &mut multipart).await?;
     validate_recipe_input(&input)?;
     let recipe = insert_recipe(&state.db, &input, image).await?;
+    state.notify("recipes");
     Ok((StatusCode::CREATED, Json(recipe)))
 }
 
@@ -967,6 +981,7 @@ async fn update_recipe(
     }
     replace_details(&mut tx, id, &input).await?;
     tx.commit().await?;
+    state.notify("recipes");
 
     load_recipe_detail(&state.db, id)
         .await?
@@ -997,6 +1012,7 @@ async fn delete_recipe(
         .bind(id)
         .execute(&state.db)
         .await?;
+    state.notify("recipes");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1145,6 +1161,34 @@ async fn login(
 /// settings page shows it next to their own version).
 async fn server_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// `GET /api/events`: server-sent events fan-out for instant client
+/// updates. Every data mutation broadcasts its topic ("grocery",
+/// "recipes", "mealplan") and this stream relays it; clients refetch
+/// whatever they are showing. Keep-alives stop proxies from dropping idle
+/// connections and the no-cache header stops reverse proxies from holding
+/// events back.
+async fn events(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let rx = state.events.subscribe();
+    let stream = tokio_stream::StreamExt::filter_map(
+        tokio_stream::wrappers::BroadcastStream::new(rx),
+        |item| match item {
+            Ok(topic) => Some(Ok::<_, std::convert::Infallible>(
+                Event::default().event(topic).data("changed"),
+            )),
+            // A slow client missed some events: one generic refresh covers
+            // everything.
+            Err(_) => Some(Ok(Event::default().event("changed").data("refresh"))),
+        },
+    );
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    )
 }
 
 const FEEDBACK_KINDS: [&str; 3] = ["bug", "feature", "other"];
@@ -1708,6 +1752,7 @@ async fn add_grocery_item(
             .bind(merge_id)
             .fetch_one(&state.db)
             .await?;
+        state.notify("grocery");
         return Ok((StatusCode::OK, Json(row_to_joined_item(&row))));
     }
     let (category, needs_classification) = resolve_category(&state.db, &item).await;
@@ -1731,6 +1776,7 @@ async fn add_grocery_item(
             });
         }
     }
+    state.notify("grocery");
     Ok((StatusCode::CREATED, Json(row_to_item(&row))))
 }
 
@@ -1834,6 +1880,7 @@ async fn add_grocery_batch(
         created.push(item);
     }
     tx.commit().await?;
+    state.notify("grocery");
     if !pending.is_empty() {
         if let Some(classifier) = state.classifier.clone() {
             let db = state.db.clone();
@@ -1858,6 +1905,7 @@ async fn update_grocery_item(
         if rows.rows_affected() == 0 {
             return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
         }
+        state.notify("grocery");
         Ok(StatusCode::NO_CONTENT)
     } else {
         let _row = sqlx::query(
@@ -1870,6 +1918,7 @@ async fn update_grocery_item(
         if _row.is_none() {
             return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
         }
+        state.notify("grocery");
         Ok(StatusCode::NO_CONTENT)
     }
 }
@@ -1921,6 +1970,7 @@ async fn patch_grocery_item(
         .bind(id)
         .fetch_one(&state.db)
         .await?;
+    state.notify("grocery");
     Ok(Json(row_to_joined_item(&row)))
 }
 
@@ -1935,6 +1985,7 @@ async fn delete_grocery_item(
     if rows.rows_affected() == 0 {
         return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
     }
+    state.notify("grocery");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2013,6 +2064,7 @@ async fn add_meal_plan_entry(
         .bind(id)
         .fetch_one(&state.db)
         .await?;
+    state.notify("mealplan");
     Ok((StatusCode::CREATED, Json(row_to_meal_plan_entry(&row))))
 }
 
@@ -2028,6 +2080,7 @@ async fn delete_meal_plan_entry(
     if rows.rows_affected() == 0 {
         return Err(ApiError((StatusCode::NOT_FOUND, "no such meal plan entry").into_response()));
     }
+    state.notify("mealplan");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2083,6 +2136,7 @@ pub(crate) mod tests {
             import_allow_private: true,
             password: None,
             secure_cookies: false,
+            events: tokio::sync::broadcast::channel(64).0,
             classifier: classifier::Classifier::from_parts(
                 Some("test-key".into()),
                 Some("typesafe-ai/jev".into()),
@@ -2110,6 +2164,7 @@ pub(crate) mod tests {
             import_allow_private: true,
             password: None,
             secure_cookies: false,
+            events: tokio::sync::broadcast::channel(64).0,
             classifier: None,
             vision: recipe_import::vision::VisionExtractor::from_parts(
                 Some("test-key".into()),
