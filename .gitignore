@@ -16,3 +16,4 @@ result
 release/
 __pycache__/
 .direnv/
+blaz_files/
