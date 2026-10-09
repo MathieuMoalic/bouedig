@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, delete, post};
+use axum::routing::{get, delete, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use shared::{
-    GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry,
-    NewGroceryBatch, NewGroceryItem, Recipe, RecipeDetail, RecipeInput,
+    FeedbackItem, GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep,
+    MealPlanEntry, NewFeedback, NewGroceryBatch, NewGroceryItem, Recipe, RecipeDetail, RecipeInput,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool};
@@ -201,6 +201,14 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
         )
         .route("/grocery/names", get(grocery_names))
         .route("/grocery/batch", post(add_grocery_batch))
+        .route(
+            "/feedback",
+            get(list_feedback).post(add_feedback),
+        )
+        .route(
+            "/feedback/{id}",
+            patch(update_feedback).delete(delete_feedback),
+        )
         .route(
             "/grocery/{id}",
             delete(delete_grocery_item)
@@ -1137,6 +1145,114 @@ async fn login(
 /// settings page shows it next to their own version).
 async fn server_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+const FEEDBACK_KINDS: [&str; 3] = ["bug", "feature", "other"];
+const FEEDBACK_MAX_LEN: usize = 4000;
+
+fn feedback_row(row: &sqlx::sqlite::SqliteRow) -> FeedbackItem {
+    use sqlx::Row;
+    FeedbackItem {
+        id: row.get("id"),
+        kind: row.get("kind"),
+        text: row.get("text"),
+        app_version: row.get("app_version"),
+        seen: row.get::<i64, _>("seen") != 0,
+        created_at: row.get("created_at"),
+    }
+}
+
+/// `POST /api/feedback`: store a report from the Settings form. Kind is a
+/// fixed set and the text is capped so a stray paste can't bloat the DB.
+async fn add_feedback(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(feedback): Json<NewFeedback>,
+) -> Result<(StatusCode, Json<FeedbackItem>), ApiError> {
+    let text = feedback.text.trim();
+    if !FEEDBACK_KINDS.contains(&feedback.kind.as_str()) {
+        return Err(ApiError(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "kind must be bug, feature or other",
+            )
+                .into_response(),
+        ));
+    }
+    if text.is_empty() {
+        return Err(ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "feedback text must not be empty").into_response(),
+        ));
+    }
+    if text.len() > FEEDBACK_MAX_LEN {
+        return Err(ApiError(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("feedback text must be at most {FEEDBACK_MAX_LEN} characters"),
+            )
+                .into_response(),
+        ));
+    }
+    let row = sqlx::query(
+        "INSERT INTO feedback (kind, text, app_version) VALUES (?, ?, ?) \
+         RETURNING id, kind, text, app_version, seen, created_at",
+    )
+    .bind(feedback.kind.trim())
+    .bind(text)
+    .bind(feedback.app_version.trim())
+    .fetch_one(&state.db)
+    .await?;
+    Ok((StatusCode::CREATED, Json(feedback_row(&row))))
+}
+
+/// `GET /api/feedback`: every report, newest first.
+async fn list_feedback(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<Json<Vec<FeedbackItem>>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, kind, text, app_version, seen, created_at \
+         FROM feedback ORDER BY id DESC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows.iter().map(feedback_row).collect()))
+}
+
+/// `PATCH /api/feedback/{id}`: set the seen flag (cosmetic).
+async fn update_feedback(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let seen = body["seen"].as_bool().ok_or_else(|| {
+        ApiError(
+            (StatusCode::UNPROCESSABLE_ENTITY, "seen must be a boolean").into_response(),
+        )
+    })?;
+    let result =
+        sqlx::query("UPDATE feedback SET seen = ? WHERE id = ?")
+            .bind(seen)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such feedback").into_response()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/feedback/{id}`: remove a report.
+async fn delete_feedback(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let result = sqlx::query("DELETE FROM feedback WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such feedback").into_response()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/logout`: invalidate the session and expire the cookie.
@@ -2967,6 +3083,75 @@ pub(crate) mod tests {
             .next()
             .unwrap()
             .to_string()
+    }
+
+    /// The Settings feedback form end to end: create (with kind/text
+    /// validation), list newest-first, flip the seen flag, delete.
+    #[tokio::test]
+    async fn feedback_crud_flow() {
+        let app = test_router(None).await;
+        for payload in [
+            r#"{"kind":"bug","text":"The drag drops on the wrong day"}"#,
+            r#"{"kind":"feature","text":"Shopping list sorting","app_version":"0.1.10"}"#,
+        ] {
+            let (status, body) =
+                json_response(app.clone(), "POST", "/api/feedback", Some(payload)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        // Validation: unknown kind, empty text, over-long text.
+        for payload in [
+            r#"{"kind":"rant","text":"x"}"#,
+            r#"{"kind":"bug","text":"   "}"#,
+        ] {
+            let (status, _) =
+                json_response(app.clone(), "POST", "/api/feedback", Some(payload)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{payload}");
+        }
+        let long = format!(r#"{{"kind":"bug","text":"{}"}}"#, "x".repeat(4001));
+        let (status, _) = json_response(app.clone(), "POST", "/api/feedback", Some(&long)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (_, body) = json_response(app.clone(), "GET", "/api/feedback", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let items = list.as_array().unwrap();
+        assert_eq!(items.len(), 2, "{body}");
+        // Newest first.
+        assert_eq!(items[0]["kind"], "feature");
+        assert_eq!(items[0]["app_version"], "0.1.10");
+        assert_eq!(items[0]["seen"], false);
+        assert_eq!(items[1]["kind"], "bug");
+
+        let id = items[0]["id"].as_i64().unwrap();
+        let (status, _) = json_response(
+            app.clone(),
+            "PATCH",
+            &format!("/api/feedback/{id}"),
+            Some(r#"{"seen":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = json_response(app.clone(), "GET", "/api/feedback", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["seen"], true);
+
+        let (status, _) = json_response(
+            app.clone(),
+            "PATCH",
+            &format!("/api/feedback/{id}"),
+            Some(r#"{"seen":"yes"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) =
+            json_response(app.clone(), "DELETE", &format!("/api/feedback/{id}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) =
+            json_response(app.clone(), "DELETE", &format!("/api/feedback/{id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, body) = json_response(app, "GET", "/api/feedback", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -2044,3 +2044,145 @@ ol.instruction-list li.instruction-item {
     width: 14px;
     height: 14px;
 }
+
+/* Settings feedback: report form + the household's reports. */
+.feedback {
+    margin-top: 14px;
+    border-top: 1px solid var(--divider);
+    padding-top: 12px;
+    text-align: left;
+}
+
+.feedback h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+}
+
+.feedback-hint {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--muted);
+}
+
+.feedback .kind-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.kind-btn {
+    flex: 1;
+    padding: 7px 0;
+    border: 1px solid var(--divider);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.kind-btn.selected {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fff;
+}
+
+.feedback textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 72px;
+    background: var(--bg);
+    border: 1px solid var(--divider);
+    border-radius: 10px;
+    color: var(--text);
+    font: inherit;
+    padding: 8px 10px;
+    resize: vertical;
+}
+
+.feedback .btn-primary {
+    margin-top: 8px;
+}
+
+#feedback-status {
+    min-height: 1em;
+    margin: 6px 0 0;
+    font-size: 13px;
+}
+
+.feedback-error {
+    color: var(--error);
+}
+
+.feedback-ok {
+    color: var(--accent-bright);
+}
+
+.feedback-list {
+    list-style: none;
+    margin: 10px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.feedback-list li {
+    border: 1px solid var(--divider);
+    border-radius: 10px;
+    padding: 8px 10px;
+}
+
+.feedback-list li.seen {
+    opacity: 0.65;
+}
+
+.fb-meta {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.fb-kind {
+    font-weight: 700;
+    text-transform: capitalize;
+}
+
+.fb-new {
+    color: var(--accent-bright);
+    font-weight: 700;
+}
+
+.fb-date {
+    margin-left: auto;
+}
+
+.fb-text {
+    margin: 4px 0;
+    font-size: 14px;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.fb-actions {
+    display: flex;
+    gap: 10px;
+}
+
+.fb-actions button {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+}
+
+.fb-delete {
+    color: var(--error);
+}

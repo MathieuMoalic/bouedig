@@ -7,8 +7,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use shared::{
-    GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep, MealPlanEntry,
-    NewGroceryBatch, NewGroceryItem, Recipe, RecipeDetail as RecipeDetailModel, RecipeInput,
+    FeedbackItem, GroceryItem, GroceryPatch, GroceryUpdate, Ingredient, InstructionStep,
+    MealPlanEntry, NewFeedback, NewGroceryBatch, NewGroceryItem, Recipe,
+    RecipeDetail as RecipeDetailModel, RecipeInput,
 };
 
 const WALLPAPER: Asset = asset!("/assets/background.avif");
@@ -5352,12 +5353,172 @@ fn SettingsContent() -> Element {
             }
         });
     });
+
+    // Feedback: a small report form plus the list of everything the
+    // household has sent so far (newest first), with seen/delete.
+    let mut kind = use_signal(|| "bug".to_string());
+    let mut text = use_signal(String::new);
+    let items: Signal<Vec<FeedbackItem>> = use_signal(Vec::new);
+    let mut status = use_signal(String::new);
+
+    let refresh = move |mut items: Signal<Vec<FeedbackItem>>, mut status: Signal<String>| {
+        spawn(async move {
+            match api_get::<Vec<FeedbackItem>>("/api/feedback").await {
+                Ok(list) => {
+                    items.set(list);
+                    // Clear only our own load error — a submit's
+                    // "Thanks — reported!" must survive the refresh.
+                    if status().starts_with("Could not load") {
+                        status.set(String::new());
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("feedback list fetch failed: {err:#}");
+                    status.set("Could not load earlier reports.".into());
+                }
+            }
+        });
+    };
+    use_effect(move || refresh(items, status));
+
     rsx! {
         div { class: "page",
                 div { class: "card placeholder-card",
                     h1 { "Settings" }
                     p { class: "settings-version",
                         "App v{env!(\"CARGO_PKG_VERSION\")} — Server v{server_version}"
+                    }
+                    div { class: "feedback",
+                        h2 { "Feedback" }
+                        p { class: "feedback-hint",
+                            "Report a bug or suggest a feature — it lands on the developer's desk."
+                        }
+                        div { class: "kind-row",
+                            for (value, label) in [("bug", "Bug"), ("feature", "Feature"), ("other", "Other")] {
+                                button {
+                                    id: "feedback-kind-{value}",
+                                    class: if kind() == value { "kind-btn selected" } else { "kind-btn" },
+                                    r#type: "button",
+                                    onclick: move |_| kind.set(value.to_string()),
+                                    "{label}"
+                                }
+                            }
+                        }
+                        textarea {
+                            id: "feedback-text",
+                            value: "{text}",
+                            placeholder: "What happened, or what would you like?",
+                            oninput: move |e: FormEvent| text.set(e.value()),
+                        }
+                        button {
+                            id: "feedback-send",
+                            class: "btn-primary",
+                            r#type: "button",
+                            disabled: text.read().trim().is_empty(),
+                            onclick: move |_| {
+                                // Bind first: submit clears the signal.
+                                let payload = NewFeedback {
+                                    kind: kind.read().clone(),
+                                    text: text.read().trim().to_string(),
+                                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                                };
+                                spawn(async move {
+                                    let result = reqwest::Client::new()
+                                        .post(format!("{}/api/feedback", api_base()))
+                                        .json(&payload)
+                                        .send()
+                                        .await;
+                                    match result {
+                                        Ok(r) if r.status().is_success() => {
+                                            text.set(String::new());
+                                            status.set("Thanks — reported!".into());
+                                            refresh(items, status);
+                                        }
+                                        Ok(r) => {
+                                            status.set(format!("Could not send ({})", r.status()));
+                                        }
+                                        Err(err) => {
+                                            status.set(format!("Could not send: {err}"));
+                                        }
+                                    }
+                                });
+                            },
+                            "Send"
+                        }
+                        p {
+                            id: "feedback-status",
+                            class: if status().starts_with("Thanks") { "feedback-ok" } else { "feedback-error" },
+                            "{status}"
+                        }
+                        ul { class: "feedback-list", id: "feedback-list",
+                            for item in items() {
+                                li { class: if item.seen { "seen" } else { "" },
+                                    div { class: "fb-meta",
+                                        span { class: "fb-kind", "{item.kind}" }
+                                        if !item.seen {
+                                            span { class: "fb-new", "new" }
+                                        }
+                                        span { class: "fb-date",
+                                            {item.created_at.split(' ').next().unwrap_or("").to_string()}
+                                        }
+                                    }
+                                    p { class: "fb-text", "{item.text}" }
+                                    div { class: "fb-actions",
+                                        if item.seen {
+                                            button {
+                                                id: "feedback-unseen-{item.id}",
+                                                r#type: "button",
+                                                onclick: move |_| {
+                                                    let id = item.id;
+                                                    spawn(async move {
+                                                        let _ = reqwest::Client::new()
+                                                            .patch(format!("{}/api/feedback/{id}", api_base()))
+                                                            .json(&serde_json::json!({ "seen": false }))
+                                                            .send()
+                                                            .await;
+                                                        refresh(items, status);
+                                                    });
+                                                },
+                                                "Mark unseen"
+                                            }
+                                        } else {
+                                            button {
+                                                id: "feedback-seen-{item.id}",
+                                                r#type: "button",
+                                                onclick: move |_| {
+                                                    let id = item.id;
+                                                    spawn(async move {
+                                                        let _ = reqwest::Client::new()
+                                                            .patch(format!("{}/api/feedback/{id}", api_base()))
+                                                            .json(&serde_json::json!({ "seen": true }))
+                                                            .send()
+                                                            .await;
+                                                        refresh(items, status);
+                                                    });
+                                                },
+                                                "Mark seen"
+                                            }
+                                        }
+                                        button {
+                                            id: "feedback-del-{item.id}",
+                                            class: "fb-delete",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let id = item.id;
+                                                spawn(async move {
+                                                    let _ = reqwest::Client::new()
+                                                        .delete(format!("{}/api/feedback/{id}", api_base()))
+                                                        .send()
+                                                        .await;
+                                                    refresh(items, status);
+                                                });
+                                            },
+                                            "Delete"
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     button {
                         id: "logout",

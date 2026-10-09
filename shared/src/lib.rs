@@ -229,3 +229,31 @@ pub struct NewMealPlanEntry {
     pub date: String,
     pub recipe_id: i64,
 }
+
+/// A report from the Settings feedback form: a bug, a feature idea, or
+/// anything else the household wants to wave at the developer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeedbackItem {
+    pub id: i64,
+    /// `bug`, `feature` or `other`.
+    pub kind: String,
+    pub text: String,
+    /// Version the reporting client claims, e.g. `0.1.10`.
+    #[serde(default)]
+    pub app_version: String,
+    /// Seen marks have no behaviour — they only keep the list scannable.
+    #[serde(default)]
+    pub seen: bool,
+    /// `YYYY-MM-DD HH:MM:SS` (UTC).
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Payload for `POST /api/feedback`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewFeedback {
+    pub kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub app_version: String,
+}

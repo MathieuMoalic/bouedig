@@ -1812,6 +1812,18 @@ async fn json_post(
     Ok((status, text))
 }
 
+/// `GET {base}{path}`, returning the status and the raw body.
+async fn json_get(
+    http: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> anyhow::Result<(u16, String)> {
+    let response = http.get(format!("{base}{path}")).send().await?;
+    let status = response.status().as_u16();
+    let text = response.text().await?;
+    Ok((status, text))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grocery_suggestions_removal_and_no_resurrection() -> anyhow::Result<()> {
     let addr = spawn_test_backend().await?;
@@ -3387,6 +3399,115 @@ async fn meal_plan_move_sheet_flow() -> anyhow::Result<()> {
             !url.path().starts_with("/recipe/"),
             "move sheet trailing click navigated to {}",
             url.path()
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// The Settings feedback form: pick a kind, submit a report, see it in the
+/// list as unread, mark it seen, delete it — with the API asserting the
+/// same lifecycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_feedback_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/settings")).await?;
+        wait_for_url_path(&driver, "/settings").await?;
+        driver.find(By::Id("feedback-text")).await
+            .context("feedback form missing")?;
+
+        // Pick the "feature" kind and submit a report.
+        driver.find(By::Id("feedback-kind-feature")).await?.click().await?;
+        driver
+            .find(By::Id("feedback-text"))
+            .await?
+            .send_keys("Please add a dark mode toggle")
+            .await?;
+        driver.find(By::Id("feedback-send")).await?.click().await?;
+
+        // The success status and the unread list entry appear.
+        let mut appeared = false;
+        for _ in 0..25 {
+            let status = driver.find(By::Id("feedback-status")).await?;
+            if status.text().await?.contains("Thanks") {
+                appeared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(appeared, "no success status after submitting feedback");
+        let entry = driver
+            .find(By::XPath(
+                "//ul[@id='feedback-list']/li[contains(., 'dark mode toggle')]",
+            ))
+            .await
+            .context("submitted report missing from the list")?;
+        let entry_text = entry.text().await?;
+        println!("FEEDBACK ENTRY TEXT: {entry_text:?}");
+        // text() returns the CSS-rendered text, so the kind comes back
+        // capitalized.
+        let lowered = entry_text.to_lowercase();
+        anyhow::ensure!(
+            lowered.contains("feature") && lowered.contains("new"),
+            "the entry must show its kind and unread state"
+        );
+
+        // The API holds the report with the client's version attached.
+        let (status, body) =
+            json_get(&http, &base, "/api/feedback").await?;
+        anyhow::ensure!(status == 200, "GET /api/feedback answered {status}");
+        let list: serde_json::Value = serde_json::from_str(&body)?;
+        let items = list.as_array().unwrap();
+        anyhow::ensure!(items.len() == 1, "expected one report: {body}");
+        anyhow::ensure!(
+            items[0]["kind"] == "feature" && !items[0]["seen"].as_bool().unwrap(),
+            "unexpected report: {body}"
+        );
+        anyhow::ensure!(
+            items[0]["app_version"].as_str().unwrap_or("").len() >= 3,
+            "app version missing: {body}"
+        );
+        let id = items[0]["id"].as_i64().context("report id missing")?;
+
+        // Mark it seen: the unread pill disappears.
+        driver.find(By::Id(format!("feedback-seen-{id}"))).await?.click().await?;
+        let mut seen = false;
+        for _ in 0..25 {
+            let text = driver
+                .find(By::XPath(
+                    "//ul[@id='feedback-list']/li[contains(., 'dark mode toggle')]",
+                ))
+                .await?
+                .text()
+                .await?;
+            if !text.contains("new") {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(seen, "the report never became seen");
+
+        // Delete it: the list empties and the API agrees.
+        driver.find(By::Id(format!("feedback-del-{id}"))).await?.click().await?;
+        wait_for_gone(&driver, "#feedback-list li").await?;
+        let (status, body) = json_get(&http, &base, "/api/feedback").await?;
+        anyhow::ensure!(status == 200, "GET /api/feedback answered {status}");
+        anyhow::ensure!(
+            serde_json::from_str::<serde_json::Value>(&body)?
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "report was not deleted: {body}"
         );
         Ok(())
     })()
