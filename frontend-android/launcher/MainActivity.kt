@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.view.KeyEvent
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.result.ActivityResultLauncher
@@ -20,6 +21,36 @@ class MainActivity : WryActivity() {
     private lateinit var libraryLauncher: ActivityResultLauncher<Intent>
     private lateinit var cameraLauncher: ActivityResultLauncher<Intent>
     private var lastCaptureUri: Uri? = null
+
+    // The system back key/gesture must navigate the app's own history
+    // (dioxus router pushState entries) instead of finishing the activity.
+    private var appWebView: WebView? = null
+
+    // The system back key/gesture never maps to webview history (the
+    // router's history is in-memory, invisible to the webview) and eval
+    // can't return values to Rust on this platform: drop a marker file —
+    // the same channel the photo picker uses — and always swallow the
+    // event. The Rust loop decides between an in-app back-step and
+    // exitApp().
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            forwardBack()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onBackPressed() {
+        forwardBack()
+    }
+
+    private fun forwardBack() {
+        try {
+            File(cacheDir, "back.press").createNewFile()
+        } catch (ex: Exception) {
+            Logger.error("back marker failed: " + ex.message)
+        }
+    }
 
     // The import screen polls for these files from Rust (same uid): a photo
     // means "here it is", the cancel marker means "user backed out".
@@ -39,6 +70,8 @@ class MainActivity : WryActivity() {
     }
 
     override fun onWebViewCreate(webView: WebView) {
+        // Keep the webview reachable for the back-key navigation above.
+        appWebView = webView
         // dx ships RustWebChromeClient.kt but the webview's own
         // <input type=file> never opens a chooser on Android (wry gap), so
         // the import screen picks through this native bridge instead: the
@@ -83,6 +116,13 @@ class MainActivity : WryActivity() {
 
     /// Exposed to the import screen as window.BouedigNative.
     inner class BouedigBridge {
+        /// Called from Rust when the back gesture reaches the app's root:
+        /// leave the app but keep the process for an instant relaunch.
+        @JavascriptInterface
+        fun exitApp() {
+            runOnUiThread { moveTaskToBack(true) }
+        }
+
         @JavascriptInterface
         fun pickFromLibrary() {
             val picker = Intent(Intent.ACTION_GET_CONTENT)

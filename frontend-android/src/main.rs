@@ -125,6 +125,39 @@ fn App() -> Element {
 
 #[component]
 fn Layout() -> Element {
+    // The Android back key/gesture must step the ROUTER back, but the
+    // mobile launcher wires the router to an in-memory history the webview
+    // can't see (wry's canGoBack is always false) and the router only
+    // re-renders when ITS navigator moves. MainActivity therefore drops a
+    // marker file (the same channel as the photo picker) and this poll
+    // turns it into a navigator back-step — or hands the gesture back to
+    // Android (moveTaskToBack via the JS bridge) when the app is at root.
+    #[cfg(target_os = "android")]
+    {
+        let navigator = use_navigator();
+        use_effect(move || {
+            let navigator = navigator.clone();
+            spawn(async move {
+                const BACK_MARKER: &str = "/data/data/eu.matmoa.bouedig/cache/back.press";
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let marker = std::path::Path::new(BACK_MARKER);
+                    if !marker.exists() {
+                        continue;
+                    }
+                    let _ = std::fs::remove_file(marker);
+                    if navigator.can_go_back() {
+                        navigator.go_back();
+                    } else {
+                        _ = dioxus::document::eval(
+                            "window.BouedigNative && window.BouedigNative.exitApp()",
+                        )
+                        .await;
+                    }
+                }
+            });
+        });
+    }
     rsx! {
         style { {include_str!("../assets/style.css")} }
         document::Title { "Bouedig" }
