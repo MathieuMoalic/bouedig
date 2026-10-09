@@ -4986,7 +4986,8 @@ fn MealPlanContent() -> Element {
             }
             week_adding.set(false);
             week_note.set(if failures.is_empty() {
-                format!("Added {total} ingredients from {planned} recipes.")
+                let unit = if planned == 1 { "recipe" } else { "recipes" };
+                format!("Added {total} ingredients from {planned} {unit}.")
             } else {
                 format!(
                     "Added {total} from {planned} recipes; failures: {}",
