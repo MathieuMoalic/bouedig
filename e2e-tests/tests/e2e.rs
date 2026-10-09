@@ -3719,3 +3719,144 @@ async fn grocery_group_prefs_flow() -> anyhow::Result<()> {
     let _ = driver.quit().await;
     result
 }
+
+/// The meal plan's week button: one press adds every planned recipe's
+/// ingredients for the open week to the shopping list, merged by name+unit
+/// and stamped with the recipe provenance.
+#[tokio::test(flavor = "multi_thread")]
+async fn meal_plan_week_to_list_flow() -> anyhow::Result<()> {
+    use chrono::Datelike;
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    // Two recipes with an overlapping ingredient: "flour" must merge into
+    // ONE row of 400 g (200 + 200) instead of two rows.
+    for (name, ingredients) in [
+        (
+            "Week Pasta",
+            r#"[{"quantity":200.0,"unit":"g","name":"flour"},{"quantity":2.0,"unit":"tbsp","name":"olive oil"}]"#,
+        ),
+        (
+            "Week Soup",
+            r#"[{"quantity":200.0,"unit":"g","name":"flour"},{"quantity":null,"unit":null,"name":"onion"}]"#,
+        ),
+    ] {
+        let payload = format!(
+            r#"{{"name":"{name}","ingredients":{ingredients},"instructions":[]}}"#
+        );
+        let response = http
+            .post(format!("{base}/api/recipes"))
+            .header("content-type", "application/json")
+            .body(payload)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "recipe create failed: {}",
+            response.status()
+        );
+    }
+    let recipes: Vec<serde_json::Value> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    anyhow::ensure!(recipes.len() == 2, "expected the two seeded recipes");
+    let pasta_id = recipes[0]["id"].as_i64().context("pasta id")?;
+    let soup_id = recipes[1]["id"].as_i64().context("soup id")?;
+
+    // Plan them on the first two days of the CURRENT Sat→Fri week.
+    let today = chrono::Local::now().date_naive();
+    let saturday = today - chrono::Duration::days(today.weekday().num_days_from_sunday() as i64);
+    let sunday = saturday + chrono::Duration::days(1);
+    for (date, recipe_id) in [
+        (saturday.format("%Y-%m-%d").to_string(), pasta_id),
+        (sunday.format("%Y-%m-%d").to_string(), soup_id),
+    ] {
+        let payload = format!(r#"{{"date":"{date}","recipe_id":{recipe_id}}}"#);
+        let (status, body) = json_post(&http, &base, "/api/meal-plan", &payload).await?;
+        anyhow::ensure!(status == 201, "meal plan add failed: {body}");
+    }
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/meal-plan")).await?;
+        wait_for_url_path(&driver, "/meal-plan").await?;
+
+        // If the app opened on next week (Friday evening), jump to today —
+        // the planned meals live on the current week.
+        if let Ok(today_btn) = driver.find(By::Id("plan-week-today")).await {
+            today_btn.click().await?;
+        }
+
+        // Wait for the week button (enabled: the week holds two recipes).
+        let shop = driver.find(By::Id("plan-week-shop")).await?;
+        let mut enabled = false;
+        for _ in 0..25 {
+            if shop.is_enabled().await? {
+                enabled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(enabled, "the week button never became enabled");
+
+        // Two clicks: arm, then fire.
+        shop.click().await?;
+        shop.click().await?;
+
+        // The result note appears...
+        let mut noted = false;
+        for _ in 0..40 {
+            if let Ok(note) = driver.find(By::Css(".plan-note")).await {
+                if note.text().await?.contains("Added") {
+                    noted = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(noted, "no result note after the week add");
+
+        // ...and the list holds the merged ingredients: 400 g flour
+        // (200 + 200), 2 tbsp olive oil, one plain onion.
+        let (status, body) = json_get(&http, &base, "/api/grocery").await?;
+        anyhow::ensure!(status == 200, "grocery fetch failed: {status}");
+        let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+        anyhow::ensure!(items.len() == 3, "expected 3 merged rows: {body}");
+        let flour = items
+            .iter()
+            .find(|i| i["name"] == "flour")
+            .context("flour missing")?;
+        anyhow::ensure!(
+            flour["quantity"] == 400.0 && flour["unit"] == "g",
+            "flour must merge to 400 g: {flour}"
+        );
+        let oil = items
+            .iter()
+            .find(|i| i["name"] == "olive oil")
+            .context("olive oil missing")?;
+        anyhow::ensure!(oil["quantity"] == 2.0 && oil["unit"] == "tbsp", "{oil}");
+        let onion = items
+            .iter()
+            .find(|i| i["name"] == "onion")
+            .context("onion missing")?;
+        anyhow::ensure!(onion["quantity"].is_null(), "{onion}");
+        // Provenance: every row knows which recipe it came from.
+        for item in &items {
+            anyhow::ensure!(
+                item["recipe"]["id"].is_null() == false,
+                "provenance missing: {item}"
+            );
+        }
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}

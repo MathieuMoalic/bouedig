@@ -4542,6 +4542,11 @@ fn MealPlanContent() -> Element {
     let mut plan_drag = use_signal(|| None::<PlanDrag>);
     let mut drag_target = use_signal(|| None::<String>);
     let mut suppress_open = use_signal(|| false);
+    // Week → shopping list: armed two-click confirm, then every planned
+    // recipe's ingredients go to the list as provenance-stamped batches.
+    let mut week_add_armed = use_signal(|| false);
+    let mut week_adding = use_signal(|| false);
+    let mut week_note = use_signal(String::new);
     // Day-section viewport rects for the drag hit-test, captured through
     // the eval bridge when a drag arms (no DOM access natively).
     let mut plan_day_rects = use_signal(|| None::<Vec<(String, f64, f64)>>);
@@ -4618,6 +4623,82 @@ fn MealPlanContent() -> Element {
     let drag_target_snapshot = drag_target.read().clone();
     let move_sheet_snapshot = move_sheet.read().clone();
 
+    // Week → shopping list: the open week's recipe ids in day order.
+    let mut week_recipe_ids: Vec<i64> = Vec::new();
+    for day in &days {
+        for entry in &day.entries {
+            if !week_recipe_ids.contains(&entry.recipe.id) {
+                week_recipe_ids.push(entry.recipe.id);
+            }
+        }
+    }
+    let week_recipe_ids_clone = week_recipe_ids.clone();
+    let week_add = move |_| {
+        if week_adding() {
+            return;
+        }
+        if !week_add_armed() {
+            // Two-click confirm: quantities add up when pressed twice.
+            week_add_armed.set(true);
+            week_note.set(String::new());
+            return;
+        }
+        week_add_armed.set(false);
+        week_adding.set(true);
+        let ids = week_recipe_ids_clone.clone();
+        spawn(async move {
+            let mut total = 0usize;
+            let mut planned = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            for id in ids {
+                match api_get::<RecipeDetailModel>(&format!("/api/recipes/{id}")).await {
+                    Ok(detail) => {
+                        if detail.ingredients.is_empty() {
+                            continue;
+                        }
+                        let batch = NewGroceryBatch {
+                            items: detail
+                                .ingredients
+                                .iter()
+                                .map(|ing| NewGroceryItem {
+                                    name: ing.name.clone(),
+                                    category: None,
+                                    quantity: ing.quantity,
+                                    unit: ing.unit.clone(),
+                                })
+                                .collect(),
+                            recipe_id: Some(id),
+                        };
+                        let count = batch.items.len();
+                        match http()
+                            .post(format!("{}/api/grocery/batch", api_base()))
+                            .json(&batch)
+                            .send()
+                            .await
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                total += count;
+                                planned += 1;
+                            }
+                            Ok(r) => failures.push(format!("#{}: {}", id, r.status())),
+                            Err(err) => failures.push(format!("#{}: {err}", id)),
+                        }
+                    }
+                    Err(err) => failures.push(format!("#{}: {err}", id)),
+                }
+            }
+            week_adding.set(false);
+            week_note.set(if failures.is_empty() {
+                format!("Added {total} ingredients from {planned} recipes.")
+            } else {
+                format!(
+                    "Added {total} from {planned} recipes; failures: {}",
+                    failures.join(", ")
+                )
+            });
+        });
+    };
+
     rsx! {
         div { class: "page",
             if !error.read().is_empty() {
@@ -4653,6 +4734,23 @@ fn MealPlanContent() -> Element {
                     onclick: move |_| week_offset.with_mut(|v| *v += 1),
                     IconBack {}
                 }
+            }
+            button {
+                id: "plan-week-shop",
+                class: "btn-primary",
+                r#type: "button",
+                disabled: week_adding() || week_recipe_ids.is_empty(),
+                onclick: week_add,
+                if week_add_armed() {
+                    "Really add? Quantities add up"
+                } else if week_adding() {
+                    "Adding…"
+                } else {
+                    "Add all ingredients to the shopping list"
+                }
+            }
+            if !week_note.read().is_empty() {
+                p { class: "plan-note", "{week_note}" }
             }
             div {
                 class: "plan-days",

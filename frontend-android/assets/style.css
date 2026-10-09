@@ -2200,3 +2200,16 @@ ol.instruction-list li.instruction-item {
 .group-move + .group-move {
     margin-left: 0;
 }
+
+/* Meal plan: add-the-week button + result note. */
+#plan-week-shop {
+    width: 100%;
+    margin-top: 10px;
+}
+
+.plan-note {
+    margin: 6px 0 0;
+    font-size: 13px;
+    color: var(--accent-bright);
+    text-align: center;
+}
