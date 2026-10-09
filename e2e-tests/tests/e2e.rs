@@ -3581,3 +3581,141 @@ async fn grocery_live_update_flow() -> anyhow::Result<()> {
     let _ = driver.quit().await;
     result
 }
+
+/// Grocery group layout prefs: moving a group up reorders the list, and
+/// both the order and a group's collapsed state survive a page reload
+/// (device-local persistence).
+#[tokio::test(flavor = "multi_thread")]
+async fn grocery_group_prefs_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    // Seed one item in each of two known groups (explicit categories skip
+    // the classifier, so the groups are deterministic).
+    for (name, category) in [("Apple", "Fruits"), ("Rice", "Pantry")] {
+        let payload = format!(r#"{{"name":"{name}","category":"{category}"}}"#);
+        let (status, _) = json_post(&http, &base, "/api/grocery", &payload).await?;
+        anyhow::ensure!(status == 201, "seed add failed: {status}");
+    }
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        let group_names = |driver: &WebDriver| {
+            let driver = driver.clone();
+            async move {
+                let elements = driver
+                    .find_all(By::Css(".grocery-groups .group-name"))
+                    .await?;
+                let mut names = Vec::new();
+                for el in elements {
+                    names.push(el.text().await?);
+                }
+                Ok::<Vec<String>, anyhow::Error>(names)
+            }
+        };
+
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        let mut ready = false;
+        for _ in 0..40 {
+            if !driver
+                .find_all(By::Css(".grocery-groups .group-name"))
+                .await?
+                .is_empty()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(ready, "grocery groups never rendered");
+        anyhow::ensure!(
+            group_names(&driver).await? == ["Fruits", "Pantry"],
+            "expected first-seen order"
+        );
+
+        // Move Pantry up: the swap is visible immediately...
+        driver
+            .find(By::XPath(
+                "//button[contains(@class, 'grocery-group')][.//span[text()='Pantry']]\
+                 /span[@class='group-move'][text()='↑']",
+            ))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        anyhow::ensure!(
+            group_names(&driver).await? == ["Pantry", "Fruits"],
+            "move up did not reorder the groups"
+        );
+
+        // ...and survives a reload (the whole point of the persistence).
+        driver.refresh().await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        let mut persisted = false;
+        for _ in 0..40 {
+            let names = group_names(&driver).await?;
+            if names == ["Pantry", "Fruits"] {
+                persisted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(
+            persisted,
+            "the moved order did not survive a reload: {:?}",
+            group_names(&driver).await?
+        );
+
+        // Collapse a group: its items disappear, and the collapsed state
+        // survives a reload too.
+        driver
+            .find(By::XPath(
+                "//button[contains(@class, 'grocery-group')][.//span[text()='Pantry']]",
+            ))
+            .await?
+            .click()
+            .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        anyhow::ensure!(
+            driver
+                .find(By::XPath(
+                    "//div[contains(@class, 'grocery-card')][.//span[text()='Pantry']]//ul",
+                ))
+                .await
+                .is_err(),
+            "Pantry must be collapsed"
+        );
+        driver.refresh().await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        let mut collapsed = false;
+        for _ in 0..40 {
+            let hidden = driver
+                .find(By::XPath(
+                    "//div[contains(@class, 'grocery-card')][.//span[text()='Pantry']]//ul",
+                ))
+                .await
+                .is_err();
+            let visible_fruits = driver
+                .find(By::XPath(
+                    "//div[contains(@class, 'grocery-card')][.//span[text()='Fruits']]//li",
+                ))
+                .await
+                .is_ok();
+            if hidden && visible_fruits {
+                collapsed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(collapsed, "the collapsed state did not survive a reload");
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
