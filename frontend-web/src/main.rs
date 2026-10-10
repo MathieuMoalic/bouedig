@@ -215,16 +215,40 @@ fn Layout() -> Element {
                 "online",
                 on_online.as_ref().unchecked_ref(),
             );
+            let on_offline = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(
+                move |_| {
+                    *OFFLINE.write() = true;
+                },
+            );
+            let _ = window.add_event_listener_with_callback(
+                "offline",
+                on_offline.as_ref().unchecked_ref(),
+            );
+            std::mem::forget(on_offline);
         }
         std::mem::forget(on_online);
         spawn(async move {
             loop {
                 sleep_ms(1000).await;
-                if !PENDING_BOUGHT.read().is_empty() {
+                // Drain queued ticks, and also retry while the offline flag
+                // is stuck on (e.g. it was set with an empty queue) so the
+                // flag clears itself the moment the network returns.
+                if !PENDING_BOUGHT.read().is_empty() || OFFLINE() {
                     drain_pending_bought().await;
                 }
             }
         });
+    });
+
+    // Reconnect: when the offline flag clears, bump every epoch so the
+    // open pages refetch immediately — no tab switch or reload needed.
+    use_effect(move || {
+        let offline = OFFLINE();
+        if !offline {
+            *RECIPES_EPOCH.write() += 1;
+            *GROCERY_EPOCH.write() += 1;
+            *MEALPLAN_EPOCH.write() += 1;
+        }
     });
 
     rsx! {
@@ -4009,12 +4033,12 @@ fn GroceryContent() -> Element {
             // Discreet offline marker: small pill, no layout shift. Appears
             // while ticks are queued for the server.
             if OFFLINE() {
-                div { class: "offline-badge", "Offline — ticks sync when back online" }
+                div { class: "offline-bar", "No connection" }
             }
             if let Some(removed) = undo_snapshot {
                 // A floating toast, not in-flow content: ticking an item
                 // off must never shove the list around.
-                div { class: "undo-toast",
+                div { class: if OFFLINE() { "undo-toast offline" } else { "undo-toast" },
                     span { class: "undo-text", "Removed \"{removed.name}\"" }
                     button {
                         id: "undo-restore",
@@ -4026,11 +4050,8 @@ fn GroceryContent() -> Element {
                     }
                 }
             }
-            // Fetch problems surface as a small toast that fades away —
-            // never as a red block shoving content around (feedback #8).
-            if !error.read().is_empty() {
-                div { class: "toast-error", key: "{error}", "{error}" }
-            }
+            // Network problems are covered by the offline bar + spinners;
+            // no separate error popup (feedback #8 follow-up).
             if groups_empty {
                 p { class: "empty", "Your grocery list is empty. Tap + to add an item." }
             } else {

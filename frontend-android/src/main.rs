@@ -133,17 +133,30 @@ fn App() -> Element {
 #[component]
 fn Layout() -> Element {
     // Offline queue: load the pending ticks and run the sync loop that
-    // flushes them whenever connectivity returns.
+    // flushes them whenever connectivity returns. The loop also retries
+    // while the offline flag is stuck on, so the flag clears itself the
+    // moment the network returns.
     use_effect(move || {
         load_pending_bought();
         spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if !PENDING_BOUGHT.read().is_empty() {
+                if !PENDING_BOUGHT.read().is_empty() || OFFLINE() {
                     drain_pending_bought().await;
                 }
             }
         });
+    });
+
+    // Reconnect: when the offline flag clears, bump every epoch so the
+    // open pages refetch immediately — no tab switch or reload needed.
+    use_effect(move || {
+        let offline = OFFLINE();
+        if !offline {
+            *RECIPES_EPOCH.write() += 1;
+            *GROCERY_EPOCH.write() += 1;
+            *MEALPLAN_EPOCH.write() += 1;
+        }
     });
     // The Android back key/gesture must step the ROUTER back, but the
     // mobile launcher wires the router to an in-memory history the webview
@@ -3806,12 +3819,12 @@ fn GroceryContent() -> Element {
             // Discreet offline marker: small pill, no layout shift. Appears
             // while ticks are queued for the server.
             if OFFLINE() {
-                div { class: "offline-badge", "Offline — ticks sync when back online" }
+                div { class: "offline-bar", "No connection" }
             }
             if let Some(removed) = undo_snapshot {
                 // A floating toast, not in-flow content: ticking an item
                 // off must never shove the list around.
-                div { class: "undo-toast",
+                div { class: if OFFLINE() { "undo-toast offline" } else { "undo-toast" },
                     span { class: "undo-text", "Removed \"{removed.name}\"" }
                     button {
                         id: "undo-restore",
@@ -3823,11 +3836,8 @@ fn GroceryContent() -> Element {
                     }
                 }
             }
-            // Fetch problems surface as a small toast that fades away —
-            // never as a red block shoving content around (feedback #8).
-            if !error.read().is_empty() {
-                div { class: "toast-error", key: "{error}", "{error}" }
-            }
+            // Network problems are covered by the offline bar + spinners;
+            // no separate error popup (feedback #8 follow-up).
             if groups_empty {
                 p { class: "empty", "Your grocery list is empty. Add an item above." }
             } else {
