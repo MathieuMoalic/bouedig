@@ -2518,7 +2518,9 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
             "the Today button must return to the current week, got {title_text}"
         );
 
-        // The current week runs Saturday→Friday and contains today.
+        // The current week runs Saturday→Friday and contains today. On
+        // Saturdays the first day IS today, so its label renders as
+        // "Today" instead of "Sat, …".
         let first_label = driver
             .execute(
                 "return document.querySelector('.plan-day-label').textContent;",
@@ -2530,7 +2532,7 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
             .context("first label missing")?
             .to_string();
         anyhow::ensure!(
-            first_label.starts_with("Sat, "),
+            first_label.starts_with("Sat, ") || first_label == "Today",
             "the week must start on Saturday, got {first_label:?}"
         );
         driver
@@ -3770,19 +3772,6 @@ async fn meal_plan_week_to_list_flow() -> anyhow::Result<()> {
     let pasta_id = recipes[0]["id"].as_i64().context("pasta id")?;
     let soup_id = recipes[1]["id"].as_i64().context("soup id")?;
 
-    // Plan them on the first two days of the CURRENT Sat→Fri week.
-    let today = chrono::Local::now().date_naive();
-    let saturday = today - chrono::Duration::days(today.weekday().num_days_from_sunday() as i64);
-    let sunday = saturday + chrono::Duration::days(1);
-    for (date, recipe_id) in [
-        (saturday.format("%Y-%m-%d").to_string(), pasta_id),
-        (sunday.format("%Y-%m-%d").to_string(), soup_id),
-    ] {
-        let payload = format!(r#"{{"date":"{date}","recipe_id":{recipe_id}}}"#);
-        let (status, body) = json_post(&http, &base, "/api/meal-plan", &payload).await?;
-        anyhow::ensure!(status == 201, "meal plan add failed: {body}");
-    }
-
     let driver = open_headless_firefox().await?;
     let result = (|| async {
         driver.goto(format!("{base}/meal-plan")).await?;
@@ -3794,19 +3783,55 @@ async fn meal_plan_week_to_list_flow() -> anyhow::Result<()> {
             today_btn.click().await?;
         }
 
-        // Wait for the week button (enabled: the week holds two recipes).
-        let shop = driver.find(By::Id("plan-week-shop")).await?;
-        let mut enabled = false;
-        for _ in 0..25 {
-            if shop.is_enabled().await? {
-                enabled = true;
+        // Plan the two recipes on the first two days of the week the app is
+        // currently showing. The dates come from the BROWSER's clock (the
+        // app's "today") so a midnight flip mid-suite can't desync them;
+        // if the button still isn't enabled, the flip happened mid-flight —
+        // re-read and re-plan once.
+        for attempt in 0..2 {
+            let browser_today: String = driver
+                .execute(
+                    "return new Date().toLocaleDateString('sv');",
+                    Vec::<serde_json::Value>::new(),
+                )
+                .await?
+                .json()
+                .as_str()
+                .context("browser date missing")?
+                .to_string();
+            let today = chrono::NaiveDate::parse_from_str(&browser_today, "%Y-%m-%d")
+                .context("bad browser date")?;
+            // Days back to the week's Saturday: Sun=0 → 1 … Sat=6 → 0.
+            let days_back = (today.weekday().num_days_from_sunday() + 1) % 7;
+            let saturday = today - chrono::Duration::days(days_back as i64);
+            let sunday = saturday + chrono::Duration::days(1);
+            for (date, recipe_id) in [
+                (saturday.format("%Y-%m-%d").to_string(), pasta_id),
+                (sunday.format("%Y-%m-%d").to_string(), soup_id),
+            ] {
+                let payload = format!(r#"{{"date":"{date}","recipe_id":{recipe_id}}}"#);
+                let (status, body) =
+                    json_post(&http, &base, "/api/meal-plan", &payload).await?;
+                anyhow::ensure!(status == 201, "meal plan add failed: {body}");
+            }
+
+            let shop = driver.find(By::Id("plan-week-shop")).await?;
+            let mut enabled = false;
+            for _ in 0..25 {
+                if shop.is_enabled().await? {
+                    enabled = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if enabled {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            anyhow::ensure!(attempt == 0, "the week button never became enabled");
         }
-        anyhow::ensure!(enabled, "the week button never became enabled");
 
         // Two clicks: arm, then fire.
+        let shop = driver.find(By::Id("plan-week-shop")).await?;
         shop.click().await?;
         shop.click().await?;
 
@@ -3854,6 +3879,91 @@ async fn meal_plan_week_to_list_flow() -> anyhow::Result<()> {
                 "provenance missing: {item}"
             );
         }
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Feedback #3: renaming an item onto another item's name must merge the
+/// two rows — quantities add up and the duplicate disappears.
+#[tokio::test(flavor = "multi_thread")]
+async fn grocery_rename_merge_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    for payload in [
+        r#"{"name":"Red lentils","quantity":500.0,"unit":"g"}"#,
+        r#"{"name":"Lentils","quantity":200.0,"unit":"g"}"#,
+    ] {
+        let (status, _) = json_post(&http, &base, "/api/grocery", payload).await?;
+        anyhow::ensure!(status == 201, "seed add failed: {status}");
+    }
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        let mut ready = false;
+        for _ in 0..40 {
+            if driver
+                .find(By::XPath("//li[contains(., 'Red lentils')]"))
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(ready, "the seeded rows never rendered");
+
+        // Tap the Red lentils row: the edit sheet opens. Rename it onto the
+        // other row's name and save.
+        driver
+            .find(By::XPath("//li[contains(., 'Red lentils')]"))
+            .await?
+            .click()
+            .await?;
+        let name_input = driver.find(By::Id("sheet-item-name")).await?;
+        name_input.clear().await?;
+        name_input.send_keys("Lentils").await?;
+        driver.find(By::Id("sheet-item-save")).await?.click().await?;
+        wait_for_gone(&driver, ".sheet").await?;
+
+        // One merged row: 500 + 200 = 700 g, no Red lentils left.
+        let mut merged = false;
+        for _ in 0..25 {
+            let rows = driver
+                .find_all(By::XPath(
+                    "//li[contains(@class, 'grocery-item') and contains(., 'Lentils')]",
+                ))
+                .await?;
+            let red_gone = driver
+                .find(By::XPath("//li[contains(., 'Red lentils')]"))
+                .await
+                .is_err();
+            if rows.len() == 1 && red_gone && rows[0].text().await?.contains("700 g") {
+                merged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(merged, "the rename never merged the duplicate rows");
+
+        let (status, body) = json_get(&http, &base, "/api/grocery").await?;
+        anyhow::ensure!(status == 200);
+        let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+        anyhow::ensure!(items.len() == 1, "expected one merged row: {body}");
+        anyhow::ensure!(
+            items[0]["name"] == "Lentils" && items[0]["quantity"] == 700.0,
+            "wrong merged row: {body}"
+        );
         Ok(())
     })()
     .await;

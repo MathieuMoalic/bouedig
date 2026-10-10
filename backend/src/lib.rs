@@ -1707,6 +1707,29 @@ async fn find_grocery_merge_target(
     .flatten()
 }
 
+/// Same match as [`find_grocery_merge_target`], but ignores one row — used
+/// when a rename turns an edited item into a duplicate of another one.
+async fn find_grocery_merge_target_excluding(
+    db: impl sqlx::Executor<'_, Database = Sqlite>,
+    name: &str,
+    unit: &str,
+    exclude_id: i64,
+) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT id FROM grocery_items \
+         WHERE id != ?1 AND lower(name) = lower(?2) \
+           AND (lower(trim(unit)) = lower(?3) OR trim(unit) = '' OR trim(?3) = '') \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(exclude_id)
+    .bind(name.trim())
+    .bind(unit.trim())
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Absorb an add into an existing row: quantities add up (a missing stored
 /// quantity counts as 1 — an add without one is already passed as 1) and a
 /// blank unit on the existing row adopts the add's unit.
@@ -1965,6 +1988,32 @@ async fn patch_grocery_item(
     }
     if old.as_deref() != Some(category) {
         classifier::pin_manual(&state.db, name, category).await;
+    }
+    // The rename may have turned this row into a duplicate of another one
+    // (same name case-insensitive, compatible units). Absorb that row: the
+    // edited row survives with the user's name, group and unit, quantities
+    // add up (missing = 1), a blank unit adopts the other's, and recipe
+    // provenance is kept from whichever row has one.
+    if let Some(other_id) =
+        find_grocery_merge_target_excluding(&state.db, name, unit, id).await
+    {
+        sqlx::query(
+            "UPDATE grocery_items SET \
+             quantity = COALESCE(quantity, 1) + \
+               COALESCE((SELECT quantity FROM grocery_items WHERE id = ?2), 1), \
+             unit = CASE WHEN trim(unit) = '' \
+               THEN (SELECT unit FROM grocery_items WHERE id = ?2) ELSE unit END, \
+             recipe_id = COALESCE(recipe_id, (SELECT recipe_id FROM grocery_items WHERE id = ?2)) \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(other_id)
+        .execute(&state.db)
+        .await?;
+        sqlx::query("DELETE FROM grocery_items WHERE id = ?")
+            .bind(other_id)
+            .execute(&state.db)
+            .await?;
     }
     let row = sqlx::query(&format!("{GROCERY_SELECT} WHERE g.id = ?"))
         .bind(id)
@@ -2571,6 +2620,76 @@ pub(crate) mod tests {
         assert_eq!(patched["quantity"], 0.5);
         assert_eq!(patched["unit"], "l");
         assert_eq!(patched["category"], "Vegan");
+    }
+
+    /// Renaming an item onto another item's name merges the two: quantities
+    /// add up (missing = 1), the edited row's name and group win, a blank
+    /// unit adopts the other's, and the duplicate row disappears.
+    #[tokio::test]
+    async fn grocery_patch_rename_merges_duplicates() {
+        let app = test_router(None).await;
+        for payload in [
+            r#"{"name":"Red lentils","quantity":500.0,"unit":"g"}"#,
+            r#"{"name":"Lentils","quantity":200.0,"unit":"g"}"#,
+            r#"{"name":"Tofu"}"#,
+            r#"{"name":"Tofu blocks"}"#,
+        ] {
+            let (status, _) =
+                json_response(app.clone(), "POST", "/api/grocery", Some(payload)).await;
+            assert_eq!(status, StatusCode::CREATED, "{payload}");
+        }
+        let (_, body) = json_response(app.clone(), "GET", "/api/grocery", None).await;
+        let items: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let red_id = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "Red lentils")
+            .and_then(|i| i["id"].as_i64())
+            .unwrap();
+        let blocks_id = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "Tofu blocks")
+            .and_then(|i| i["id"].as_i64())
+            .unwrap();
+
+        // Rename "Red lentils" onto "Lentils": one row, 500 + 200 = 700 g.
+        let (status, body) = json_response(
+            app.clone(),
+            "PUT",
+            &format!("/api/grocery/{red_id}"),
+            Some(r#"{"name":"Lentils","category":"Pantry","quantity":500.0,"unit":"g"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(merged["quantity"], 700.0, "{body}");
+        assert_eq!(merged["unit"], "g");
+        assert_eq!(merged["category"], "Pantry");
+
+        // Rename the unit-less "Tofu blocks" onto the unit-less "Tofu":
+        // both count as 1, so the survivor holds 2.
+        let (status, body) = json_response(
+            app.clone(),
+            "PUT",
+            &format!("/api/grocery/{blocks_id}"),
+            Some(r#"{"name":"tofu","quantity":null,"unit":""}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(merged["quantity"], 2.0, "{body}");
+
+        let (_, body) = json_response(app, "GET", "/api/grocery", None).await;
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = list.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{body}");
+        assert_eq!(rows[0]["name"], "Lentils");
+        assert_eq!(rows[0]["quantity"], 700.0);
+        assert_eq!(rows[1]["name"], "tofu");
+        assert_eq!(rows[1]["quantity"], 2.0);
     }
 
     /// Same-name adds add up: equal units merge, a missing quantity counts
