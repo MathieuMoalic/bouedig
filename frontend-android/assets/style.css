@@ -2239,12 +2239,7 @@ ol.instruction-list li.instruction-item {
     margin-left: 0;
 }
 
-/* Meal plan: add-the-week button + result note. */
-#plan-week-shop {
-    width: 100%;
-    margin-top: 10px;
-}
-
+/* Meal plan: week-add result note. */
 .plan-note {
     margin: 6px 0 0;
     font-size: 13px;
@@ -2295,4 +2290,14 @@ li.grocery-item > span.tick-spinner {
 
 .toast-error.offline {
     bottom: 134px;
+}
+
+/* Meal plan: cart button in the week header — disabled until the week
+   has recipes, and dimmed further while a sync runs. */
+#plan-week-shop {
+    color: var(--accent-bright);
+}
+
+#plan-week-shop:disabled {
+    opacity: 0.4;
 }

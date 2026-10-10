@@ -4956,9 +4956,10 @@ fn MealPlanContent() -> Element {
     let mut plan_drag = use_signal(|| None::<PlanDrag>);
     let mut drag_target = use_signal(|| None::<String>);
     let mut suppress_open = use_signal(|| false);
-    // Week → shopping list: armed two-click confirm, then every planned
-    // recipe's ingredients go to the list as provenance-stamped batches.
-    let mut week_add_armed = use_signal(|| false);
+    // Week → shopping list: the cart button opens a confirmation modal,
+    // then every planned recipe's ingredients go to the list as
+    // provenance-stamped batches.
+    let mut week_add_confirm = use_signal(|| false);
     let mut week_adding = use_signal(|| false);
     let mut week_note = use_signal(String::new);
 
@@ -5043,18 +5044,14 @@ fn MealPlanContent() -> Element {
             }
         }
     }
+    let week_count = week_recipe_ids.len();
+    let recipe_noun = if week_count == 1 { "recipe" } else { "recipes" };
     let week_recipe_ids_clone = week_recipe_ids.clone();
     let week_add = move |_| {
         if week_adding() {
             return;
         }
-        if !week_add_armed() {
-            // Two-click confirm: quantities add up when pressed twice.
-            week_add_armed.set(true);
-            week_note.set(String::new());
-            return;
-        }
-        week_add_armed.set(false);
+        week_add_confirm.set(false);
         week_adding.set(true);
         let ids = week_recipe_ids_clone.clone();
         spawn(async move {
@@ -5142,6 +5139,15 @@ fn MealPlanContent() -> Element {
                     }
                 }
                 button {
+                    id: "plan-week-shop",
+                    class: "plan-week-btn",
+                    r#type: "button",
+                    title: "Add this week's ingredients to the shopping list",
+                    disabled: week_adding() || week_recipe_ids.is_empty(),
+                    onclick: move |_| week_add_confirm.set(true),
+                    TabIcon { icon: Icons::Shopping }
+                }
+                button {
                     id: "plan-week-next",
                     class: "plan-week-btn icon-flip",
                     r#type: "button",
@@ -5150,18 +5156,32 @@ fn MealPlanContent() -> Element {
                     IconBack {}
                 }
             }
-            button {
-                id: "plan-week-shop",
-                class: "btn-primary",
-                r#type: "button",
-                disabled: week_adding() || week_recipe_ids.is_empty(),
-                onclick: week_add,
-                if week_add_armed() {
-                    "Really add? Quantities add up"
-                } else if week_adding() {
-                    "Adding…"
-                } else {
-                    "Add all ingredients to the shopping list"
+            if week_add_confirm() {
+                div { class: "dialog-backdrop",
+                    onclick: move |_| week_add_confirm.set(false),
+                    div { class: "dialog",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                        h2 { class: "dialog-title", "Add to shopping list?" }
+                        p { class: "dialog-text",
+                            "Add the ingredients of all {week_count} planned {recipe_noun} this week to your shopping list? Quantities of the same item add up."
+                        }
+                        div { class: "dialog-actions",
+                            button {
+                                class: "dialog-btn",
+                                r#type: "button",
+                                onclick: move |_| week_add_confirm.set(false),
+                                "Cancel"
+                            }
+                            button {
+                                id: "plan-week-confirm",
+                                class: "dialog-btn primary",
+                                r#type: "button",
+                                disabled: week_adding(),
+                                onclick: week_add,
+                                if week_adding() { "Adding…" } else { "Add" }
+                            }
+                        }
+                    }
                 }
             }
             if !week_note.read().is_empty() {
