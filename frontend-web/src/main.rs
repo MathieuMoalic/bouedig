@@ -3690,7 +3690,7 @@ fn Grocery() -> Element {
 
 #[component]
 fn GroceryContent() -> Element {
-    let mut items = use_signal(Vec::<GroceryItem>::new);
+    let items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut new_qty = use_signal(String::new);
     let mut new_unit = use_signal(String::new);
@@ -3904,11 +3904,10 @@ fn GroceryContent() -> Element {
 
     rsx! {
         div { class: "page",
-            if !error.read().is_empty() {
-                p { class: "status-error", "{error}" }
-            }
             if let Some(removed) = undo_snapshot {
-                div { class: "undo-bar",
+                // A floating toast, not in-flow content: ticking an item
+                // off must never shove the list around.
+                div { class: "undo-toast",
                     span { class: "undo-text", "Removed \"{removed.name}\"" }
                     button {
                         id: "undo-restore",
@@ -3920,8 +3919,10 @@ fn GroceryContent() -> Element {
                     }
                 }
             }
+            // Fetch problems surface as a small toast that fades away —
+            // never as a red block shoving content around (feedback #8).
             if !error.read().is_empty() {
-                p { class: "status-error", "{error}" }
+                div { class: "toast-error", key: "{error}", "{error}" }
             }
             if groups_empty {
                 p { class: "empty", "Your grocery list is empty. Tap + to add an item." }
@@ -3965,23 +3966,10 @@ fn GroceryContent() -> Element {
                             let url = format!("{}/api/grocery/{id}", api_base());
                             match client.put(&url).json(&payload).send().await {
                                 Ok(r) if r.status().is_success() => {
-                                    match r.json::<GroceryItem>().await {
-                                        Ok(updated) => {
-                                            items.with_mut(|v| {
-                                                if let Some(slot) =
-                                                    v.iter_mut().find(|i| i.id == id)
-                                                {
-                                                    *slot = updated;
-                                                }
-                                            });
-                                        }
-                                        Err(err) => {
-                                            tracing::error!(
-                                                "PUT /api/grocery unreadable body: {err:#}"
-                                            );
-                                            refresh(items, error).await;
-                                        }
-                                    }
+                                    // The rename may have merged this row
+                                    // into another one server-side: refetch
+                                    // instead of patching one slot.
+                                    refresh(items, error).await;
                                 }
                                 Ok(r) => {
                                     tracing::error!("PUT /api/grocery failed: {}", r.status());

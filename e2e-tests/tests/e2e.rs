@@ -1677,7 +1677,7 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
         // category AND its recipe provenance.
         let mut bar = None;
         for _ in 0..25 {
-            if let Ok(el) = driver.find(By::Css(".undo-bar .undo-text")).await {
+            if let Ok(el) = driver.find(By::Css(".undo-toast .undo-text")).await {
                 bar = Some(el);
                 break;
             }
@@ -1715,7 +1715,7 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
             "provenance points at recipe {provenance}, expected {recipe_id}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let bars = driver.find_all(By::Css(".undo-bar")).await?;
+        let bars = driver.find_all(By::Css(".undo-toast")).await?;
         anyhow::ensure!(
             bars.is_empty(),
             "undo bar must disappear after restoring"
@@ -1745,7 +1745,7 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
         row.find(By::Css("input[type=checkbox]")).await?.click().await?;
         let mut bar = None;
         for _ in 0..25 {
-            if let Ok(el) = driver.find(By::Css(".undo-bar")).await {
+            if let Ok(el) = driver.find(By::Css(".undo-toast")).await {
                 bar = Some(el);
                 break;
             }
@@ -1753,7 +1753,7 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
         }
         bar.context("undo bar missing for the second removal")?;
         tokio::time::sleep(Duration::from_millis(6800)).await;
-        let bars = driver.find_all(By::Css(".undo-bar")).await?;
+        let bars = driver.find_all(By::Css(".undo-toast")).await?;
         anyhow::ensure!(
             bars.is_empty(),
             "undo bar must expire after ~6s without a click"

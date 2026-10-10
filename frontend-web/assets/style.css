@@ -1943,19 +1943,57 @@ ol.instruction-list li.instruction-item {
 
 
 /* Undo bar for just-ticked-off grocery items. */
-.undo-bar {
+/* Undo confirmation + transient errors: floating toasts above the bottom
+   nav — they must never shift the list (feedback #7/#8). */
+.undo-toast {
+    position: fixed;
+    left: 12px;
+    right: 76px;
+    bottom: 74px;
+    z-index: 40;
     display: flex;
     align-items: center;
     gap: 10px;
-    margin: 0 0 12px;
-    padding: 8px 12px;
-    background: var(--raised);
+    padding: 10px 14px;
+    background: var(--surface-solid);
     border: 1px solid var(--divider);
     border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
     font-size: 14px;
+    animation: toast-in 160ms ease-out;
 }
 
-.undo-bar .undo-text {
+.toast-error {
+    position: fixed;
+    left: 12px;
+    right: 76px;
+    bottom: 132px;
+    z-index: 40;
+    padding: 9px 14px;
+    background: var(--surface-solid);
+    border: 1px solid var(--divider);
+    border-left: 3px solid var(--error);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    color: var(--text);
+    font-size: 13px;
+    animation: toast-in 160ms ease-out, toast-fade 600ms ease-out 4s forwards;
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+}
+
+@keyframes toast-fade {
+    to {
+        opacity: 0;
+    }
+}
+
+.undo-toast .undo-text {
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1963,7 +2001,7 @@ ol.instruction-list li.instruction-item {
     color: var(--muted);
 }
 
-.undo-bar #undo-restore {
+.undo-toast #undo-restore {
     background: var(--accent);
     color: var(--text);
     border: none;
