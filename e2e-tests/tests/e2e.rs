@@ -3815,10 +3815,14 @@ async fn meal_plan_week_to_list_flow() -> anyhow::Result<()> {
             anyhow::ensure!(attempt == 0, "the week button never became enabled");
         }
 
-        // Two clicks: arm, then fire.
+        // The cart button opens the confirmation modal; Add fires.
         let shop = driver.find(By::Id("plan-week-shop")).await?;
         shop.click().await?;
-        shop.click().await?;
+        driver
+            .find(By::Id("plan-week-confirm"))
+            .await?
+            .click()
+            .await?;
 
         // The result note appears...
         let mut noted = false;
