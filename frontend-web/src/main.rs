@@ -201,38 +201,16 @@ fn Layout() -> Element {
         std::mem::forget(source);
     });
 
-    // Offline sync loop: while ticks are queued, retry every second; the
-    // browser's online event (and any successful request) triggers an
-    // immediate attempt.
+    // Offline sync loop: while ticks are queued — or the offline flag is
+    // stuck on (e.g. it was set with an empty queue) — retry every second
+    // so everything flushes and the flag clears the moment the network
+    // returns. NOTE: never wire dioxus signal writes or `spawn` into raw
+    // browser event callbacks (online/offline listeners) — they run outside
+    // the dioxus runtime context and panic the whole app (feedback #8).
     use_effect(move || {
-        let on_online = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_|{
-            spawn(async move {
-                drain_pending_bought().await;
-            });
-        });
-        if let Some(window) = web_sys::window() {
-            let _ = window.add_event_listener_with_callback(
-                "online",
-                on_online.as_ref().unchecked_ref(),
-            );
-            let on_offline = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(
-                move |_| {
-                    *OFFLINE.write() = true;
-                },
-            );
-            let _ = window.add_event_listener_with_callback(
-                "offline",
-                on_offline.as_ref().unchecked_ref(),
-            );
-            std::mem::forget(on_offline);
-        }
-        std::mem::forget(on_online);
         spawn(async move {
             loop {
                 sleep_ms(1000).await;
-                // Drain queued ticks, and also retry while the offline flag
-                // is stuck on (e.g. it was set with an empty queue) so the
-                // flag clears itself the moment the network returns.
                 if !PENDING_BOUGHT.read().is_empty() || OFFLINE() {
                     drain_pending_bought().await;
                 }
