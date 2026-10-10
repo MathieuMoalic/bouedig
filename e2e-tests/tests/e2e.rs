@@ -2489,18 +2489,11 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
         );
 
         // Smart default: on Friday evening the tab opens on next week
-        // (planning time); otherwise on the current week. Normalize to the
-        // current week for the rest of this flow.
-        let title_text = driver
-            .find(By::Css(".plan-week-title"))
-            .await?
-            .text()
-            .await?;
-        anyhow::ensure!(
-            title_text == "This week" || title_text == "Next week",
-            "unexpected week title: {title_text}"
-        );
-        if title_text == "Next week" {
+        // (planning time); otherwise on the current week. The Today button
+        // only renders when the app is NOT on the current week, so its
+        // presence is the signal — press it to normalize. (Reading the
+        // title text here races the wasm render and can come back empty.)
+        if driver.find(By::Id("plan-week-today")).await.is_ok() {
             driver
                 .find(By::Id("plan-week-today"))
                 .await?
@@ -2508,11 +2501,7 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
                 .await?;
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        let title_text = driver
-            .find(By::Css(".plan-week-title"))
-            .await?
-            .text()
-            .await?;
+        let title_text = week_title_text(&driver).await?;
         anyhow::ensure!(
             title_text == "This week",
             "the Today button must return to the current week, got {title_text}"
@@ -2558,11 +2547,7 @@ async fn meal_plan_add_and_remove_flow() -> anyhow::Result<()> {
             .click()
             .await?;
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let title_text = driver
-            .find(By::Css(".plan-week-title"))
-            .await?
-            .text()
-            .await?;
+        let title_text = week_title_text(&driver).await?;
         anyhow::ensure!(
             title_text == "Next week",
             "the next arrow must move to next week, got {title_text}"
@@ -3969,4 +3954,29 @@ async fn grocery_rename_merge_flow() -> anyhow::Result<()> {
     .await;
     let _ = driver.quit().await;
     result
+}
+
+/// Read the meal plan's week title, retrying while the wasm render leaves
+/// it transiently empty (a plain text() call can race the render and
+/// return "" for seconds after boot).
+async fn week_title_text(driver: &WebDriver) -> anyhow::Result<String> {
+    // Read via JS textContent: the WebDriver text() visibility filter has
+    // been observed returning "" for this rendered span on Firefox.
+    for _ in 0..25 {
+        let raw = driver
+            .execute(
+                "return document.querySelector('.plan-week-title')?.textContent ?? '';",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !raw.is_empty() {
+            return Ok(raw);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(String::new())
 }
