@@ -50,6 +50,80 @@ fn save_group_prefs(order: &[String], collapsed: &HashSet<String>) {
     }
 }
 
+/// Offline queue for "mark bought" ticks: ids whose PATCH didn't reach the
+/// server. Persisted so a restart doesn't lose them, drained automatically
+/// when connectivity returns (see the sync loop in `Layout`).
+static PENDING_BOUGHT: GlobalSignal<Vec<i64>> = GlobalSignal::new(Vec::new);
+/// True while requests are failing (or the browser reports offline).
+static OFFLINE: GlobalSignal<bool> = GlobalSignal::new(|| false);
+const PENDING_BOUGHT_KEY: &str = "bouedig.pending_bought";
+
+fn load_pending_bought() {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return;
+    };
+    if let Ok(Some(json)) = storage.get_item(PENDING_BOUGHT_KEY) {
+        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&json) {
+            *PENDING_BOUGHT.write() = ids;
+        }
+    }
+}
+
+fn save_pending_bought(ids: &[i64]) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let json = serde_json::to_string(ids).unwrap_or_default();
+        let _ = storage.set_item(PENDING_BOUGHT_KEY, &json);
+    }
+}
+
+fn queue_bought(id: i64) {
+    {
+        let mut ids = PENDING_BOUGHT.write();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    save_pending_bought(&PENDING_BOUGHT.read().clone());
+    *OFFLINE.write() = true;
+}
+
+fn pending_remove(id: i64) {
+    PENDING_BOUGHT.write().retain(|x| *x != id);
+    save_pending_bought(&PENDING_BOUGHT.read().clone());
+    if PENDING_BOUGHT.read().is_empty() {
+        *OFFLINE.write() = false;
+    }
+}
+
+/// Try to flush the queue. `true` = everything synced; `false` = still
+/// offline (the remaining ids stay queued in order).
+async fn drain_pending_bought() -> bool {
+    let ids = PENDING_BOUGHT.read().clone();
+    let client = reqwest::Client::new();
+    for id in ids {
+        let result = client
+            .patch(format!("{}/api/grocery/{id}", api_base()))
+            .json(&GroceryUpdate { bought: true })
+            .send()
+            .await;
+        match result {
+            // Synced — or the item no longer exists (ticked elsewhere):
+            // either way the queued tick is done.
+            Ok(r) if r.status().is_success() || r.status() == 404 => pending_remove(id),
+            // The server answered but refused: drop the tick rather than
+            // spin forever on a request that can't succeed.
+            Ok(_) => pending_remove(id),
+            // Network failure: still offline — stop and retry later.
+            Err(_) => {
+                *OFFLINE.write() = true;
+                return false;
+            }
+        }
+    }
+    *OFFLINE.write() = false;
+    true
+}
+
 fn main() {
     // Set up logging and panic reporting first, so that anything that goes
     // wrong afterwards (including panics) is visible in the browser console.
@@ -99,6 +173,7 @@ fn Layout() -> Element {
     // epoch signal and the open page refetches. The source and the
     // callbacks live for the app's lifetime.
     use_effect(move || {
+        load_pending_bought();
         let source = match web_sys::EventSource::new(&format!("{}/api/events", api_base())) {
             Ok(source) => source,
             Err(err) => {
@@ -124,6 +199,32 @@ fn Layout() -> Element {
             std::mem::forget(callback);
         }
         std::mem::forget(source);
+    });
+
+    // Offline sync loop: while ticks are queued, retry every second; the
+    // browser's online event (and any successful request) triggers an
+    // immediate attempt.
+    use_effect(move || {
+        let on_online = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_|{
+            spawn(async move {
+                drain_pending_bought().await;
+            });
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.add_event_listener_with_callback(
+                "online",
+                on_online.as_ref().unchecked_ref(),
+            );
+        }
+        std::mem::forget(on_online);
+        spawn(async move {
+            loop {
+                sleep_ms(1000).await;
+                if !PENDING_BOUGHT.read().is_empty() {
+                    drain_pending_bought().await;
+                }
+            }
+        });
     });
 
     rsx! {
@@ -3845,6 +3946,7 @@ fn GroceryContent() -> Element {
     let groups_empty = groups.is_empty();
     // Precompute per-section handlers: rsx for-bodies can't hold let
     // statements, and each section needs its own copy of the mover.
+    let pending_ids = PENDING_BOUGHT.read().clone();
     let sections: Vec<(String, Vec<GroceryItem>, EventHandler<(String, bool)>)> = groups
         .into_iter()
         .map(|(category, group_items)| {
@@ -3904,6 +4006,11 @@ fn GroceryContent() -> Element {
 
     rsx! {
         div { class: "page",
+            // Discreet offline marker: small pill, no layout shift. Appears
+            // while ticks are queued for the server.
+            if OFFLINE() {
+                div { class: "offline-badge", "Offline — ticks sync when back online" }
+            }
             if let Some(removed) = undo_snapshot {
                 // A floating toast, not in-flow content: ticking an item
                 // off must never shove the list around.
@@ -3933,6 +4040,7 @@ fn GroceryContent() -> Element {
                             key: "{category}",
                             name: category,
                             items: group_items,
+                            pending_ids: pending_ids.clone(),
                             collapsed: collapsed,
                             items_sig: items,
                             error: error,
@@ -4151,6 +4259,7 @@ fn GroceryContent() -> Element {
 fn GroupSection(
     name: String,
     items: Vec<GroceryItem>,
+    pending_ids: Vec<i64>,
     mut collapsed: Signal<HashSet<String>>,
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
@@ -4159,6 +4268,15 @@ fn GroupSection(
     on_bought: EventHandler<GroceryItem>,
 ) -> Element {
     let is_collapsed = collapsed.read().contains(&name);
+    // rsx for-bodies can't hold lets: precompute (row, pending) pairs.
+    let rows: Vec<(GroceryItem, bool)> = items
+        .iter()
+        .cloned()
+        .map(|item| {
+            let pending = pending_ids.contains(&item.id);
+            (item, pending)
+        })
+        .collect();
     // Each header handler owns its copy: rsx closures are FnMut and cannot
     // share one moved String.
     let collapse_name = name.clone();
@@ -4205,10 +4323,11 @@ fn GroupSection(
             }
             if !is_collapsed {
                 ul { class: "grocery-list",
-                    for item in items.iter().cloned() {
+                    for (item, pending) in rows {
                         GroceryRow {
                             key: "{item.id}",
                             item: item,
+                            pending: pending,
                             items_sig: items_sig,
                             error: error,
                             on_edit: on_edit.clone(),
@@ -4224,6 +4343,7 @@ fn GroupSection(
 #[component]
 fn GroceryRow(
     item: GroceryItem,
+    pending: bool,
     mut items_sig: Signal<Vec<GroceryItem>>,
     mut error: Signal<String>,
     on_edit: EventHandler<GroceryItem>,
@@ -4237,39 +4357,46 @@ fn GroceryRow(
             class: "grocery-item",
             onclick: move |_| on_edit.call(item.clone()),
             // Checking the box marks the item bought — today's toggle
-            // semantics remove it from the list.
-            input {
-                r#type: "checkbox",
-                class: "grocery-check",
-                title: "Mark bought",
-                onclick: move |e: MouseEvent| e.stop_propagation(),
-                onchange: move |_| {
-                    let id = item_id;
-                    let bought_item = item_for_bought.clone();
-                    spawn(async move {
-                        let client = reqwest::Client::new();
-                        let url = format!("{}/api/grocery/{id}", api_base());
-                        match client
-                            .patch(&url)
-                            .json(&GroceryUpdate { bought: true })
-                            .send()
-                            .await
-                        {
-                            Ok(r) if r.status().is_success() => {
-                                items_sig.with_mut(|v| v.retain(|i| i.id != id));
-                                on_bought.call(bought_item);
+            // semantics remove it from the list. Offline, the box is
+            // replaced by a spinner and the tick queues until the
+            // connection returns.
+            if pending {
+                span { class: "tick-spinner", title: "Waiting for connection…" }
+            } else {
+                input {
+                    r#type: "checkbox",
+                    class: "grocery-check",
+                    title: "Mark bought",
+                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                    onchange: move |_| {
+                        let id = item_id;
+                        let bought_item = item_for_bought.clone();
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/grocery/{id}", api_base());
+                            match client
+                                .patch(&url)
+                                .json(&GroceryUpdate { bought: true })
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    items_sig.with_mut(|v| v.retain(|i| i.id != id));
+                                    on_bought.call(bought_item);
+                                }
+                                Err(_) => {
+                                    // Offline: queue the tick; the sync
+                                    // loop finishes it on reconnect.
+                                    queue_bought(id);
+                                }
+                                Ok(r) => {
+                                    tracing::error!("PATCH /api/grocery/{id} failed: {}", r.status());
+                                    error.set("Failed to mark item bought.".into());
+                                }
                             }
-                            Ok(r) => {
-                                tracing::error!("PATCH /api/grocery/{id} failed: {}", r.status());
-                                error.set("Failed to mark item bought.".into());
-                            }
-                            Err(err) => {
-                                tracing::error!("PATCH /api/grocery/{id} request failed: {err:#}");
-                                error.set("Failed to mark item bought.".into());
-                            }
-                        }
-                    });
-                },
+                        });
+                    },
+                }
             }
             // Amount prefix (as typed), only when the item has one.
             if let Some(prefix) = grocery_qty_prefix(item.quantity, &item.unit) {
