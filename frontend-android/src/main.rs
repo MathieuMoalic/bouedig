@@ -3169,7 +3169,7 @@ fn RecipeDetail(id: i64) -> Element {
                                                 }
                                                 span { class: "ing-name", "{ingredient.name}" }
                                                 if let Some(prep) = &ingredient.prep {
-                                                    span { class: "ing-prep", "{prep}" }
+                                                    span { class: "ing-prep", ", {prep}" }
                                                 }
                                             }
                                         }
@@ -3451,7 +3451,8 @@ fn DayChooser(
 /// "200 g " — the scaled quantity + unit prefix for a detail ingredient
 /// row, as its own muted span. The trailing space keeps the rendered text
 /// "200 g Flour" whole despite the split spans; empty when the ingredient
-/// has neither a quantity nor a unit.
+/// has neither a quantity nor a unit. The prep note renders inline after
+/// the name, comma-prefixed by the rsx.
 fn ingredient_amount(ingredient: &Ingredient, scale: f64) -> String {
     let mut out = String::new();
     if let Some(q) = ingredient.quantity {
