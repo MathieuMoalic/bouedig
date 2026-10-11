@@ -127,6 +127,10 @@ def cargo_check() -> None:
 
 
 def build_web() -> Path:
+    # dx writes content-hashed assets and never prunes old ones, so the
+    # bundle accumulates every historical wasm/js (17 stale bundles shipped
+    # in the v0.1.12 tarball). Wipe it so only the current build is packed.
+    shutil.rmtree(WEB_BUNDLE, ignore_errors=True)
     run("dx", "build", "--platform", "web", "--release", cwd=WEB)
     if not (WEB_BUNDLE / "index.html").is_file():
         raise RuntimeError(f"no web bundle at {WEB_BUNDLE}")
