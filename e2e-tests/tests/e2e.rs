@@ -2299,7 +2299,9 @@ async fn import_from_url_flow() -> anyhow::Result<()> {
             .await?
             .text()
             .await?;
-        for expected in ["2 buckwheat galettes", "2 eggs", "60 g gruyère, grated"] {
+        // Prep notes render as their own muted line under the name, so the
+        // quantity+name and the prep word are separate expectations here.
+        for expected in ["2 buckwheat galettes", "2 eggs", "60 g gruyère", "grated"] {
             anyhow::ensure!(
                 ingredients.contains(expected),
                 "imported ingredient '{expected}' missing from detail: {ingredients}"

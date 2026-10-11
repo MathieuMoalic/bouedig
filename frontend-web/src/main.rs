@@ -3330,7 +3330,13 @@ fn RecipeDetail(id: i64) -> Element {
                                                         }
                                                     });
                                                 },
-                                                "{ingredient_line(ingredient, effective_scale)}"
+                                                if ingredient.quantity.is_some() || ingredient.unit.is_some() {
+                                                    span { class: "ing-amount", "{ingredient_amount(ingredient, effective_scale)}" }
+                                                }
+                                                span { class: "ing-name", "{ingredient.name}" }
+                                                if let Some(prep) = &ingredient.prep {
+                                                    span { class: "ing-prep", "{prep}" }
+                                                }
                                             }
                                         }
                                     }
@@ -3610,22 +3616,25 @@ fn DayChooser(
 
 /// One ingredient line, e.g. `180 g buckwheat flour, finely chopped`,
 /// with the quantity multiplied by the detail-view scale factor.
-fn ingredient_line(ingredient: &Ingredient, scale: f64) -> String {
-    let mut line = String::new();
+/// "200 g " — the scaled quantity + unit prefix for a detail ingredient
+/// row, as its own muted span. The trailing space keeps the rendered text
+/// "200 g Flour" whole despite the split spans; empty when the ingredient
+/// has neither a quantity nor a unit.
+fn ingredient_amount(ingredient: &Ingredient, scale: f64) -> String {
+    let mut out = String::new();
     if let Some(q) = ingredient.quantity {
-        line.push_str(&fmt_qty(q * scale));
-        line.push(' ');
+        out.push_str(&fmt_qty(q * scale));
     }
     if let Some(unit) = &ingredient.unit {
-        line.push_str(unit);
-        line.push(' ');
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(unit);
     }
-    line.push_str(&ingredient.name);
-    if let Some(prep) = &ingredient.prep {
-        line.push_str(", ");
-        line.push_str(prep);
+    if !out.is_empty() {
+        out.push(' ');
     }
-    line
+    out
 }
 
 /// Shopping-list line for an ingredient: quantity + unit + name only —

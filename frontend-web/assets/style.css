@@ -672,12 +672,40 @@ ol.instruction-list li.instruction-item {
 /* Cooking check-off: tapped lines are struck through and dimmed. The step
    badge stays colored so the numbering keeps reading. */
 .ingredient-item {
+    position: relative;
+    padding: 3px 0 3px 14px;
     cursor: pointer;
+}
+
+/* Dot marker per ingredient line. */
+.ingredient-item::before {
+    content: "";
+    position: absolute;
+    left: 2px;
+    top: 0.62em;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+}
+
+.ingredient-item .ing-amount {
+    color: var(--muted);
+}
+
+.ingredient-item .ing-prep {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
 }
 
 .ingredient-item.crossed {
     text-decoration: line-through;
     color: var(--muted);
+}
+
+.ingredient-item.crossed::before {
+    background: var(--muted);
 }
 
 .instruction-item.crossed .step-text {
