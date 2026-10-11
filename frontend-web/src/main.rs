@@ -4157,6 +4157,9 @@ fn GroceryContent() -> Element {
                             match client.delete(&url).send().await {
                                 Ok(r) if r.status().is_success() => {
                                     items.with_mut(|v| v.retain(|i| i.id != id));
+                                    // The backend tombstoned the name, so it
+                                    // leaves the suggestion history too.
+                                    refresh_names(name_history).await;
                                     record_removed_item(item, undo_item, undo_gen, mounted);
                                 }
                                 Ok(r) => {

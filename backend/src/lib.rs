@@ -1652,7 +1652,8 @@ async fn grocery_names(
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM \
          (SELECT DISTINCT name FROM grocery_items \
-          UNION SELECT name FROM ingredient_categories) \
+          UNION SELECT name FROM ingredient_categories \
+          WHERE name NOT IN (SELECT name FROM deleted_grocery_names)) \
          WHERE name != '' ORDER BY name COLLATE NOCASE",
     )
     .fetch_all(&state.db)
@@ -1763,6 +1764,11 @@ async fn add_grocery_item(
             (StatusCode::UNPROCESSABLE_ENTITY, "item name must not be empty").into_response(),
         ));
     }
+    // The name is back on the list, so it may be suggested again.
+    sqlx::query("DELETE FROM deleted_grocery_names WHERE name = ?")
+        .bind(name)
+        .execute(&state.db)
+        .await?;
     let unit = item.unit.as_deref().map(str::trim).unwrap_or("");
     // Same name + compatible units → the amounts add up and no second line
     // is created (a missing quantity counts as 1). The existing row wins
@@ -1866,6 +1872,13 @@ async fn add_grocery_batch(
     let mut tx = state.db.begin().await?;
     let mut created = Vec::with_capacity(prepared.len());
     let mut pending = Vec::new();
+    for (name, ..) in &prepared {
+        // The names are back on the list, so they may be suggested again.
+        sqlx::query("DELETE FROM deleted_grocery_names WHERE name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+    }
     for (name, quantity, unit, category, needs_classification) in prepared {
         // Same name + compatible units → add up into the existing row (this
         // also covers duplicates within one batch; a missing quantity counts
@@ -2027,6 +2040,14 @@ async fn delete_grocery_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    let row = sqlx::query("SELECT name FROM grocery_items WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+    let Some(row) = row else {
+        return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
+    };
+    let name: String = sqlx::Row::get(&row, "name");
     let rows = sqlx::query("DELETE FROM grocery_items WHERE id = ?")
         .bind(id)
         .execute(&state.db)
@@ -2034,6 +2055,13 @@ async fn delete_grocery_item(
     if rows.rows_affected() == 0 {
         return Err(ApiError((StatusCode::NOT_FOUND, "no such grocery item").into_response()));
     }
+    // An explicit delete also stops the name from coming back as an
+    // add-row suggestion (ticking off keeps the history); adding the name
+    // again clears this.
+    sqlx::query("INSERT OR IGNORE INTO deleted_grocery_names (name) VALUES (?)")
+        .bind(name)
+        .execute(&state.db)
+        .await?;
     state.notify("grocery");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2546,6 +2574,35 @@ pub(crate) mod tests {
             names,
             vec!["Bananas".to_string(), "milk".to_string(), "Seitan".to_string()],
             "union of live items and classification history, case-insensitive order"
+        );
+    }
+
+    #[tokio::test]
+    async fn grocery_delete_hides_name_from_suggestions_until_readded() {
+        let app = test_router(None).await;
+        let (status, body) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"Doomed Yogurt","category":"Pantry"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = id["id"].as_i64().unwrap();
+
+        // An explicit DELETE also stops the name from being suggested...
+        let (status, _) = json_response(app.clone(), "DELETE", &format!("/api/grocery/{id}"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = json_response(app.clone(), "GET", "/api/grocery/names", None).await;
+        let names: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case("doomed yogurt")),
+            "deleted name must leave the suggestion history, got {names:?}"
+        );
+
+        // Adding the name again clears the tombstone.
+        let (status, _) = json_response(app.clone(), "POST", "/api/grocery", Some(r#"{"name":"doomed yogurt"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, body) = json_response(app, "GET", "/api/grocery/names", None).await;
+        let names: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("doomed yogurt")),
+            "re-added name must be suggested again, got {names:?}"
         );
     }
 

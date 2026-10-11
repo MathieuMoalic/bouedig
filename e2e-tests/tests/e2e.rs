@@ -1815,6 +1815,24 @@ async fn grocery_edit_sheet_delete_flow() -> anyhow::Result<()> {
         }
         anyhow::ensure!(deleted, "delete did not remove the item server-side");
 
+        // Delete means delete: the name leaves the suggestion history too
+        // (ticking off keeps it there by design).
+        let mut scrubbed = false;
+        for _ in 0..25 {
+            let names: Vec<String> = http
+                .get(format!("{base}/api/grocery/names"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if !names.iter().any(|n| n.eq_ignore_ascii_case("doomed yogurt")) {
+                scrubbed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(scrubbed, "deleted name still in the suggestion history");
+
         // The undo bar appears; Undo restores the deleted item's group.
         let mut bar = None;
         for _ in 0..25 {
@@ -1846,6 +1864,22 @@ async fn grocery_edit_sheet_delete_flow() -> anyhow::Result<()> {
             "undo must restore the group, got {:?}",
             restored.category
         );
+        // ...and restoring puts the name back into the suggestions.
+        let mut suggested = false;
+        for _ in 0..25 {
+            let names: Vec<String> = http
+                .get(format!("{base}/api/grocery/names"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if names.iter().any(|n| n.eq_ignore_ascii_case("doomed yogurt")) {
+                suggested = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(suggested, "restored name must be suggested again");
         Ok(())
     })()
     .await;
