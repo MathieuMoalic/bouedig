@@ -3631,6 +3631,38 @@ fn GroceryContent() -> Element {
         collapsed.set(collapsed_set);
         prefs_loaded.set(true);
     });
+    // A group the saved order doesn't know yet (new or renamed) falls back
+    // to first-item ordering, so ticking off items could reshuffle the cards
+    // — append every unseen group to the saved order.
+    use_effect(move || {
+        if !prefs_loaded() {
+            return;
+        }
+        let seen: Vec<String> = {
+            let list = items.read();
+            let mut seen: Vec<String> = Vec::new();
+            for item in list.iter() {
+                if !seen.contains(&item.category) {
+                    seen.push(item.category.clone());
+                }
+            }
+            seen
+        };
+        if seen.is_empty() {
+            return;
+        }
+        let mut order = group_order.read().clone();
+        let mut changed = false;
+        for name in seen {
+            if !order.contains(&name) {
+                order.push(name);
+                changed = true;
+            }
+        }
+        if changed {
+            group_order.set(order);
+        }
+    });
     use_effect(move || {
         if !prefs_loaded() {
             return;
