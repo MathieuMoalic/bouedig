@@ -295,7 +295,9 @@ li.grocery-item {
 li.grocery-item > span.grocery-qty {
     flex: none;
     color: var(--muted);
-    margin-right: 2px;
+    /* The prefix text ends in a space; pull the name closer so the gap
+       reads like one between words, not between columns. */
+    margin-right: -5px;
 }
 
 li.grocery-item > span {
