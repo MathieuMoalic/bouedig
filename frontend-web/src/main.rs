@@ -21,6 +21,17 @@ static GROCERY_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
 static RECIPES_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
 static MEALPLAN_EPOCH: GlobalSignal<u64> = GlobalSignal::new(|| 0);
 
+// Cached page data: tab switches remount the pages, and without these the
+// tabs showed an empty list until their refetch landed (feedback #6). A
+// remount renders the last view instantly, then the mount refresh replaces
+// it in place.
+static RECIPE_LIST: GlobalSignal<Vec<Recipe>> = GlobalSignal::new(Vec::new);
+static RECIPE_SORT: GlobalSignal<SortMode> = GlobalSignal::new(|| SortMode::Updated);
+static PLAN_ENTRIES: GlobalSignal<Vec<MealPlanEntry>> = GlobalSignal::new(Vec::new);
+static GROCERY_LIST: GlobalSignal<Vec<GroceryItem>> = GlobalSignal::new(Vec::new);
+static GROCERY_NAMES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
+static PROVENANCE_PLAN: GlobalSignal<Vec<MealPlanEntry>> = GlobalSignal::new(Vec::new);
+
 /// The grocery groups' device-local layout: display order and which groups
 /// are collapsed. Stored in localStorage, so each device keeps its own.
 static GROUP_PREFS_KEY: &str = "bouedig.grocery.groups";
@@ -803,12 +814,14 @@ async fn copy_clipboard(_text: String) -> bool {
 
 #[component]
 fn Recipes() -> Element {
-    let mut recipes = use_signal(Vec::<Recipe>::new);
+    // The list lives in a session cache: remounting the tab renders the
+    // previous grid instantly while this mount's refresh runs.
+    let mut recipes = RECIPE_LIST.signal();
+    let mut sort_mode = RECIPE_SORT.signal();
     let mut error = use_signal(|| String::new());
     let mut loaded = use_signal(|| false);
     let navigator = use_navigator();
 
-    let mut sort_mode = use_signal(|| SortMode::Updated);
     let mut random_seed = use_signal(|| 0u64);
     let mut add_menu = use_signal(|| false);
     let mut sort_menu = use_signal(|| false);
@@ -820,8 +833,11 @@ fn Recipes() -> Element {
     use_effect(move || {
         if !loaded() {
             loaded.set(true);
-            // Fresh random seed per mount; Random presses bump it again.
-            random_seed.set(now_millis());
+            // Seed once per session so a cached grid holds still across tab
+            // switches; Random presses bump it again.
+            if random_seed() == 0 {
+                random_seed.set(now_millis());
+            }
             spawn(async move {
                 match api_get::<Vec<Recipe>>("/api/recipes").await {
                     Ok(list) => {
@@ -3802,14 +3818,16 @@ fn Grocery() -> Element {
 
 #[component]
 fn GroceryContent() -> Element {
-    let mut items = use_signal(Vec::<GroceryItem>::new);
+    // List + history live in session caches so a remount renders the last
+    // view instantly while this mount's refresh runs.
+    let mut items = GROCERY_LIST.signal();
     let mut new_item = use_signal(String::new);
     let mut new_qty = use_signal(String::new);
     let mut new_unit = use_signal(String::new);
     // Every name ever seen on this list (server: /api/grocery/names) so the
     // add-row suggestions also cover past recipe additions, which are gone
     // from the live list once ticked off.
-    let name_history = use_signal(Vec::<String>::new);
+    let name_history = GROCERY_NAMES.signal();
     let mut error = use_signal(|| String::new());
     let mut focused = use_signal(|| false);
     let mut collapsed = use_signal(|| HashSet::<String>::new());
@@ -3863,7 +3881,7 @@ fn GroceryContent() -> Element {
     });
     let mut loaded = use_signal(|| false);
     let mut plan_loaded = use_signal(|| false);
-    let mut plan_entries = use_signal(Vec::<MealPlanEntry>::new);
+    let mut plan_entries = PROVENANCE_PLAN.signal();
     let mut edit_item = use_signal(|| None::<GroceryItem>);
     // The add-item bottom sheet (opened by the [+] FAB) replaces the old
     // always-visible add row.
@@ -5014,8 +5032,8 @@ fn open_move_sheet(
 
 #[component]
 fn MealPlanContent() -> Element {
-    let mut entries = use_signal(Vec::<MealPlanEntry>::new);
-    let mut recipes = use_signal(Vec::<Recipe>::new);
+    let mut entries = PLAN_ENTRIES.signal();
+    let mut recipes = RECIPE_LIST.signal();
     let mut error = use_signal(|| String::new());
     let mut loaded = use_signal(|| false);
     let mut picker = use_signal(|| None::<PickerState>);
