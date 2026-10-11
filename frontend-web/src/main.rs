@@ -3793,7 +3793,7 @@ fn Grocery() -> Element {
 
 #[component]
 fn GroceryContent() -> Element {
-    let items = use_signal(Vec::<GroceryItem>::new);
+    let mut items = use_signal(Vec::<GroceryItem>::new);
     let mut new_item = use_signal(String::new);
     let mut new_qty = use_signal(String::new);
     let mut new_unit = use_signal(String::new);
@@ -4117,6 +4117,28 @@ fn GroceryContent() -> Element {
                                 Err(err) => {
                                     tracing::error!("PUT /api/grocery request failed: {err:#}");
                                     error.set("Failed to update item.".into());
+                                }
+                            }
+                        });
+                    },
+                    on_delete: move |item: GroceryItem| {
+                        edit_item.set(None);
+                        let id = item.id;
+                        spawn(async move {
+                            let client = reqwest::Client::new();
+                            let url = format!("{}/api/grocery/{id}", api_base());
+                            match client.delete(&url).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    items.with_mut(|v| v.retain(|i| i.id != id));
+                                    record_removed_item(item, undo_item, undo_gen, mounted);
+                                }
+                                Ok(r) => {
+                                    tracing::error!("DELETE /api/grocery failed: {}", r.status());
+                                    error.set("Failed to delete item.".into());
+                                }
+                                Err(err) => {
+                                    tracing::error!("DELETE /api/grocery request failed: {err:#}");
+                                    error.set("Failed to delete item.".into());
                                 }
                             }
                         });
@@ -4453,6 +4475,7 @@ fn GroceryEditSheet(
     source: String,
     groups: Vec<String>,
     on_save: EventHandler<(String, Option<f64>, String, String)>,
+    on_delete: EventHandler<GroceryItem>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let mut name = use_signal(|| item.name.clone());
@@ -4554,6 +4577,12 @@ fn GroceryEditSheet(
                     }
                 }
                 div { class: "sheet-actions",
+                    button {
+                        id: "sheet-item-delete",
+                        class: "dialog-btn danger",
+                        onclick: move |_| on_delete.call(item.clone()),
+                        "Delete"
+                    }
                     button {
                         id: "sheet-item-cancel",
                         class: "dialog-btn",

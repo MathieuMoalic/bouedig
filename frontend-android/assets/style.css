@@ -850,6 +850,11 @@ ol.instruction-list li.instruction-item {
     margin-top: 12px;
 }
 
+/* Delete sits alone on the left of the edit sheet's action row. */
+.sheet-actions .dialog-btn.danger {
+    margin-right: auto;
+}
+
 .sheet-actions .dialog-btn[disabled] {
     opacity: 0.45;
     cursor: default;

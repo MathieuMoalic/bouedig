@@ -1766,6 +1766,93 @@ async fn grocery_bought_undo_restores_item_with_provenance() -> anyhow::Result<(
     result
 }
 
+/// Feedback #2: the edit sheet's Delete button removes the item outright,
+/// and the undo bar brings it back with its group intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn grocery_edit_sheet_delete_flow() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    let seeded = http
+        .post(format!("{base}/api/grocery"))
+        .json(&serde_json::json!({"name": "Doomed Yogurt", "category": "Pantry"}))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        seeded.status().as_u16() == 201,
+        "grocery seed failed: {}",
+        seeded.status()
+    );
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+
+        let item_id = poll_first_grocery_id(&http, &base).await?;
+        // Tapping the row opens the edit sheet; Delete removes the item.
+        let row = driver.find(By::Id(format!("grocery-item-{item_id}"))).await?;
+        row.click().await?;
+        driver.find(By::Id("sheet-item-delete")).await?.click().await?;
+
+        let mut deleted = false;
+        for _ in 0..25 {
+            let items: Vec<GroceryItem> = http
+                .get(format!("{base}/api/grocery"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if items.iter().all(|i| i.name != "Doomed Yogurt") {
+                deleted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(deleted, "delete did not remove the item server-side");
+
+        // The undo bar appears; Undo restores the deleted item's group.
+        let mut bar = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Css(".undo-toast .undo-text")).await {
+                bar = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        bar.context("undo bar did not appear after deleting")?;
+        driver.find(By::Id("undo-restore")).await?.click().await?;
+        let mut restored = None;
+        for _ in 0..50 {
+            let items: Vec<GroceryItem> = http
+                .get(format!("{base}/api/grocery"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if let Some(item) = items.iter().find(|i| i.name == "Doomed Yogurt") {
+                restored = Some(item.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let restored = restored.context("undo did not restore the deleted item")?;
+        anyhow::ensure!(
+            restored.category == "Pantry",
+            "undo must restore the group, got {:?}",
+            restored.category
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 async fn poll_first_grocery_id(http: &reqwest::Client, base: &str) -> anyhow::Result<i64> {
     for _ in 0..50 {
         let items: Vec<GroceryItem> = http
