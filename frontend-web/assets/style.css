@@ -1419,6 +1419,8 @@ ol.instruction-list li.instruction-item {
 
 .row-btn.drag-handle {
     cursor: grab;
+    /* The handle owns the whole gesture: touches on it never scroll. */
+    touch-action: none;
 }
 
 .row-btn.drag-handle:active {

@@ -820,6 +820,87 @@ async fn drag_reorders_steps() -> anyhow::Result<()> {
     result
 }
 
+/// The editor's drag handles must own the whole touch gesture: without
+/// `touch-action: none` Android steals the drag for page scrolling and
+/// rows cannot be moved on a phone (feedback #9).
+#[tokio::test(flavor = "multi_thread")]
+async fn editor_drag_handles_own_the_touch_gesture() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Touchable".into(),
+            sections: vec![],
+            ingredients: vec![Ingredient {
+                quantity: Some(200.0),
+                unit: Some("g".into()),
+                name: "Flour".into(),
+                prep: None,
+                section: None,
+            }],
+            instructions: vec![InstructionStep { text: "Mix.".into(), section: None }],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let id = recipes[0].id;
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/edit/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/edit/{id}")).await?;
+
+        // Poll until the editor renders its rows, then insist every
+        // handle (ingredients, sections, steps) computes touch-action:
+        // none so a touch drag never becomes a scroll.
+        let mut verdict = None;
+        for _ in 0..50 {
+            let summary = driver
+                .execute(
+                    "const handles = document.querySelectorAll('.row-btn.drag-handle');
+                     const bad = [...handles].filter(
+                         el => getComputedStyle(el).touchAction !== 'none').length;
+                     return `${handles.length}:${bad}`;",
+                    Vec::<serde_json::Value>::new(),
+                )
+                .await?
+                .json()
+                .as_str()
+                .context("touch-action summary not a string")?
+                .to_string();
+            let (total, bad) = summary
+                .split_once(':')
+                .context("unexpected touch-action summary {summary:?}")?;
+            if total.parse::<usize>().unwrap_or(0) > 0 {
+                verdict = Some(bad.parse::<i64>().unwrap_or(-1));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let bad = verdict.context("no drag handles rendered on the edit page")?;
+        anyhow::ensure!(bad == 0, "{bad} drag handles would scroll on touch");
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 /// Detail-view scale: multiplies displayed quantities, validates live and
 /// resets; nothing is persisted.
 #[tokio::test(flavor = "multi_thread")]

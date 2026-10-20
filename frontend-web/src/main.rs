@@ -2261,6 +2261,13 @@ fn RecipeFormFields(
                     drag.set(None);
                 }
             },
+            // The OS claims the gesture for scrolling mid-drag.
+            onpointercancel: move |_| {
+                if drag.read().is_some() {
+                    suppress_click.set(true);
+                    drag.set(None);
+                }
+            },
             h1 { if editing { "Edit Recipe" } else { "Add a Recipe" } }
             form {
                 class: "card",
