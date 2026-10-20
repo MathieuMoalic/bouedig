@@ -320,6 +320,23 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// Bind, migrate and serve **in the background**, returning the bound
 /// address. Used by the E2E suite, which passes port 0 to get a free port.
 pub async fn spawn_server(config: Config) -> anyhow::Result<SocketAddr> {
+    let (addr, tx) = spawn_server_with_shutdown(config).await?;
+    // Keep the shutdown sender alive forever: dropping it would trigger the
+    // graceful shutdown immediately.
+    std::mem::forget(tx);
+    Ok(addr)
+}
+
+/// Same, but hands back a shutdown trigger so a test can take the server
+/// away mid-flow (offline-startup coverage: the browser keeps the app and
+/// its caches while every request starts failing). The server task is
+/// ABORTED, not gracefully drained — an open SSE stream would otherwise
+/// hold a graceful shutdown open forever while the kernel keeps accepting
+/// into the backlog, so clients would hang instead of seeing the
+/// connection fail.
+pub async fn spawn_server_with_shutdown(
+    config: Config,
+) -> anyhow::Result<(SocketAddr, tokio::sync::watch::Sender<bool>)> {
     let pool = open_db(&config.db_url).await?;
     run_migrations(&pool).await?;
     ensure_data_dirs(&config.data_dir)?;
@@ -329,12 +346,17 @@ pub async fn spawn_server(config: Config) -> anyhow::Result<SocketAddr> {
         .context("failed to bind address")?;
     let addr = listener.local_addr()?;
     tracing::info!("listening on http://{addr}");
-    tokio::spawn(async move {
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    let serve = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::error!("server error: {err:#}");
         }
     });
-    Ok(addr)
+    tokio::spawn(async move {
+        let _ = rx.changed().await;
+        serve.abort();
+    });
+    Ok((addr, tx))
 }
 
 // ---------------------------------------------------------------------------

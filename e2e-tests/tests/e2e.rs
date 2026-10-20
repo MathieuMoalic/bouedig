@@ -52,6 +52,36 @@ async fn spawn_test_backend_with_password(password: Option<&str>) -> anyhow::Res
     spawn_test_backend_with_config(config).await
 }
 
+/// Same, but the caller can take the server away mid-flow (offline-startup
+/// coverage): the browser keeps the loaded app and its persisted caches
+/// while every request starts failing.
+async fn spawn_test_backend_with_shutdown(
+) -> anyhow::Result<(SocketAddr, tokio::sync::watch::Sender<bool>)> {
+    let config = backend::Config {
+        addr: SocketAddr::from(([127, 0, 0, 1], env_port("E2E_BACKEND_PORT", 0))),
+        db_url: String::new(),
+        base_path: None,
+        static_dir: Some(find_web_bundle()?),
+        data_dir: std::env::temp_dir().join("unused"),
+        import_allow_private: true,
+        openrouter_key: None,
+        classifier_model: None,
+        classifier_endpoint: None,
+        vision_model: None,
+        vision_endpoint: None,
+        password: None,
+        secure_cookies: false,
+    };
+    let db_dir = tempfile::tempdir()?;
+    let data_dir = tempfile::tempdir()?;
+    let mut config = config;
+    config.db_url = format!("sqlite://{}/bouedig-test.db?mode=rwc", db_dir.path().display());
+    config.data_dir = data_dir.path().to_path_buf();
+    let (addr, tx) = backend::spawn_server_with_shutdown(config).await?;
+    std::mem::forget((db_dir, data_dir));
+    Ok((addr, tx))
+}
+
 /// Same, with a vision endpoint (a local mock) so image import works.
 async fn spawn_test_backend_with_vision(vision_endpoint: String) -> anyhow::Result<SocketAddr> {
     let config = backend::Config {
@@ -1880,6 +1910,207 @@ async fn grocery_edit_sheet_delete_flow() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         anyhow::ensure!(suggested, "restored name must be suggested again");
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Offline startup: with the server taken away, the app keeps the household
+/// signed in (no login card anywhere), renders the cached lists on every
+/// tab, opens previously visited recipe details, and shows the
+/// No-connection bar.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_cached_startup_flow() -> anyhow::Result<()> {
+    let (addr, shutdown) = spawn_test_backend_with_shutdown().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    wait_for_port(&addr.to_string()).await?;
+    wait_for_port(&webdriver_addr()).await?;
+
+    // Seed one recipe with a grocery item pushed from it (provenance).
+    let (status, body) = json_post(
+        &http,
+        &base,
+        "/api/recipes",
+        r#"{"name":"Offline Loaf","sections":[],"ingredients":[],"instructions":[],"instruction_sections":[],"notes":"","yield":"","source":""}"#,
+    )
+    .await?;
+    anyhow::ensure!(status == 201, "recipe seed failed: {body}");
+    let recipe_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+        .as_i64()
+        .unwrap();
+    let seeded = http
+        .post(format!("{base}/api/grocery/batch"))
+        .json(&serde_json::json!({
+            "items": [{"name": "Offline Oats", "category": "Pantry"}],
+            "recipe_id": recipe_id,
+        }))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        seeded.status().as_u16() == 201,
+        "grocery seed failed: {}",
+        seeded.status()
+    );
+
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        // Warm every cache while the server is up. Grocery also snapshots
+        // the meal plan (provenance fetch) and the name history.
+        driver.goto(format!("{base}/grocery")).await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        let item_id = poll_first_grocery_id(&http, &base).await?;
+        let mut row = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Id(format!("grocery-item-{item_id}"))).await {
+                row = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        row.context("grocery row did not render while online")?;
+
+        // Recipes tab warms the grid snapshot; the detail visit warms the
+        // write-through detail cache.
+        let nav = driver
+            .find(By::XPath(
+                "//nav[@id='bottom-nav']//a[normalize-space()='Recipes']",
+            ))
+            .await?;
+        nav.click().await?;
+        let mut card = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Css(".recipe-card")).await {
+                card = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        card.context("recipe card did not render while online")?;
+        driver.goto(format!("{base}/recipe/{recipe_id}")).await?;
+        wait_for_url_path(&driver, &format!("/recipe/{recipe_id}")).await?;
+        let mut name_el = None;
+        for _ in 0..25 {
+            if let Ok(el) = driver.find(By::Css(".detail-name")).await {
+                if !el.text().await?.trim().is_empty() {
+                    name_el = Some(el);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        name_el.context("detail did not render while online")?;
+
+        // Take the server away. Everything from here runs against the
+        // device's caches only.
+        shutdown.send(true).ok();
+        let mut down = false;
+        for _ in 0..25 {
+            if http
+                .get(format!("{base}/api/version"))
+                .send()
+                .await
+                .is_err()
+            {
+                down = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(down, "test server did not stop accepting");
+
+        // Meal plan tab: fresh LoginGate must stay optimistic-authenticated
+        // and the offline bar must appear.
+        let nav = driver
+            .find(By::XPath(
+                "//nav[@id='bottom-nav']//a[normalize-space()='Meal plan']",
+            ))
+            .await?;
+        nav.click().await?;
+        let mut week_head = false;
+        for _ in 0..40 {
+            let head = driver.find(By::Css(".plan-week-head")).await.is_ok();
+            let login = driver.find(By::Id("login-password")).await.is_ok();
+            if head && !login {
+                week_head = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(
+            week_head,
+            "meal plan must render offline without the login card"
+        );
+        let mut bar = false;
+        for _ in 0..25 {
+            if driver.find(By::Css(".offline-bar")).await.is_ok() {
+                bar = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(bar, "offline bar missing while the server is down");
+
+        // Grocery tab: the seeded row renders from the snapshot.
+        let nav = driver
+            .find(By::XPath(
+                "//nav[@id='bottom-nav']//a[normalize-space()='Shopping']",
+            ))
+            .await?;
+        nav.click().await?;
+        let mut oats = false;
+        for _ in 0..40 {
+            if let Ok(list) = driver.find(By::Css(".grocery-item")).await {
+                let text = list.text().await?;
+                if text.contains("Offline Oats") {
+                    oats = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(oats, "grocery list must render offline from the cache");
+
+        // Detail page: reach the recipe through the app itself. A goto
+        // would ask the dead server for a fresh page load (which can never
+        // complete), so the recipes tab renders from its snapshot and the
+        // card's click pushes the client-side route; the detail then comes
+        // from the visited-details cache.
+        let nav = driver
+            .find(By::XPath(
+                "//nav[@id='bottom-nav']//a[normalize-space()='Recipes']",
+            ))
+            .await?;
+        nav.click().await?;
+        let mut card = None;
+        for _ in 0..40 {
+            if let Ok(el) = driver.find(By::Id(format!("recipe-card-{recipe_id}"))).await {
+                card = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        card.context("cached recipe card did not render offline")?
+            .click()
+            .await?;
+        wait_for_url_path(&driver, &format!("/recipe/{recipe_id}")).await?;
+        let mut name = String::new();
+        for _ in 0..40 {
+            if let Ok(el) = driver.find(By::Css(".detail-name")).await {
+                name = el.text().await?;
+                if !name.trim().is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::ensure!(
+            name.contains("Offline Loaf"),
+            "visited recipe must render offline from the detail cache, got {name:?}"
+        );
         Ok(())
     })()
     .await;

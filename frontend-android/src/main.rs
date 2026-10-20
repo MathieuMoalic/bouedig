@@ -144,16 +144,18 @@ fn App() -> Element {
 #[component]
 fn Layout() -> Element {
     // Offline queue: load the pending ticks and run the sync loop that
-    // flushes them whenever connectivity returns. The loop also retries
-    // while the offline flag is stuck on, so the flag clears itself the
-    // moment the network returns.
+    // flushes them whenever connectivity returns. While the offline flag
+    // is up without queued work (server unreachable at startup), the loop
+    // probes until the server answers and clears the flag.
     use_effect(move || {
         load_pending_bought();
         spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if !PENDING_BOUGHT.read().is_empty() || OFFLINE() {
+                if !PENDING_BOUGHT.read().is_empty() {
                     drain_pending_bought().await;
+                } else if OFFLINE() && probe_reachable().await {
+                    *OFFLINE.write() = false;
                 }
             }
         });
@@ -261,6 +263,12 @@ fn Layout() -> Element {
             main { class: "content",
                 id: "content-scroller",
                 Outlet::<Route> {}
+                // Discreet offline marker, app-wide: small pill pinned above
+                // the bottom nav, no layout shift. Set by a queued tick, a
+                // failed flush, or an unreachable server at startup.
+                if OFFLINE() {
+                    div { class: "offline-bar", "No connection" }
+                }
             }
             BottomNav {}
         }
@@ -641,13 +649,27 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// `GET /api/session` → am I authenticated? 401 and network errors both mean
-/// "no" (with auth off the endpoint always says yes).
-async fn session_authenticated() -> bool {
+/// `GET /api/session` → am I authenticated? With auth off the endpoint
+/// always says yes. A network failure is NOT "logged out" — the device may
+/// still hold a perfectly valid session — so it gets its own answer.
+enum SessionCheck {
+    Authed,
+    Unauthed,
+    Unreachable,
+}
+
+async fn session_check() -> SessionCheck {
     match http().get(format!("{}/api/session", api_base())).send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
+        Ok(response) if response.status().is_success() => SessionCheck::Authed,
+        Ok(_) => SessionCheck::Unauthed,
+        Err(_) => SessionCheck::Unreachable,
     }
+}
+
+/// Android's stand-in for an "ever authed" flag is the session token file
+/// itself: its existence proves this device logged in before.
+fn was_ever_authed() -> bool {
+    session_token_path().is_file()
 }
 
 /// Gate tab content behind the household login: children render only when
@@ -663,7 +685,22 @@ fn LoginGate(children: Element) -> Element {
 
     use_effect(move || {
         spawn(async move {
-            authed.set(Some(session_authenticated().await));
+            match session_check().await {
+                SessionCheck::Authed => {
+                    authed.set(Some(true));
+                }
+                SessionCheck::Unauthed => {
+                    authed.set(Some(false));
+                }
+                // The server is out of reach — that is not "logged out".
+                // Stay in on the strength of the earlier login (the token
+                // file is still on the device) and let the offline bar
+                // explain the rest.
+                SessionCheck::Unreachable => {
+                    *OFFLINE.write() = true;
+                    authed.set(Some(was_ever_authed()));
+                }
+            }
         });
     });
 
@@ -790,16 +827,29 @@ fn Recipes() -> Element {
             if random_seed() == 0 {
                 random_seed.set(now_millis());
             }
+            // Cold start without the server: fall back to the persisted
+            // snapshot so the grid has content offline.
+            let empty = recipes.read().is_empty();
+            if empty {
+                if let Some(cached) = cache_load::<Vec<Recipe>>(CACHE_RECIPES) {
+                    recipes.set(cached);
+                }
+            }
             spawn(async move {
                 match api_get::<Vec<Recipe>>("/api/recipes").await {
                     Ok(list) => {
                         tracing::debug!("recipes refreshed: {} items", list.len());
+                        cache_save(CACHE_RECIPES, &list);
                         recipes.set(list);
                         error.set(String::new());
                     }
                     Err(err) => {
                         tracing::error!("recipes refresh failed: {err:#}");
-                        error.set(err.to_string());
+                        // Cached content on screen speaks for itself; keep
+                        // the error banner for a truly empty start.
+                        if recipes.read().is_empty() {
+                            error.set(err.to_string());
+                        }
                     }
                 }
                 // Restore the persisted sort choice (404 = keep the default).
@@ -2880,10 +2930,16 @@ fn RecipeDetail(id: i64) -> Element {
     let navigator = use_navigator();
 
     // Anonymous visitors browse read-only: the mutating header actions only
-    // render once authenticated.
+    // render once authenticated. While the server is unreachable, keep the
+    // optimistic default (a logged-in household sees its buttons offline;
+    // a real 401 surfaces when they tap) and raise the offline bar.
     use_effect(move || {
         spawn(async move {
-            authed.set(session_authenticated().await);
+            match session_check().await {
+                SessionCheck::Unauthed => authed.set(false),
+                SessionCheck::Unreachable => *OFFLINE.write() = true,
+                SessionCheck::Authed => {}
+            }
         });
     });
 
@@ -2892,11 +2948,19 @@ fn RecipeDetail(id: i64) -> Element {
             match api_get::<RecipeDetailModel>(&format!("/api/recipes/{id}")).await {
                 Ok(d) => {
                     tracing::debug!("recipe {id} loaded: {} ingredients", d.ingredients.len());
+                    // Write-through: the next offline visit can read it.
+                    cache_details_put(id, &d);
                     detail.set(Some(d));
                 }
                 Err(err) => {
                     tracing::error!("recipe {id} failed to load: {err:#}");
-                    error.set(err.to_string());
+                    // The server is out of reach — fall back to the last
+                    // read of this recipe, if there ever was one.
+                    if let Some(cached) = cache_details_get(id) {
+                        detail.set(Some(cached));
+                    } else {
+                        error.set(err.to_string());
+                    }
                 }
             }
         });
@@ -3644,7 +3708,7 @@ fn GroceryContent() -> Element {
     // Every name ever seen on this list (server: /api/grocery/names) so the
     // add-row suggestions also cover past recipe additions, which are gone
     // from the live list once ticked off.
-    let name_history = GROCERY_NAMES.signal();
+    let mut name_history = GROCERY_NAMES.signal();
     let mut error = use_signal(|| String::new());
     let mut focused = use_signal(|| false);
     let mut collapsed = use_signal(|| HashSet::<String>::new());
@@ -3711,6 +3775,20 @@ fn GroceryContent() -> Element {
     use_effect(move || {
         if !loaded() {
             loaded.set(true);
+            // Cold start without the server: show the persisted snapshots
+            // (list + suggestion history) while this fetch runs.
+            let items_empty = items.read().is_empty();
+            if items_empty {
+                if let Some(cached) = cache_load::<Vec<GroceryItem>>(CACHE_GROCERY) {
+                    items.set(cached);
+                }
+            }
+            let names_empty = name_history.read().is_empty();
+            if names_empty {
+                if let Some(cached) = cache_load::<Vec<String>>(CACHE_NAMES) {
+                    name_history.set(cached);
+                }
+            }
             spawn(async move {
                 refresh(items, error).await;
                 refresh_names(name_history).await;
@@ -3749,13 +3827,23 @@ fn GroceryContent() -> Element {
     });
 
     // Plan dates feed the provenance line ("Lentil Loaf in 4 days"): one
-    // fetch, mapped against the device's local today.
+    // fetch, mapped against the device's local today. The same snapshot
+    // feeds the offline cold start of the meal plan tab.
     use_effect(move || {
         if !plan_loaded() {
             plan_loaded.set(true);
+            let empty = plan_entries.read().is_empty();
+            if empty {
+                if let Some(cached) = cache_load::<Vec<MealPlanEntry>>(CACHE_MEALPLAN) {
+                    plan_entries.set(cached);
+                }
+            }
             spawn(async move {
                 match api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
-                    Ok(list) => plan_entries.set(list),
+                    Ok(list) => {
+                        cache_save(CACHE_MEALPLAN, &list);
+                        plan_entries.set(list);
+                    }
                     Err(err) => tracing::error!("meal-plan fetch for provenance failed: {err:#}"),
                 }
             });
@@ -3875,11 +3963,6 @@ fn GroceryContent() -> Element {
 
     rsx! {
         div { class: "page",
-            // Discreet offline marker: small pill, no layout shift. Appears
-            // while ticks are queued for the server.
-            if OFFLINE() {
-                div { class: "offline-bar", "No connection" }
-            }
             if let Some(removed) = undo_snapshot {
                 // A floating toast, not in-flow content: ticking an item
                 // off must never shove the list around.
@@ -4434,11 +4517,13 @@ fn GroceryEditSheet(
     }
 }
 
-/// Re-fetch the grocery list from the backend.
+/// Re-fetch the grocery list from the backend. Every successful fetch also
+/// refreshes the persisted snapshot for offline cold starts.
 async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>) {
     match api_get::<Vec<GroceryItem>>("/api/grocery").await {
         Ok(list) => {
             tracing::debug!("grocery list refreshed: {} items", list.len());
+            cache_save(CACHE_GROCERY, &list);
             items.set(list);
             error.set(String::new());
         }
@@ -4453,7 +4538,10 @@ async fn refresh(mut items: Signal<Vec<GroceryItem>>, mut error: Signal<String>)
 /// (live items plus everything the classifier has ever seen).
 async fn refresh_names(mut history: Signal<Vec<String>>) {
     match api_get::<Vec<String>>("/api/grocery/names").await {
-        Ok(names) => history.set(names),
+        Ok(names) => {
+            cache_save(CACHE_NAMES, &names);
+            history.set(names);
+        }
         Err(err) => tracing::error!("grocery name history refresh failed: {err:#}"),
     }
 }
@@ -4687,16 +4775,38 @@ fn MealPlanContent() -> Element {
     use_effect(move || {
         if !loaded() {
             loaded.set(true);
+            // Cold start without the server: fall back to the persisted
+            // plan + recipe snapshots so the week has content offline.
+            let entries_empty = entries.read().is_empty();
+            if entries_empty {
+                if let Some(cached) = cache_load::<Vec<MealPlanEntry>>(CACHE_MEALPLAN) {
+                    entries.set(cached);
+                }
+            }
+            let recipes_empty = recipes.read().is_empty();
+            if recipes_empty {
+                if let Some(cached) = cache_load::<Vec<Recipe>>(CACHE_RECIPES) {
+                    recipes.set(cached);
+                }
+            }
             spawn(async move {
                 match api_get::<Vec<MealPlanEntry>>("/api/meal-plan").await {
-                    Ok(list) => entries.set(list),
+                    Ok(list) => {
+                        cache_save(CACHE_MEALPLAN, &list);
+                        entries.set(list);
+                    }
                     Err(err) => {
                         tracing::error!("meal plan refresh failed: {err:#}");
-                        error.set(err.to_string());
+                        if entries.read().is_empty() {
+                            error.set(err.to_string());
+                        }
                     }
                 }
                 match api_get::<Vec<Recipe>>("/api/recipes").await {
-                    Ok(list) => recipes.set(list),
+                    Ok(list) => {
+                        cache_save(CACHE_RECIPES, &list);
+                        recipes.set(list);
+                    }
                     Err(err) => tracing::error!("recipes refresh failed: {err:#}"),
                 }
             });
@@ -5901,6 +6011,52 @@ fn save_group_prefs(order: &[String], collapsed: &HashSet<String>) {
     }
 }
 
+/// Persisted snapshots of the pages' data (the last successfully fetched
+/// lists), so a cold start without a server still has something to show.
+/// Lists only — recipe images stay online-only.
+const CACHE_RECIPES: &str = "/data/data/eu.matmoa.bouedig/files/cache_recipes.json";
+const CACHE_GROCERY: &str = "/data/data/eu.matmoa.bouedig/files/cache_grocery.json";
+const CACHE_NAMES: &str = "/data/data/eu.matmoa.bouedig/files/cache_names.json";
+const CACHE_MEALPLAN: &str = "/data/data/eu.matmoa.bouedig/files/cache_mealplan.json";
+const CACHE_DETAILS: &str = "/data/data/eu.matmoa.bouedig/files/cache_details.json";
+
+fn cache_load<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+fn cache_save<T: serde::Serialize>(path: &str, value: &T) {
+    let Ok(json) = serde_json::to_string(value) else {
+        return;
+    };
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, json);
+}
+
+/// Recently opened recipes, write-through on every successful detail fetch
+/// and read when the server cannot be reached. Newest first, capped so the
+/// file stays small.
+const DETAIL_CACHE_CAP: usize = 50;
+
+fn cache_details_put(id: i64, detail: &RecipeDetailModel) {
+    let mut entries: Vec<(i64, RecipeDetailModel)> =
+        cache_load(CACHE_DETAILS).unwrap_or_default();
+    entries.retain(|(existing, _)| *existing != id);
+    entries.insert(0, (id, detail.clone()));
+    entries.truncate(DETAIL_CACHE_CAP);
+    cache_save(CACHE_DETAILS, &entries);
+}
+
+fn cache_details_get(id: i64) -> Option<RecipeDetailModel> {
+    let entries: Vec<(i64, RecipeDetailModel)> = cache_load(CACHE_DETAILS)?;
+    entries
+        .into_iter()
+        .find(|(existing, _)| *existing == id)
+        .map(|(_, detail)| detail)
+}
+
 /// Offline queue for "mark bought" ticks: ids whose PATCH didn't reach the
 /// server. Persisted in the app files dir so a restart doesn't lose them,
 /// drained automatically when connectivity returns (sync loop in Layout).
@@ -5952,6 +6108,12 @@ fn pending_remove(id: i64) {
 /// offline (the remaining ids stay queued in order).
 async fn drain_pending_bought() -> bool {
     let ids = PENDING_BOUGHT.read().clone();
+    if ids.is_empty() {
+        // Nothing to flush. The offline flag may have been set by an
+        // unreachable server at startup — the sync loop clears it once a
+        // reachability probe answers, so don't touch it here.
+        return true;
+    }
     let client = http();
     for id in ids {
         let result = client
@@ -5977,4 +6139,14 @@ async fn drain_pending_bought() -> bool {
     }
     *OFFLINE.write() = false;
     true
+}
+
+/// Is the server reachable again? The sync loop probes this while the
+/// offline flag was raised without any queued work (startup offline).
+async fn probe_reachable() -> bool {
+    http()
+        .get(format!("{}/api/version", api_base()))
+        .send()
+        .await
+        .is_ok()
 }
