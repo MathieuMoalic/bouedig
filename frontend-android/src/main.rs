@@ -176,29 +176,33 @@ fn Layout() -> Element {
     // can't see (wry's canGoBack is always false) and the router only
     // re-renders when ITS navigator moves. MainActivity therefore drops a
     // marker file (the same channel as the photo picker) and this poll
-    // turns it into a navigator back-step — or hands the gesture back to
-    // Android (moveTaskToBack via the JS bridge) when the app is at root.
+    // turns it into a navigator back-step.
     #[cfg(target_os = "android")]
     {
         let navigator = use_navigator();
         use_effect(move || {
             let navigator = navigator.clone();
             spawn(async move {
-                const BACK_MARKER: &str = "/data/data/eu.matmoa.bouedig/cache/back.press";
+                // The marker lives in the app's own cache dir (TMPDIR),
+                // so dev builds under a different package id work too.
+                let back_marker = std::env::var("TMPDIR")
+                    .or_else(|_| std::env::var("HOME"))
+                    .map(|dir| std::path::PathBuf::from(dir).join("back.press"))
+                    .unwrap_or_else(|_| {
+                        std::path::PathBuf::from("/data/data/eu.matmoa.bouedig/cache/back.press")
+                    });
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    let marker = std::path::Path::new(BACK_MARKER);
-                    if !marker.exists() {
+                    if !back_marker.exists() {
                         continue;
                     }
-                    let _ = std::fs::remove_file(marker);
+                    let _ = std::fs::remove_file(&back_marker);
+                    // Back is back, never close: step the in-app history,
+                    // and at the root simply swallow the gesture (the
+                    // household rule — leaving the app is the home
+                    // gesture's job).
                     if navigator.can_go_back() {
                         navigator.go_back();
-                    } else {
-                        _ = dioxus::document::eval(
-                            "window.BouedigNative && window.BouedigNative.exitApp()",
-                        )
-                        .await;
                     }
                 }
             });
