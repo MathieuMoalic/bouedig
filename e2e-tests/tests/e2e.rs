@@ -901,6 +901,78 @@ async fn editor_drag_handles_own_the_touch_gesture() -> anyhow::Result<()> {
     result
 }
 
+/// Back navigation: opening a recipe from the meal plan and tapping the
+/// detail header's back arrow returns to the plan — not the recipes tab
+/// (feedback #11).
+#[tokio::test(flavor = "multi_thread")]
+async fn detail_back_from_plan_returns_to_plan() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Plan Loaf".into(),
+            sections: vec![],
+            ingredients: vec![],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let recipe_id = recipes[0].id;
+    let status = http
+        .post(format!("{base}/api/meal-plan"))
+        .json(&serde_json::json!({
+            "date": initial_plan_week()[1],
+            "recipe_id": recipe_id,
+        }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/meal-plan")).await?;
+        wait_for_url_path(&driver, "/meal-plan").await?;
+        wait_for_plan_render(&driver).await?;
+
+        let mut card = None;
+        for _ in 0..50 {
+            if let Ok(el) = driver.find(By::Css(".plan-card")).await {
+                card = Some(el);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        card.context("planned recipe card did not render")?
+            .click()
+            .await?;
+        wait_for_url_path(&driver, &format!("/recipe/{recipe_id}")).await?;
+
+        driver.find(By::Id("hdr-back")).await?.click().await?;
+        wait_for_url_path(&driver, "/meal-plan").await?;
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
 /// Detail-view scale: multiplies displayed quantities, validates live and
 /// resets; nothing is persisted.
 #[tokio::test(flavor = "multi_thread")]

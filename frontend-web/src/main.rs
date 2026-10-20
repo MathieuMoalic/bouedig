@@ -3336,7 +3336,17 @@ fn RecipeDetail(id: i64) -> Element {
                     id: "hdr-back",
                     class: "hdr-btn",
                     title: "Back",
-                    onclick: move |_| { navigator.push(Route::Recipes {}); },
+                    onclick: move |_| {
+                        // Back means back where you came from (e.g. the
+                        // meal plan), not always the recipes grid; only a
+                        // cold-opened detail has no history to step back
+                        // into (feedback #11).
+                        if navigator.can_go_back() {
+                            navigator.go_back();
+                        } else {
+                            navigator.push(Route::Recipes {});
+                        }
+                    },
                     IconBack {}
                 }
                 div { class: "hdr-spacer" }
