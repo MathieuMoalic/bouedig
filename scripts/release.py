@@ -304,6 +304,29 @@ def build_apk(version: str) -> Path:
     stamp_main_activity()
     stamp_file_paths()
 
+    # Dioxus.toml carries the DEV identifier (eu.matmoa.bouedig.dev) so dx
+    # dev builds never replace the release app on the phone; releases patch
+    # the generated project back to the production identity and label. Both
+    # namespace and applicationId: the stamped Kotlin references BuildConfig
+    # from the namespace's package.
+    gradle_file = app_dir / "app" / "build.gradle.kts"
+    gradle_text = gradle_file.read_text()
+    gradle_text = gradle_text.replace(
+        'namespace="eu.matmoa.bouedig.dev"',
+        'namespace="eu.matmoa.bouedig"',
+    )
+    gradle_text = gradle_text.replace(
+        'applicationId = "eu.matmoa.bouedig.dev"',
+        'applicationId = "eu.matmoa.bouedig"',
+    )
+    gradle_file.write_text(gradle_text)
+    strings_file = res_dir / "values" / "strings.xml"
+    if strings_file.exists():
+        strings_text = strings_file.read_text().replace(
+            "Bouedig Dev", "Bouedig"
+        )
+        strings_file.write_text(strings_text)
+
     # dx packaged the APK with its stock icons; swap in ours (full set incl.
     # the launcher mipmaps) and re-run gradle so the artifact carries them.
     wipe_mipmaps()

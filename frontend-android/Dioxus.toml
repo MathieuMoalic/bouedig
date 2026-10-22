@@ -1,15 +1,19 @@
 [application]
 # NOTE: the Android launcher label comes from the package name (dx
-# Pascal-cases it: "bouedig" -> "Bouedig"); this field is not used for it.
-name = "bouedig"
+# Pascal-cases it: "bouedig dev" -> "Bouedig Dev"); this field is not used
+# for it.
+name = "bouedig dev"
 default_platform = "android"
 # The source PNG for the launcher icons (stamped in by the release script;
 # see scripts/release.py build_apk).
 icon = "assets/icon.png"
 
 [bundle]
-# Fresh identifier: the old default was com.example.FrontendAndroid.
-identifier = "eu.matmoa.bouedig"
+# The DEV identifier — deliberately distinct from the release app
+# (eu.matmoa.bouedig) so a dev install never replaces prod on the phone.
+# scripts/release.py build_apk patches the generated project back to the
+# release identity before its final gradle run.
+identifier = "eu.matmoa.bouedig.dev"
 
 [android.application]
 # Dark theme (stamped in from frontend-android/launcher/values/): dark

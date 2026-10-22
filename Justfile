@@ -28,14 +28,23 @@ dev-web:
 
 # Run backend + the Android dev build on a connected device/emulator.
 # Requires ANDROID_HOME + ANDROID_NDK_ROOT (and adb from the Nix shell).
-# The app talks to the backend via http://10.0.2.2:{{backend_port}} (emulator).
+# On a USB phone the app reaches the backend through adb reverse +
+# localhost (10.0.2.2 is the emulator alias only). The namespace sed
+# keeps the stamped launcher Kotlin compiling while the applicationId
+# stays on the dev identifier — a dev install never replaces the
+# release app.
 dev-android:
     #!/usr/bin/env bash
     set -euo pipefail
+    adb reverse tcp:{{backend_port}} tcp:{{backend_port}} || true
     cargo run -q -p backend --bin backend &
     backend_pid=$!
     trap 'kill $backend_pid 2>/dev/null || true' EXIT
-    cd frontend-android && dx serve --platform android --open false --interactive false
+    cd frontend-android
+    dx build --platform android --target aarch64-linux-android
+    sed -i 's|namespace="eu.matmoa.bouedig.dev"|namespace="eu.matmoa.bouedig"|' \
+        ../target/dx/bouedig/debug/android/app/app/build.gradle.kts
+    BOUEDIG_API_BASE=http://localhost:{{backend_port}} dx serve --platform android --open false --interactive false
 
 # Type-check everything that can be checked on the host.
 check:
