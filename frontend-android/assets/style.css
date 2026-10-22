@@ -2092,26 +2092,30 @@ ol.instruction-list li.instruction-item {
     z-index: 60;
 }
 
+/* Move control: sits beside the remove (X) button, dark like it — a tap
+   opens the day picker and a press starts a drag to reorder in place. */
 .plan-drag-handle {
     position: absolute;
-    left: 2px;
-    top: 50%;
-    transform: translateY(-50%);
+    top: 5px;
+    right: 34px;
     z-index: 2;
-    background: none;
-    border: none;
-    color: var(--muted);
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 6px 2px;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
     cursor: grab;
     /* The handle owns the whole gesture: touches on it never scroll. */
     touch-action: none;
 }
 
 .plan-drag-handle:active {
-    color: var(--text);
+    background: rgba(0, 0, 0, 0.85);
 }
 
 .plan-drag-handle .icon {

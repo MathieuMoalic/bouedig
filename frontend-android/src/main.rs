@@ -397,6 +397,15 @@ fn IconMenu() -> Element {
 }
 
 #[component]
+fn IconArrowRight() -> Element {
+    rsx! {
+        svg { class: "icon small", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round",
+            path { d: "M4 12h15M13 6l6 6-6 6" }
+        }
+    }
+}
+
+#[component]
 fn IconChevron(down: bool) -> Element {
     rsx! {
         svg { class: "icon small", view_box: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round",
@@ -1174,7 +1183,9 @@ struct StepRow {
     text: String,
 }
 
-/// Which modal is open (if any). Field values live inside the variant.
+/// Which modal is open (if any). Field values live inside the variant; the
+/// modal inputs bind `value` to those same fields, so what the user types is
+/// what gets saved and nothing re-renders their edits away.
 #[derive(Clone, PartialEq)]
 enum Modal {
     Ingredient {
@@ -1198,48 +1209,8 @@ enum Modal {
     },
 }
 
-/// The modal's text fields frozen at open time. The modal inputs render
-/// `value` from this snapshot, never from the live modal state: rewriting
-/// an input's value while the user types breaks the Android keyboard's
-/// composition and the caret jumps (feedback #10). The snapshot is retaken
-/// every time a modal opens; the live `Modal` keeps absorbing edits for
-/// the save handlers.
-#[derive(Clone, PartialEq, Default)]
-struct ModalTexts {
-    qty: String,
-    unit: String,
-    name: String,
-    prep: String,
-    section_name: String,
-    step_text: String,
-}
-
-impl Modal {
-    fn texts(&self) -> ModalTexts {
-        match self {
-            Modal::Ingredient { qty, unit, name, prep, .. } => ModalTexts {
-                qty: qty.clone(),
-                unit: unit.clone(),
-                name: name.clone(),
-                prep: prep.clone(),
-                ..Default::default()
-            },
-            Modal::Section { name, .. } => ModalTexts {
-                section_name: name.clone(),
-                ..Default::default()
-            },
-            Modal::Step { text, .. } => ModalTexts {
-                step_text: text.clone(),
-                ..Default::default()
-            },
-        }
-    }
-}
-
-/// Open a modal and freeze its inputs' initial text in one step, so the
-/// live draft and the frozen render source can never drift apart.
-fn open_modal(mut modal: Signal<Option<Modal>>, mut texts: Signal<ModalTexts>, m: Modal) {
-    texts.set(m.texts());
+/// Open a modal: the first render picks the field values up from `m`.
+fn open_modal(mut modal: Signal<Option<Modal>>, m: Modal) {
     modal.set(Some(m));
 }
 
@@ -1904,7 +1875,6 @@ fn RecipeFormFields(
     let mut source = use_signal(|| initial.source.clone());
     let mut notes = use_signal(|| initial.notes.clone());
     let mut modal = use_signal(|| None::<Modal>);
-    let modal_texts = use_signal(ModalTexts::default);
     let mut drag = use_signal(|| None::<DragState>);
     let mut suppress_click = use_signal(|| false);
     let mut photo = use_signal(|| None::<(String, Vec<u8>)>);
@@ -1922,7 +1892,6 @@ fn RecipeFormFields(
     let step_sections_snapshot = step_sections.read().clone();
     let drag_snapshot = drag.read().clone();
     let modal_snapshot = modal.read().clone();
-    let modal_texts_snapshot = modal_texts.read().clone();
     let name_value = name.read().clone();
     let yield_value = yield_amount.read().clone();
     let source_value = source.read().clone();
@@ -2280,7 +2249,7 @@ fn RecipeFormFields(
                                         r#type: "button",
                                         onclick: move |e: MouseEvent| {
                                             e.stop_propagation();
-                                            open_modal(modal, modal_texts, Modal::Section {
+                                            open_modal(modal, Modal::Section {
                                                 editing_section: Some(section.id),
                                                 name: section.name.clone(),
                                                 is_step: false,
@@ -2330,7 +2299,7 @@ fn RecipeFormFields(
                                         suppress_click.set(false);
                                         return;
                                     }
-                                    open_modal(modal, modal_texts, Modal::Ingredient {
+                                    open_modal(modal, Modal::Ingredient {
                                         section_id: row.section_id,
                                         editing_row: Some(row.id),
                                         qty: row.quantity.clone(),
@@ -2391,7 +2360,7 @@ fn RecipeFormFields(
                         onclick: move |_| {
                             let default_section = sections.read().last().map(|s| s.id);
                             tracing::debug!("opening ingredient modal (add)");
-                            open_modal(modal, modal_texts, Modal::Ingredient {
+                            open_modal(modal, Modal::Ingredient {
                                 section_id: default_section,
                                 editing_row: None,
                                 qty: String::new(),
@@ -2409,7 +2378,7 @@ fn RecipeFormFields(
                         r#type: "button",
                         onclick: move |_| {
                             tracing::debug!("opening section modal (add)");
-                            open_modal(modal, modal_texts, Modal::Section { editing_section: None, name: String::new(), is_step: false });
+                            open_modal(modal, Modal::Section { editing_section: None, name: String::new(), is_step: false });
                         },
                         IconList {}
                         span { "Add section" }
@@ -2430,7 +2399,7 @@ fn RecipeFormFields(
                                         r#type: "button",
                                         onclick: move |e: MouseEvent| {
                                             e.stop_propagation();
-                                            open_modal(modal, modal_texts, Modal::Section {
+                                            open_modal(modal, Modal::Section {
                                                 editing_section: Some(section.id),
                                                 name: section.name.clone(),
                                                 is_step: true,
@@ -2480,7 +2449,7 @@ fn RecipeFormFields(
                                         suppress_click.set(false);
                                         return;
                                     }
-                                    open_modal(modal, modal_texts, Modal::Step {
+                                    open_modal(modal, Modal::Step {
                                         editing_step: Some(step.id),
                                         section_id: step.section_id,
                                         text: step.text.clone(),
@@ -2533,7 +2502,7 @@ fn RecipeFormFields(
                         onclick: move |_| {
                             tracing::debug!("opening step modal (add)");
                             let default_section = step_sections.read().last().map(|s| s.id);
-                            open_modal(modal, modal_texts, Modal::Step {
+                            open_modal(modal, Modal::Step {
                                 editing_step: None,
                                 section_id: default_section,
                                 text: String::new(),
@@ -2548,7 +2517,7 @@ fn RecipeFormFields(
                         r#type: "button",
                         onclick: move |_| {
                             tracing::debug!("opening instruction-section modal (add)");
-                            open_modal(modal, modal_texts, Modal::Section {
+                            open_modal(modal, Modal::Section {
                                 editing_section: None,
                                 name: String::new(),
                                 is_step: true,
@@ -2694,7 +2663,7 @@ fn RecipeFormFields(
                                         class: if qty_valid { "" } else { "invalid" },
                                         r#type: "text",
                                         placeholder: "Qty",
-                                        value: "{modal_texts_snapshot.qty}",
+                                        value: "{qty}",
                                         oninput: move |e: FormEvent| {
                                             let v = e.value();
                                             modal.with_mut(|m| {
@@ -2706,7 +2675,7 @@ fn RecipeFormFields(
                                         id: "modal-unit",
                                         r#type: "text",
                                         placeholder: "Unit",
-                                        value: "{modal_texts_snapshot.unit}",
+                                        value: "{unit}",
                                         oninput: move |e: FormEvent| {
                                             let v = e.value();
                                             modal.with_mut(|m| {
@@ -2719,7 +2688,7 @@ fn RecipeFormFields(
                                         id: "modal-name",
                                         r#type: "text",
                                         placeholder: "Name *",
-                                        value: "{modal_texts_snapshot.name}",
+                                        value: "{name}",
                                     oninput: move |e: FormEvent| {
                                         let v = e.value();
                                         modal.with_mut(|m| {
@@ -2736,7 +2705,7 @@ fn RecipeFormFields(
                                         id: "modal-prep",
                                         r#type: "text",
                                         placeholder: "Prep (optional)",
-                                        value: "{modal_texts_snapshot.prep}",
+                                        value: "{prep}",
                                     oninput: move |e: FormEvent| {
                                         let v = e.value();
                                         modal.with_mut(|m| {
@@ -2830,7 +2799,7 @@ fn RecipeFormFields(
                                         id: "modal-section-name",
                                         r#type: "text",
                                         placeholder: "Section name",
-                                        value: "{modal_texts_snapshot.section_name}",
+                                        value: "{name}",
                                     oninput: move |e: FormEvent| {
                                         let v = e.value();
                                         modal.with_mut(|m| {
@@ -2888,7 +2857,7 @@ fn RecipeFormFields(
                                     textarea {
                                         id: "modal-step-text",
                                         placeholder: "Instruction",
-                                        value: "{modal_texts_snapshot.step_text}",
+                                        value: "{text}",
                                     oninput: move |e: FormEvent| {
                                         let v = e.value();
                                         modal.with_mut(|m| {
@@ -5554,7 +5523,7 @@ fn PlanDaySection(
                         button {
                             class: "plan-drag-handle",
                             r#type: "button",
-                            title: "Drag or tap to move",
+                            title: "Move to another day",
                             onpointerdown: move |ev: PointerEvent| {
                                 ev.stop_propagation();
                                 on_card_down.call((
@@ -5564,7 +5533,7 @@ fn PlanDaySection(
                                     ev.client_coordinates().y,
                                 ));
                             },
-                            IconMenu {}
+                            IconArrowRight {}
                         },
                         button {
                             class: "plan-remove",
