@@ -2674,6 +2674,13 @@ fn RecipeFormFields(
                                     input {
                                         id: "modal-unit",
                                         r#type: "text",
+                                        // Units are lowercase ("g", "ml") — the
+                                        // keyboard must not capitalize or
+                                        // correct them (feedback #12).
+                                        autocapitalize: "off",
+                                        autocorrect: "off",
+                                        spellcheck: false,
+                                        autocomplete: "off",
                                         placeholder: "Unit",
                                         value: "{unit}",
                                         oninput: move |e: FormEvent| {
@@ -4138,6 +4145,11 @@ fn GroceryContent() -> Element {
                                     id: "grocery-unit",
                                     class: "unit-input",
                                     r#type: "text",
+                                    // Units are lowercase — no capitalizing
+                                    // keyboard (feedback #12).
+                                    autocapitalize: "off",
+                                    autocorrect: "off",
+                                    spellcheck: false,
                                     value: "{new_unit}",
                                     placeholder: "g, ml, packs…",
                                     oninput: move |e: FormEvent| new_unit.set(e.value()),
@@ -4503,6 +4515,11 @@ fn GroceryEditSheet(
                                 id: "sheet-item-unit",
                                 class: "unit-input",
                                 r#type: "text",
+                                // Units are lowercase — no capitalizing
+                                // keyboard (feedback #12).
+                                autocapitalize: "off",
+                                autocorrect: "off",
+                                spellcheck: false,
                                 value: "{unit}",
                                 placeholder: "g, ml, packs…",
                                 oninput: move |e: FormEvent| unit.set(e.value()),
