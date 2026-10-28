@@ -341,7 +341,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
 
     // -- 5. The shopping list is untouched by recipe creation. --------------
     driver
-        .find(By::LinkText("Shopping"))
+        .find(By::Id("nav-grocery"))
         .await?
         .click()
         .await?;
@@ -417,7 +417,7 @@ async fn run_flow(driver: &WebDriver, http: &reqwest::Client, base: &str) -> any
 
     // -- 6. Confirm-delete removes the recipe. ------------------------------
     driver
-        .find(By::LinkText("Recipes"))
+        .find(By::Id("nav-recipes"))
         .await?
         .click()
         .await?;
@@ -966,6 +966,190 @@ async fn detail_back_from_plan_returns_to_plan() -> anyhow::Result<()> {
 
         driver.find(By::Id("hdr-back")).await?.click().await?;
         wait_for_url_path(&driver, "/meal-plan").await?;
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Unit and quantity inputs behave on mobile keyboards: units never get
+/// capitalized, quantities open the number pad (feedback #12/#13).
+#[tokio::test(flavor = "multi_thread")]
+async fn editor_field_input_attributes() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Attributed".into(),
+            sections: vec![],
+            ingredients: vec![],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let id = recipes[0].id;
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/edit/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/edit/{id}")).await?;
+        driver.find(By::Id("add-ingredient")).await?.click().await?;
+        for _ in 0..25 {
+            if driver.find(By::Id("modal-unit")).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let summary = driver
+            .execute(
+                "const qty = document.getElementById('modal-qty');
+                 const unit = document.getElementById('modal-unit');
+                 const checks = [
+                     ['qty.inputMode', qty && qty.inputMode],
+                     ['unit.autocapitalize', unit && unit.autocapitalize],
+                     ['unit.autocorrect', unit && unit.getAttribute('autocorrect')],
+                 ];
+                 // autocapitalize off reflects as none per the HTML spec.
+                 return checks.filter(([, v]) => !['decimal', 'off', 'none'].includes(v))
+                     .map(([k, v]) => k + '=' + v).join(',');",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_str()
+            .context("attribute summary not a string")?
+            .to_string();
+        anyhow::ensure!(summary.is_empty(), "editor field attributes wrong: {summary}");
+
+        // The grocery add sheet's unit field has the same keyboard rules.
+        driver.find(By::Id("nav-grocery")).await?.click().await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+        open_grocery_add_sheet(&driver).await?;
+        let unit_cap = driver
+            .execute(
+                "const unit = document.getElementById('grocery-unit');
+                 return unit ? unit.autocapitalize : 'missing';",
+                Vec::<serde_json::Value>::new(),
+            )
+            .await?
+            .json()
+            .as_str()
+            .context("grocery unit autocapitalize not a string")?
+            .to_string();
+        // autocapitalize="off" reflects as "none" per the HTML spec.
+        anyhow::ensure!(
+            unit_cap == "off" || unit_cap == "none",
+            "grocery unit autocapitalize is {unit_cap:?}"
+        );
+        Ok(())
+    })()
+    .await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Unsaved-changes guard: a dirty recipe editor asks before a tab tap
+/// discards the form; Keep editing stays, Discard leaves and saves
+/// nothing (feedback #14).
+#[tokio::test(flavor = "multi_thread")]
+async fn recipe_edit_discard_guard() -> anyhow::Result<()> {
+    let addr = spawn_test_backend().await?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+
+    let status = http
+        .post(format!("{base}/api/recipes"))
+        .json(&RecipeInput {
+            name: "Guarded Loaf".into(),
+            sections: vec![],
+            ingredients: vec![],
+            instructions: vec![],
+            instruction_sections: vec![],
+            notes: String::new(),
+            yield_amount: String::new(),
+            source: String::new(),
+        })
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 201);
+    let recipes: Vec<Recipe> = http
+        .get(format!("{base}/api/recipes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let id = recipes[0].id;
+
+    wait_for_port(&webdriver_addr()).await?;
+    let driver = open_headless_firefox().await?;
+    let result = (|| async {
+        driver.goto(format!("{base}/edit/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/edit/{id}")).await?;
+        let name = driver.find(By::Id("recipe-name")).await?;
+        name.send_keys(" (draft)").await?;
+
+        // A clean editor navigates directly; a dirty one asks first.
+        driver.find(By::Id("nav-grocery")).await?.click().await?;
+        let dialog = driver.find(By::Id("editguard-dialog")).await;
+        anyhow::ensure!(dialog.is_ok(), "dirty editor navigated without asking");
+        driver.find(By::Id("editguard-keep")).await?.click().await?;
+        wait_for_url_path(&driver, &format!("/edit/{id}")).await?;
+        for _ in 0..25 {
+            if driver.find(By::Id("editguard-dialog")).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::ensure!(
+            driver.find(By::Id("editguard-dialog")).await.is_err(),
+            "dialog must close on Keep editing"
+        );
+
+        driver.find(By::Id("nav-grocery")).await?.click().await?;
+        driver.find(By::Id("editguard-discard")).await?.click().await?;
+        wait_for_url_path(&driver, "/grocery").await?;
+
+        // Nothing was persisted by the discard.
+        let saved: Vec<Recipe> = http
+            .get(format!("{base}/api/recipes"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            saved.iter().any(|r| r.id == id && r.name == "Guarded Loaf"),
+            "discard must not persist the draft: {:?}",
+            saved.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+        );
+
+        // A clean editor still navigates without the dialog.
+        driver.goto(format!("{base}/edit/{id}")).await?;
+        wait_for_url_path(&driver, &format!("/edit/{id}")).await?;
+        driver.find(By::Id("nav-recipes")).await?.click().await?;
+        wait_for_url_path(&driver, "/").await?;
+        anyhow::ensure!(
+            driver.find(By::Id("editguard-dialog")).await.is_err(),
+            "clean editor must navigate without asking"
+        );
         Ok(())
     })()
     .await;
@@ -2129,9 +2313,7 @@ async fn offline_cached_startup_flow() -> anyhow::Result<()> {
         // Recipes tab warms the grid snapshot; the detail visit warms the
         // write-through detail cache.
         let nav = driver
-            .find(By::XPath(
-                "//nav[@id='bottom-nav']//a[normalize-space()='Recipes']",
-            ))
+            .find(By::Id("nav-recipes"))
             .await?;
         nav.click().await?;
         let mut card = None;
@@ -2178,9 +2360,7 @@ async fn offline_cached_startup_flow() -> anyhow::Result<()> {
         // Meal plan tab: fresh LoginGate must stay optimistic-authenticated
         // and the offline bar must appear.
         let nav = driver
-            .find(By::XPath(
-                "//nav[@id='bottom-nav']//a[normalize-space()='Meal plan']",
-            ))
+            .find(By::Id("nav-plan"))
             .await?;
         nav.click().await?;
         let mut week_head = false;
@@ -2209,9 +2389,7 @@ async fn offline_cached_startup_flow() -> anyhow::Result<()> {
 
         // Grocery tab: the seeded row renders from the snapshot.
         let nav = driver
-            .find(By::XPath(
-                "//nav[@id='bottom-nav']//a[normalize-space()='Shopping']",
-            ))
+            .find(By::Id("nav-grocery"))
             .await?;
         nav.click().await?;
         let mut oats = false;
@@ -2233,9 +2411,7 @@ async fn offline_cached_startup_flow() -> anyhow::Result<()> {
         // card's click pushes the client-side route; the detail then comes
         // from the visited-details cache.
         let nav = driver
-            .find(By::XPath(
-                "//nav[@id='bottom-nav']//a[normalize-space()='Recipes']",
-            ))
+            .find(By::Id("nav-recipes"))
             .await?;
         nav.click().await?;
         let mut card = None;
@@ -3321,9 +3497,9 @@ async fn assert_shell(driver: &WebDriver) -> anyhow::Result<()> {
         .find(By::Css(".wallpaper"))
         .await
         .context("app shell (wallpaper) did not render")?;
-    for tab in ["Recipes", "Meal plan", "Shopping", "Settings"] {
+    for tab in ["nav-recipes", "nav-plan", "nav-grocery", "nav-settings"] {
         driver
-            .find(By::LinkText(tab))
+            .find(By::Id(tab))
             .await
             .with_context(|| format!("nav tab '{tab}' missing"))?;
     }

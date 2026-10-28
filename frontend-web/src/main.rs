@@ -32,6 +32,14 @@ static GROCERY_LIST: GlobalSignal<Vec<GroceryItem>> = GlobalSignal::new(Vec::new
 static GROCERY_NAMES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 static PROVENANCE_PLAN: GlobalSignal<Vec<MealPlanEntry>> = GlobalSignal::new(Vec::new);
 
+// Recipe-edit unsaved-changes guard (feedback #14): Some(dirty) while an
+// edit form is mounted. The bottom nav and the Android back poll consult
+// it before leaving; a blocked exit parks in the pending slots until the
+// confirm dialog resolves it.
+static EDIT_GUARD: GlobalSignal<Option<bool>> = GlobalSignal::new(|| None);
+static PENDING_EXIT_TAB: GlobalSignal<Option<usize>> = GlobalSignal::new(|| None);
+static PENDING_EXIT_BACK: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
 /// The grocery groups' device-local layout: display order and which groups
 /// are collapsed. Stored in localStorage, so each device keeps its own.
 static GROUP_PREFS_KEY: &str = "bouedig.grocery.groups";
@@ -244,6 +252,8 @@ fn App() -> Element {
 
 #[component]
 fn Layout() -> Element {
+    // The unsaved-changes dialog (below) navigates on Discard.
+    let navigator = use_navigator();
     // Live updates: one EventSource for the whole app; each topic bumps its
     // epoch signal and the open page refetches. The source and the
     // callbacks live for the app's lifetime.
@@ -323,6 +333,55 @@ fn Layout() -> Element {
                 }
             }
             BottomNav {}
+            // Unsaved-changes confirm: a tab tap or the Android back
+            // gesture tried to leave a dirty recipe editor (feedback #14).
+            if PENDING_EXIT_TAB.read().is_some() || *PENDING_EXIT_BACK.read() {
+                div {
+                    id: "editguard-dialog",
+                    class: "dialog-backdrop",
+                    div { class: "dialog", role: "dialog",
+                        h2 { class: "dialog-title", "Discard unsaved changes?" }
+                        p { class: "dialog-text", "This recipe has changes that haven't been saved." }
+                        div { class: "dialog-actions",
+                            button {
+                                id: "editguard-keep",
+                                class: "dialog-btn",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    *PENDING_EXIT_TAB.write() = None;
+                                    *PENDING_EXIT_BACK.write() = false;
+                                },
+                                "Keep editing"
+                            }
+                            button {
+                                id: "editguard-discard",
+                                class: "dialog-btn danger",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    let tab = *PENDING_EXIT_TAB.read();
+                                    let back = *PENDING_EXIT_BACK.read();
+                                    *PENDING_EXIT_TAB.write() = None;
+                                    *PENDING_EXIT_BACK.write() = false;
+                                    if back {
+                                        navigator.go_back();
+                                    } else {
+                                        let routes = [
+                                            Route::Recipes {},
+                                            Route::MealPlan {},
+                                            Route::Grocery {},
+                                            Route::Settings {},
+                                        ];
+                                        if let Some(target) = tab.and_then(|t| routes.get(t)) {
+                                            navigator.push(target.clone());
+                                        }
+                                    }
+                                },
+                                "Discard"
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -330,28 +389,47 @@ fn Layout() -> Element {
 #[component]
 fn BottomNav() -> Element {
     let route: Route = use_route();
-    let tabs: [(Route, &str, Icons); 4] = [
-        (Route::Recipes {}, "Recipes", Icons::Recipes),
-        (Route::MealPlan {}, "Meal plan", Icons::MealPlan),
-        (Route::Grocery {}, "Shopping", Icons::Shopping),
-        (Route::Settings {}, "Settings", Icons::Settings),
+    let tabs: [(Route, &str, &str, Icons); 4] = [
+        (Route::Recipes {}, "nav-recipes", "Recipes", Icons::Recipes),
+        (Route::MealPlan {}, "nav-plan", "Meal plan", Icons::MealPlan),
+        (Route::Grocery {}, "nav-grocery", "Shopping", Icons::Shopping),
+        (Route::Settings {}, "nav-settings", "Settings", Icons::Settings),
     ];
 
     rsx! {
         nav { id: "bottom-nav", class: "bottom-nav",
-            for (target, label, icon) in tabs {
-                NavTab { target: target.clone(), label: label, icon: icon, active: route == target }
+            for (index, (target, id, label, icon)) in tabs.iter().enumerate() {
+                NavTab {
+                    target: target.clone(),
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    icon: *icon,
+                    active: route == *target,
+                    index,
+                }
             }
         }
     }
 }
 
 #[component]
-fn NavTab(target: Route, label: String, icon: Icons, active: bool) -> Element {
+fn NavTab(target: Route, id: String, label: String, icon: Icons, active: bool, index: usize) -> Element {
+    let navigator = use_navigator();
     rsx! {
-        Link {
-            to: target,
+        // A button, not a Link: leaving the recipe editor with unsaved
+        // changes must ask first (feedback #14), which an anchor's
+        // router-driven navigation can't intercept.
+        button {
+            id: "{id}",
             class: if active { "nav-tab active" } else { "nav-tab" },
+            r#type: "button",
+            onclick: move |_| {
+                if *EDIT_GUARD.read() == Some(true) {
+                    *PENDING_EXIT_TAB.write() = Some(index);
+                } else {
+                    navigator.push(target.clone());
+                }
+            },
             TabIcon { icon: icon }
             span { class: "tab-label", "{label}" }
         }
@@ -2045,6 +2123,126 @@ fn IconHandle() -> Element {
     }
 }
 
+/// The recipe exactly as the form would save it right now — the same
+/// normalization the submit handler applies — so the unsaved-changes
+/// guard (feedback #14) compares what would actually be persisted.
+fn input_from_form(
+    name: &str,
+    sections: &[SectionRow],
+    rows: &[IngredientRow],
+    steps: &[StepRow],
+    step_sections: &[SectionRow],
+    notes: &str,
+    yield_amount: &str,
+    source: &str,
+) -> RecipeInput {
+    let ingredients: Vec<Ingredient> = rows
+        .iter()
+        .filter(|r| !r.name.trim().is_empty())
+        .map(|r| Ingredient {
+            quantity: r.quantity.trim().parse::<f64>().ok(),
+            unit: (!r.unit.trim().is_empty()).then(|| r.unit.trim().to_string()),
+            name: r.name.trim().to_string(),
+            prep: (!r.prep.trim().is_empty()).then(|| r.prep.trim().to_string()),
+            section: r.section_id.and_then(|sid| {
+                sections
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .map(|s| s.name.trim().to_string())
+            }),
+        })
+        .collect();
+    let instructions: Vec<InstructionStep> = steps
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .map(|s| InstructionStep {
+            text: s.text.trim().to_string(),
+            section: s.section_id.and_then(|sid| {
+                step_sections
+                    .iter()
+                    .find(|sec| sec.id == sid)
+                    .map(|sec| sec.name.trim().to_string())
+            }),
+        })
+        .collect();
+    RecipeInput {
+        name: name.trim().to_string(),
+        sections: sections
+            .iter()
+            .map(|s| s.name.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        ingredients,
+        instructions,
+        instruction_sections: step_sections
+            .iter()
+            .map(|s| s.name.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        notes: notes.trim().to_string(),
+        yield_amount: yield_amount.trim().to_string(),
+        source: source.trim().to_string(),
+    }
+}
+
+/// The loaded recipe through the same normalization, so a fresh form
+/// compares clean and a restored edit compares equal.
+fn input_from_detail(detail: &RecipeDetailModel) -> RecipeInput {
+    RecipeInput {
+        name: detail.name.trim().to_string(),
+        sections: detail
+            .sections
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        ingredients: detail
+            .ingredients
+            .iter()
+            .map(|ing| Ingredient {
+                quantity: ing.quantity,
+                unit: ing
+                    .unit
+                    .as_deref()
+                    .map(|u| u.trim().to_string())
+                    .filter(|u| !u.is_empty()),
+                name: ing.name.trim().to_string(),
+                prep: ing
+                    .prep
+                    .as_deref()
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty()),
+                section: ing
+                    .section
+                    .as_deref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            })
+            .collect(),
+        instructions: detail
+            .instructions
+            .iter()
+            .map(|step| InstructionStep {
+                text: step.text.trim().to_string(),
+                section: step
+                    .section
+                    .as_deref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            })
+            .collect(),
+        instruction_sections: detail
+            .instruction_sections
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        notes: detail.notes.trim().to_string(),
+        yield_amount: detail.yield_amount.trim().to_string(),
+        source: detail.source.trim().to_string(),
+    }
+}
+
 #[component]
 fn RecipeFormFields(
     initial: RecipeDetailModel,
@@ -2129,6 +2327,45 @@ fn RecipeFormFields(
     let mut status = use_signal(|| String::new());
     let mut status_error = use_signal(|| false);
     let navigator = use_navigator();
+
+    // Unsaved-changes guard (feedback #14): compare the form, exactly as
+    // it would be saved, against the loaded recipe on every change; the
+    // bottom nav and the Android back poll consult EDIT_GUARD before
+    // leaving. Reordering something back is clean — only real differences
+    // count.
+    let guard_base = serde_json::to_string(&input_from_detail(&initial)).unwrap_or_default();
+    let guard_base = use_signal(move || format!("{guard_base}|photo=false"));
+    use_effect(move || {
+        let name_now = name.read().clone();
+        let sections_now = sections.read().clone();
+        let rows_now = rows.read().clone();
+        let steps_now = steps.read().clone();
+        let step_sections_now = step_sections.read().clone();
+        let notes_now = notes.read().clone();
+        let yield_now = yield_amount.read().clone();
+        let source_now = source.read().clone();
+        let has_photo = photo.read().is_some();
+        let input = input_from_form(
+            &name_now,
+            &sections_now,
+            &rows_now,
+            &steps_now,
+            &step_sections_now,
+            &notes_now,
+            &yield_now,
+            &source_now,
+        );
+        let key = format!(
+            "{}|photo={has_photo}",
+            serde_json::to_string(&input).unwrap_or_default()
+        );
+        *EDIT_GUARD.write() = Some(key != *guard_base.read());
+    });
+    use_drop(|| {
+        *EDIT_GUARD.write() = None;
+        *PENDING_EXIT_TAB.write() = None;
+        *PENDING_EXIT_BACK.write() = false;
+    });
 
     let existing_thumb = initial.thumb.clone();
     let editing = editing_id.is_some();
@@ -2296,53 +2533,20 @@ fn RecipeFormFields(
                     let rows_now = rows.read().clone();
                     let steps_now = steps.read().clone();
                     let step_sections_now = step_sections.read().clone();
-                    let ingredients: Vec<Ingredient> = rows_now
-                        .iter()
-                        .filter(|r| !r.name.trim().is_empty())
-                        .map(|r| Ingredient {
-                            quantity: r.quantity.trim().parse::<f64>().ok(),
-                            unit: (!r.unit.trim().is_empty()).then(|| r.unit.trim().to_string()),
-                            name: r.name.trim().to_string(),
-                            prep: (!r.prep.trim().is_empty()).then(|| r.prep.trim().to_string()),
-                            section: r.section_id.and_then(|sid| {
-                                sections_now
-                                    .iter()
-                                    .find(|s| s.id == sid)
-                                    .map(|s| s.name.trim().to_string())
-                            }),
-                        })
-                        .collect();
-                    let instructions: Vec<InstructionStep> = steps_now
-                        .iter()
-                        .filter(|s| !s.text.trim().is_empty())
-                        .map(|s| InstructionStep {
-                            text: s.text.trim().to_string(),
-                            section: s.section_id.and_then(|sid| {
-                                step_sections_now
-                                    .iter()
-                                    .find(|sec| sec.id == sid)
-                                    .map(|sec| sec.name.trim().to_string())
-                            }),
-                        })
-                        .collect();
-                    let input = RecipeInput {
-                        name: name.read().trim().to_string(),
-                        sections: sections_now
-                            .iter()
-                            .map(|s| s.name.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect(),
-                        ingredients: ingredients.clone(),
-                        instructions: instructions.clone(),
-                        instruction_sections: step_sections_now
-                            .iter()
-                            .map(|s| s.name.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect(),
-                        notes: notes.read().trim().to_string(),
-                        yield_amount: yield_amount.read().trim().to_string(),
-                        source: source.read().trim().to_string(),
-                    };
+                    let name_now = name.read().clone();
+                    let notes_now = notes.read().clone();
+                    let yield_now = yield_amount.read().clone();
+                    let source_now = source.read().clone();
+                    let input = input_from_form(
+                        &name_now,
+                        &sections_now,
+                        &rows_now,
+                        &steps_now,
+                        &step_sections_now,
+                        &notes_now,
+                        &yield_now,
+                        &source_now,
+                    );
                     if input.name.trim().is_empty() {
                         status.set("Please enter a recipe name.".into());
                         status_error.set(true);

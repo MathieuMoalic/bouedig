@@ -107,6 +107,11 @@ body {
     font-size: 12px;
     font-weight: 600;
     padding: 4px 8px;
+    /* NavTab renders a <button> so tab taps can be intercepted; keep it
+       looking like the old anchor. */
+    background: none;
+    border: none;
+    cursor: pointer;
 }
 
 .nav-tab .tab-icon {
