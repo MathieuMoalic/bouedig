@@ -2913,6 +2913,8 @@ fn RecipeFormFields(
                                         id: "modal-qty",
                                         class: if qty_valid { "" } else { "invalid" },
                                         r#type: "text",
+                                        inputmode: "decimal",
+                                        autocomplete: "off",
                                         placeholder: "Qty",
                                         value: "{qty}",
                                         oninput: move |e: FormEvent| {
